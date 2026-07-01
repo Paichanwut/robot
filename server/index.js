@@ -407,7 +407,7 @@ app.get('/api/monitors/:id/images', async (req, res) => {
         }
       }
       if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar')) return false;
-      if (lower.includes('ad-') || lower.includes('ads') || lower.includes('banner') || lower.includes('advertisement')) return false;
+      if (lower.includes('ad-') || lower.includes('/ads/') || lower.includes('banner') || lower.includes('advertisement')) return false;
       if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
       return true;
     });
