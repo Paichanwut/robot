@@ -18,11 +18,18 @@ app.use(express.json());
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const DIST_DIR = path.join(__dirname, '../dist');
+const SAVED_DIR = path.join(DATA_DIR, 'saved');
 
-// Ensure data directory exists
+// Ensure directories exist
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+if (!fs.existsSync(SAVED_DIR)) {
+  fs.mkdirSync(SAVED_DIR, { recursive: true });
+}
+
+// Serve saved images statically
+app.use('/api/saved-assets', express.static(SAVED_DIR));
 
 // Initial Database Structure
 const defaultDb = {
@@ -52,7 +59,8 @@ const defaultDb = {
       checks: []
     }
   ],
-  logs: []
+  logs: [],
+  saved: []
 };
 
 // Read Database
@@ -379,13 +387,128 @@ app.get('/api/monitors/:id/images', async (req, res) => {
       }
     }
 
-    // Remove duplicates and limit to 10 images
-    const uniqueImages = [...new Set(images)].slice(0, 10);
+    // Remove duplicates and return all unique images found
+    const uniqueImages = [...new Set(images)];
     res.json({ images: uniqueImages });
   } catch (error) {
     console.error(`Error scraping images from ${monitor.url}:`, error);
     res.status(500).json({ error: `Failed to scrape images: ${error.message}` });
   }
+});
+
+// Helper to extract file extension
+function getExtension(url, contentType) {
+  if (contentType) {
+    if (contentType.includes('jpeg') || contentType.includes('jpg')) return 'jpg';
+    if (contentType.includes('png')) return 'png';
+    if (contentType.includes('gif')) return 'gif';
+    if (contentType.includes('svg')) return 'svg';
+    if (contentType.includes('webp')) return 'webp';
+  }
+  const extMatch = url.match(/\.([a-zA-Z0-9]+)(?:[\?#]|$)/);
+  if (extMatch) {
+    const ext = extMatch[1].toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp'].includes(ext)) {
+      return ext === 'jpeg' ? 'jpg' : ext;
+    }
+  }
+  return 'png';
+}
+
+// Save selected website image
+app.post('/api/images/save', async (req, res) => {
+  const { monitorId, imageUrl } = req.body;
+  if (!monitorId || !imageUrl) {
+    return res.status(400).json({ error: 'monitorId and imageUrl are required' });
+  }
+
+  const db = readDb();
+  const monitor = db.monitors.find(m => m.id === monitorId);
+  if (!monitor) {
+    return res.status(404).json({ error: 'Monitor not found' });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s download timeout
+
+    const response = await fetch(imageUrl, {
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: HTTP ${response.status}`);
+    }
+
+    const contentType = response.headers.get('content-type');
+    const ext = getExtension(imageUrl, contentType);
+    
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    
+    const randomSuffix = Math.random().toString(36).substr(2, 9);
+    const filename = `${monitorId}_${randomSuffix}.${ext}`;
+    const filePath = path.join(SAVED_DIR, filename);
+
+    // Save physical file
+    await fs.promises.writeFile(filePath, buffer);
+
+    // Save DB Metadata
+    const savedRecord = {
+      id: Date.now().toString(),
+      monitorId,
+      monitorName: monitor.name,
+      originalUrl: imageUrl,
+      filename,
+      timestamp: new Date().toISOString()
+    };
+
+    if (!db.saved) db.saved = [];
+    db.saved.push(savedRecord);
+    writeDb(db);
+
+    res.status(201).json(savedRecord);
+  } catch (error) {
+    console.error(`Error saving image from ${imageUrl}:`, error);
+    res.status(500).json({ error: `Failed to save image: ${error.message}` });
+  }
+});
+
+// Get all saved images
+app.get('/api/images/saved', (req, res) => {
+  const db = readDb();
+  res.json(db.saved || []);
+});
+
+// Delete saved image from server
+app.delete('/api/images/saved/:id', (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  
+  if (!db.saved) db.saved = [];
+  const index = db.saved.findIndex(item => item.id === id);
+  
+  if (index === -1) {
+    return res.status(404).json({ error: 'Saved image not found' });
+  }
+
+  const record = db.saved[index];
+  const filePath = path.join(SAVED_DIR, record.filename);
+
+  // Delete physical file in background
+  fs.unlink(filePath, (err) => {
+    if (err && err.code !== 'ENOENT') {
+      console.error(`Failed to delete file ${filePath}:`, err);
+    }
+  });
+
+  // Remove metadata
+  db.saved.splice(index, 1);
+  writeDb(db);
+
+  res.json({ message: 'Saved image deleted successfully' });
 });
 
 // Get alert logs

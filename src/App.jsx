@@ -63,10 +63,16 @@ function App() {
   const [deletingMonitor, setDeletingMonitor] = useState(null);
   const [isClearLogsModalOpen, setIsClearLogsModalOpen] = useState(false);
   const [isGalleryModalOpen, setIsGalleryModalOpen] = useState(false);
+  const [galleryMonitorId, setGalleryMonitorId] = useState('');
   const [galleryMonitorName, setGalleryMonitorName] = useState('');
   const [galleryImages, setGalleryImages] = useState([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
   const [galleryError, setGalleryError] = useState(null);
+  const [isSavedGalleryOpen, setIsSavedGalleryOpen] = useState(false);
+  const [savedImages, setSavedImages] = useState([]);
+  const [savedLoading, setSavedLoading] = useState(false);
+  const [savedError, setSavedError] = useState(null);
+  const [savingImageUrls, setSavingImageUrls] = useState({});
 
   // Form states
   const [formName, setFormName] = useState('');
@@ -227,6 +233,7 @@ function App() {
 
   // Handle Open Image Gallery
   const handleOpenGallery = async (monitor) => {
+    setGalleryMonitorId(monitor.id);
     setGalleryMonitorName(monitor.name);
     setGalleryImages([]);
     setGalleryLoading(true);
@@ -245,6 +252,82 @@ function App() {
     } finally {
       setGalleryLoading(false);
     }
+  };
+
+  // Fetch Saved Images List
+  const fetchSavedImages = async () => {
+    setSavedLoading(true);
+    setSavedError(null);
+    try {
+      const res = await fetch('/api/images/saved');
+      if (!res.ok) throw new Error('Failed to fetch saved images from server');
+      const data = await res.json();
+      setSavedImages(data);
+    } catch (err) {
+      setSavedError(err.message);
+    } finally {
+      setSavedLoading(false);
+    }
+  };
+
+  // Open Saved Gallery Modal
+  const handleOpenSavedGallery = () => {
+    setIsSavedGalleryOpen(true);
+    fetchSavedImages();
+  };
+
+  // Save Scraped Image to Server
+  const handleSaveImageToServer = async (monitorId, imageUrl) => {
+    if (savingImageUrls[imageUrl]) return;
+
+    setSavingImageUrls(prev => ({ ...prev, [imageUrl]: true }));
+    try {
+      const res = await fetch('/api/images/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ monitorId, imageUrl })
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || 'Failed to save image to server');
+      }
+
+      alert('✓ Image saved to server storage successfully!');
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setSavingImageUrls(prev => ({ ...prev, [imageUrl]: false }));
+    }
+  };
+
+  // Delete Saved Image from Server
+  const handleDeleteSavedImage = async (savedImageId) => {
+    if (!confirm('Are you sure you want to delete this saved image from the server?')) return;
+
+    try {
+      const res = await fetch(`/api/images/saved/${savedImageId}`, {
+        method: 'DELETE'
+      });
+
+      if (!res.ok) throw new Error('Failed to delete saved image');
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Group saved images by website origin name
+  const groupSavedImagesByWebsite = () => {
+    const groups = {};
+    savedImages.forEach(img => {
+      if (!groups[img.monitorName]) {
+        groups[img.monitorName] = [];
+      }
+      groups[img.monitorName].push(img);
+    });
+    return groups;
   };
 
   // Handle Manual check trigger
@@ -336,6 +419,9 @@ function App() {
           </div>
         </div>
         <div className="header-actions">
+          <button className="btn btn-secondary" onClick={handleOpenSavedGallery} style={{ marginRight: '0.5rem' }}>
+            📂 Saved Gallery
+          </button>
           <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)}>
             <span>+</span> Add Website
           </button>
@@ -796,7 +882,7 @@ function App() {
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '700px', width: '90%' }}>
             <div className="modal-header">
-              <h3>🖼️ Image Gallery: {galleryMonitorName}</h3>
+              <h3>🖼️ Image Gallery: {galleryMonitorName} {galleryImages.length > 0 && `(${galleryImages.length} images)`}</h3>
               <button className="modal-close" onClick={() => setIsGalleryModalOpen(false)}>×</button>
             </div>
             
@@ -817,7 +903,7 @@ function App() {
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                   <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>
-                    Here are the first {galleryImages.length} images found on the homepage. This verifies image asset accessibility.
+                    Here are all the {galleryImages.length} unique images found on the homepage. This verifies image asset accessibility.
                   </p>
                   
                   {/* Images Grid */}
@@ -842,6 +928,20 @@ function App() {
                         >
                           Link #{index + 1}
                         </a>
+                        <button
+                          className="btn btn-secondary"
+                          style={{
+                            padding: '0.2rem 0.5rem',
+                            fontSize: '0.7rem',
+                            marginTop: '0.25rem',
+                            width: '100%',
+                            gap: '0.25rem'
+                          }}
+                          disabled={savingImageUrls[src]}
+                          onClick={() => handleSaveImageToServer(galleryMonitorId, src)}
+                        >
+                          {savingImageUrls[src] ? '⏳ Saving...' : '💾 Save to Server'}
+                        </button>
                       </div>
                     ))}
                   </div>
@@ -850,6 +950,92 @@ function App() {
               
               <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
                 <button type="button" className="btn btn-secondary" onClick={() => setIsGalleryModalOpen(false)}>
+                  Close Gallery
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Saved Gallery Modal */}
+      {isSavedGalleryOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ maxWidth: '850px', width: '95%' }}>
+            <div className="modal-header">
+              <h3>📂 Saved Images Gallery</h3>
+              <button className="modal-close" onClick={() => setIsSavedGalleryOpen(false)}>×</button>
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', maxHeight: '75vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
+              {savedLoading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '3rem 0', gap: '1rem' }}>
+                  <div className="spinner" />
+                  <span style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)' }}>Loading saved images...</span>
+                </div>
+              ) : savedError ? (
+                <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
+                  ⚠️ {savedError}
+                </div>
+              ) : savedImages.length === 0 ? (
+                <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '4rem 0', fontSize: '0.95rem' }}>
+                  📂 No images saved yet. Open a website's image gallery and click "Save to Server" to add photos.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+                  {Object.entries(groupSavedImagesByWebsite()).map(([websiteName, items]) => (
+                    <div key={websiteName} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '1.5rem' }}>
+                      <h4 style={{ fontSize: '1.05rem', color: 'var(--color-cyan)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        🌐 {websiteName} <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({items.length} images)</span>
+                      </h4>
+                      <div className="gallery-grid">
+                        {items.map((item) => (
+                          <div key={item.id} className="gallery-card">
+                            <div className="gallery-img-container">
+                              <img 
+                                src={`/api/saved-assets/${item.filename}`} 
+                                alt={item.originalUrl}
+                                onError={(e) => {
+                                  e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
+                                }}
+                              />
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', padding: '0.25rem 0' }}>
+                              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textAlign: 'center' }}>
+                                Saved: {new Date(item.timestamp).toLocaleDateString()}
+                              </span>
+                              <div style={{ display: 'flex', gap: '0.25rem', width: '100%', marginTop: '0.25rem' }}>
+                                <a 
+                                  href={`/api/saved-assets/${item.filename}`} 
+                                  download 
+                                  target="_blank" 
+                                  rel="noopener noreferrer" 
+                                  className="btn btn-secondary" 
+                                  style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
+                                  title="View full size image"
+                                >
+                                  🔗 View
+                                </a>
+                                <button 
+                                  className="btn btn-danger" 
+                                  style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
+                                  onClick={() => handleDeleteSavedImage(item.id)}
+                                  title="Delete from server"
+                                >
+                                  🗑️ Delete
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              
+              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsSavedGalleryOpen(false)}>
                   Close Gallery
                 </button>
               </div>
