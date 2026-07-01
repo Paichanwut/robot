@@ -36,6 +36,7 @@ const defaultDb = {
       status: "unknown",
       lastCheck: null,
       lastResponseTime: null,
+      lastError: null,
       checks: []
     },
     {
@@ -47,6 +48,7 @@ const defaultDb = {
       status: "unknown",
       lastCheck: null,
       lastResponseTime: null,
+      lastError: null,
       checks: []
     }
   ],
@@ -131,6 +133,7 @@ async function checkSite(monitor) {
     dbMonitor.status = status;
     dbMonitor.lastCheck = timestamp;
     dbMonitor.lastResponseTime = status === 'up' ? responseTime : null;
+    dbMonitor.lastError = status === 'down' ? errorMsg : null;
 
     // Record check history
     if (!dbMonitor.checks) dbMonitor.checks = [];
@@ -228,6 +231,7 @@ app.post('/api/monitors', (req, res) => {
     status: 'unknown',
     lastCheck: null,
     lastResponseTime: null,
+    lastError: null,
     checks: []
   };
 

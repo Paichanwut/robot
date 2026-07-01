@@ -414,7 +414,24 @@ function App() {
                     >
                       {/* Name & URL */}
                       <div className="monitor-info">
-                        <span className="monitor-name">{monitor.name}</span>
+                        <span className="monitor-name">
+                          {monitor.name}
+                          <span style={{ 
+                            fontSize: '0.7rem', 
+                            color: 'var(--color-text-muted)', 
+                            backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                            padding: '0.15rem 0.4rem',
+                            borderRadius: '4px',
+                            marginLeft: '0.5rem',
+                            fontWeight: 'normal',
+                            border: '1px solid var(--border-color)',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.25rem'
+                          }}>
+                            ⏱️ {monitor.interval >= 60 ? `${monitor.interval / 60}m` : `${monitor.interval}s`}
+                          </span>
+                        </span>
                         <a
                           href={monitor.url}
                           target="_blank"
@@ -423,6 +440,22 @@ function App() {
                         >
                           {monitor.url}
                         </a>
+                        
+                        {monitor.active && monitor.status === 'down' && (
+                          <div style={{
+                            fontSize: '0.75rem',
+                            color: 'var(--color-red)',
+                            marginTop: '0.35rem',
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '0.25rem'
+                          }}>
+                            <span style={{ flexShrink: 0 }}>⚠️</span>
+                            <span style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
+                              {monitor.lastError || 'Connection failed'}
+                            </span>
+                          </div>
+                        )}
                       </div>
 
                       {/* Status */}
