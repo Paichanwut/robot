@@ -59,6 +59,9 @@ function App() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [editingMonitor, setEditingMonitor] = useState(null);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [deletingMonitor, setDeletingMonitor] = useState(null);
+  const [isClearLogsModalOpen, setIsClearLogsModalOpen] = useState(false);
 
   // Form states
   const [formName, setFormName] = useState('');
@@ -194,16 +197,23 @@ function App() {
     }
   };
 
-  // Handle Delete Monitor
-  const handleDeleteMonitor = async (id) => {
-    if (!confirm('Are you sure you want to delete this monitor?')) return;
+  // Handle Delete Monitor Modal Open
+  const openDeleteModal = (monitor) => {
+    setDeletingMonitor(monitor);
+    setIsDeleteModalOpen(true);
+  };
 
+  // Confirm Delete Monitor
+  const confirmDeleteMonitor = async () => {
+    if (!deletingMonitor) return;
     try {
-      const res = await fetch(`/api/monitors/${id}`, {
+      const res = await fetch(`/api/monitors/${deletingMonitor.id}`, {
         method: 'DELETE'
       });
 
       if (!res.ok) throw new Error('Failed to delete monitor');
+      setIsDeleteModalOpen(false);
+      setDeletingMonitor(null);
       fetchData();
     } catch (err) {
       alert(err.message);
@@ -228,13 +238,12 @@ function App() {
     }
   };
 
-  // Handle Clear Logs
-  const handleClearLogs = async () => {
-    if (!confirm('Clear all in-app logs?')) return;
-
+  // Confirm Clear Logs
+  const confirmClearLogs = async () => {
     try {
       const res = await fetch('/api/logs/clear', { method: 'POST' });
       if (!res.ok) throw new Error('Failed to clear logs');
+      setIsClearLogsModalOpen(false);
       fetchData();
     } catch (err) {
       alert(err.message);
@@ -475,7 +484,7 @@ function App() {
                         <button
                           className="btn btn-danger btn-icon-only"
                           title="Delete monitor"
-                          onClick={() => handleDeleteMonitor(monitor.id)}
+                          onClick={() => openDeleteModal(monitor)}
                         >
                           🗑️
                         </button>
@@ -496,7 +505,7 @@ function App() {
               <div className="alerts-header">
                 <h3>🔔 Activity History</h3>
                 {logs.length > 0 && (
-                  <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={handleClearLogs}>
+                  <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setIsClearLogsModalOpen(true)}>
                     Clear
                   </button>
                 )}
@@ -656,6 +665,56 @@ function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Monitor Confirmation Modal */}
+      {isDeleteModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+            <div className="modal-header">
+              <h3 style={{ color: 'var(--color-red)' }}>⚠️ Delete Monitor</h3>
+              <button className="modal-close" onClick={() => setIsDeleteModalOpen(false)}>×</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.95rem' }}>
+                Are you sure you want to delete <strong>{deletingMonitor?.name}</strong>? This action will remove the website monitor and its ping history.
+              </p>
+              <div className="modal-footer">
+                <button type="button" className="btn btn-secondary" onClick={() => setIsDeleteModalOpen(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="btn btn-danger" onClick={confirmDeleteMonitor}>
+                  Yes, Delete Monitor
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Logs Confirmation Modal */}
+      {isClearLogsModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+            <div className="modal-header">
+              <h3 style={{ color: 'var(--color-red)' }}>⚠️ Clear Alert Logs</h3>
+              <button className="modal-close" onClick={() => setIsClearLogsModalOpen(false)}>×</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.95rem' }}>
+                Are you sure you want to clear all status transition alert history? This cannot be undone.
+              </p>
+              <div className="modal-footer">
+                <button type="button" className="btn btn-secondary" onClick={() => setIsClearLogsModalOpen(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="btn btn-danger" onClick={confirmClearLogs}>
+                  Yes, Clear Logs
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
