@@ -62,6 +62,11 @@ function App() {
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [deletingMonitor, setDeletingMonitor] = useState(null);
   const [isClearLogsModalOpen, setIsClearLogsModalOpen] = useState(false);
+  const [isGalleryModalOpen, setIsGalleryModalOpen] = useState(false);
+  const [galleryMonitorName, setGalleryMonitorName] = useState('');
+  const [galleryImages, setGalleryImages] = useState([]);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [galleryError, setGalleryError] = useState(null);
 
   // Form states
   const [formName, setFormName] = useState('');
@@ -217,6 +222,28 @@ function App() {
       fetchData();
     } catch (err) {
       alert(err.message);
+    }
+  };
+
+  // Handle Open Image Gallery
+  const handleOpenGallery = async (monitor) => {
+    setGalleryMonitorName(monitor.name);
+    setGalleryImages([]);
+    setGalleryLoading(true);
+    setGalleryError(null);
+    setIsGalleryModalOpen(true);
+
+    try {
+      const res = await fetch(`/api/monitors/${monitor.id}/images`);
+      if (!res.ok) {
+        throw new Error('Failed to fetch images from this site');
+      }
+      const data = await res.json();
+      setGalleryImages(data.images || []);
+    } catch (err) {
+      setGalleryError(err.message || 'Error occurred while loading images');
+    } finally {
+      setGalleryLoading(false);
     }
   };
 
@@ -509,6 +536,18 @@ function App() {
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
+                          title="Show website images"
+                          disabled={!monitor.active || monitor.status !== 'up'}
+                          onClick={() => handleOpenGallery(monitor)}
+                          style={{
+                            cursor: (!monitor.active || monitor.status !== 'up') ? 'not-allowed' : 'pointer',
+                            opacity: (!monitor.active || monitor.status !== 'up') ? 0.5 : 1
+                          }}
+                        >
+                          📷
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-icon-only"
                           title="Edit settings"
                           onClick={() => openEditModal(monitor)}
                         >
@@ -745,6 +784,73 @@ function App() {
                 </button>
                 <button type="button" className="btn btn-danger" onClick={confirmClearLogs}>
                   Yes, Clear Logs
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Website Image Gallery Modal */}
+      {isGalleryModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ maxWidth: '700px', width: '90%' }}>
+            <div className="modal-header">
+              <h3>🖼️ Image Gallery: {galleryMonitorName}</h3>
+              <button className="modal-close" onClick={() => setIsGalleryModalOpen(false)}>×</button>
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '70vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
+              {galleryLoading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '3rem 0', gap: '1rem' }}>
+                  <div className="spinner" />
+                  <span style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)' }}>Scraping website for images...</span>
+                </div>
+              ) : galleryError ? (
+                <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
+                  ⚠️ {galleryError}
+                </div>
+              ) : galleryImages.length === 0 ? (
+                <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '3rem 0', fontSize: '0.95rem' }}>
+                  📷 No image tags found on this website's home page (ignoring data URIs).
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                  <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>
+                    Here are the first {galleryImages.length} images found on the homepage. This verifies image asset accessibility.
+                  </p>
+                  
+                  {/* Images Grid */}
+                  <div className="gallery-grid">
+                    {galleryImages.map((src, index) => (
+                      <div key={index} className="gallery-card">
+                        <div className="gallery-img-container">
+                          <img 
+                            src={src} 
+                            alt={`Scraped asset ${index + 1}`}
+                            onError={(e) => {
+                              e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Error+Loading+Image';
+                            }}
+                          />
+                        </div>
+                        <a 
+                          href={src} 
+                          target="_blank" 
+                          rel="noopener noreferrer" 
+                          className="gallery-img-link"
+                          title={src}
+                        >
+                          Link #{index + 1}
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsGalleryModalOpen(false)}>
+                  Close Gallery
                 </button>
               </div>
             </div>

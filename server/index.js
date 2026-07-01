@@ -330,6 +330,64 @@ app.post('/api/monitors/:id/check', async (req, res) => {
   }
 });
 
+// Get website images
+app.get('/api/monitors/:id/images', async (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  const monitor = db.monitors.find(m => m.id === id);
+
+  if (!monitor) {
+    return res.status(404).json({ error: 'Monitor not found' });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+    const response = await fetch(monitor.url, {
+      headers: {
+        'User-Agent': 'UptimeRobot/1.0 (Status Checker Bot)'
+      },
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP Error: ${response.status}`);
+    }
+
+    const html = await response.text();
+
+    // Regex to extract all img src attributes
+    const imgRegex = /<img\s+[^>]*src=["']([^"']+)["']/gi;
+    const images = [];
+    let match;
+
+    while ((match = imgRegex.exec(html)) !== null) {
+      const src = match[1].trim();
+      if (!src) continue;
+      
+      // Ignore base64 data URIs as they might bloat the UI
+      if (src.startsWith('data:')) continue;
+
+      try {
+        const absoluteUrl = new URL(src, monitor.url).href;
+        images.push(absoluteUrl);
+      } catch (e) {
+        images.push(src);
+      }
+    }
+
+    // Remove duplicates and limit to 10 images
+    const uniqueImages = [...new Set(images)].slice(0, 10);
+    res.json({ images: uniqueImages });
+  } catch (error) {
+    console.error(`Error scraping images from ${monitor.url}:`, error);
+    res.status(500).json({ error: `Failed to scrape images: ${error.message}` });
+  }
+});
+
 // Get alert logs
 app.get('/api/logs', (req, res) => {
   const db = readDb();
