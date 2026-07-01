@@ -73,6 +73,7 @@ function App() {
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedError, setSavedError] = useState(null);
   const [savingImageUrls, setSavingImageUrls] = useState({});
+  const [isSavingAll, setIsSavingAll] = useState(false);
 
   // Form states
   const [formName, setFormName] = useState('');
@@ -299,6 +300,36 @@ function App() {
       alert(err.message);
     } finally {
       setSavingImageUrls(prev => ({ ...prev, [imageUrl]: false }));
+    }
+  };
+
+  // Save All Scraped Images to Server
+  const handleSaveAllImagesToServer = async () => {
+    if (galleryImages.length === 0 || !galleryMonitorId) return;
+
+    if (!confirm(`Are you sure you want to download and save all ${galleryImages.length} images to the server?`)) return;
+
+    setIsSavingAll(true);
+    try {
+      const res = await fetch('/api/images/save-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          monitorId: galleryMonitorId,
+          imageUrls: galleryImages
+        })
+      });
+
+      if (!res.ok) throw new Error('Failed to save all images');
+      const data = await res.json();
+      
+      alert(`✓ Batch download finished!\nSaved: ${data.savedCount} images successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+      
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsSavingAll(false);
     }
   };
 
@@ -949,6 +980,17 @@ function App() {
               )}
               
               <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+                {galleryImages.length > 0 && (
+                  <button 
+                    type="button" 
+                    className="btn btn-primary" 
+                    disabled={isSavingAll}
+                    onClick={handleSaveAllImagesToServer}
+                    style={{ marginRight: 'auto' }}
+                  >
+                    {isSavingAll ? '⏳ Saving all...' : '💾 Save All to Server'}
+                  </button>
+                )}
                 <button type="button" className="btn btn-secondary" onClick={() => setIsGalleryModalOpen(false)}>
                   Close Gallery
                 </button>

@@ -338,7 +338,7 @@ app.post('/api/monitors/:id/check', async (req, res) => {
   }
 });
 
-// Get website images
+// Get website images (scrapes both HTML img tags and JS string arrays)
 app.get('/api/monitors/:id/images', async (req, res) => {
   const { id } = req.params;
   const db = readDb();
@@ -354,7 +354,8 @@ app.get('/api/monitors/:id/images', async (req, res) => {
 
     const response = await fetch(monitor.url, {
       headers: {
-        'User-Agent': 'UptimeRobot/1.0 (Status Checker Bot)'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
       },
       signal: controller.signal
     });
@@ -366,19 +367,28 @@ app.get('/api/monitors/:id/images', async (req, res) => {
     }
 
     const html = await response.text();
-
-    // Regex to extract all img src attributes
-    const imgRegex = /<img\s+[^>]*src=["']([^"']+)["']/gi;
     const images = [];
     let match;
 
+    // 1. Regex to extract standard img src attributes
+    const imgRegex = /<img\s+[^>]*src=["']([^"']+)["']/gi;
     while ((match = imgRegex.exec(html)) !== null) {
       const src = match[1].trim();
-      if (!src) continue;
-      
-      // Ignore base64 data URIs as they might bloat the UI
-      if (src.startsWith('data:')) continue;
+      if (src && !src.startsWith('data:')) {
+        try {
+          const absoluteUrl = new URL(src, monitor.url).href;
+          images.push(absoluteUrl);
+        } catch (e) {
+          images.push(src);
+        }
+      }
+    }
 
+    // 2. Regex to extract JS image array maps (like "/img/backcat/...")
+    // Captures strings in quotes that end with image extensions
+    const jsImgRegex = /["']([^"'\s>]+\.(?:jpg|jpeg|png|webp|gif|svg))["']/gi;
+    while ((match = jsImgRegex.exec(html)) !== null) {
+      const src = match[1].trim();
       try {
         const absoluteUrl = new URL(src, monitor.url).href;
         images.push(absoluteUrl);
@@ -387,8 +397,23 @@ app.get('/api/monitors/:id/images', async (req, res) => {
       }
     }
 
-    // Remove duplicates and return all unique images found
-    const uniqueImages = [...new Set(images)];
+    // Filter out static site assets (icons, loaders, ads, etc.)
+    const filteredImages = images.filter(url => {
+      const lower = url.toLowerCase();
+      // Ignore theme-specific assets unless they look like chapter files
+      if (lower.includes('/static/') || lower.includes('/theme/') || lower.includes('/assets/')) {
+        if (!lower.includes('chapter') && !lower.includes('ep0') && !lower.includes('ep-') && !lower.includes('backcat')) {
+          return false;
+        }
+      }
+      if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar')) return false;
+      if (lower.includes('ad-') || lower.includes('ads') || lower.includes('banner') || lower.includes('advertisement')) return false;
+      if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
+      return true;
+    });
+
+    // Remove duplicates
+    const uniqueImages = [...new Set(filteredImages)];
     res.json({ images: uniqueImages });
   } catch (error) {
     console.error(`Error scraping images from ${monitor.url}:`, error);
@@ -484,6 +509,93 @@ app.post('/api/images/save', async (req, res) => {
     console.error(`Error saving image from ${imageUrl}:`, error);
     res.status(500).json({ error: `Failed to save image: ${error.message}` });
   }
+});
+
+// Save multiple website images at once (Batch Save)
+app.post('/api/images/save-all', async (req, res) => {
+  const { monitorId, imageUrls } = req.body;
+  if (!monitorId || !imageUrls || !Array.isArray(imageUrls)) {
+    return res.status(400).json({ error: 'monitorId and imageUrls array are required' });
+  }
+
+  const db = readDb();
+  const monitor = db.monitors.find(m => m.id === monitorId);
+  if (!monitor) {
+    return res.status(404).json({ error: 'Monitor not found' });
+  }
+
+  const savedRecords = [];
+  const errors = [];
+  const batchSize = 5; // Batch download 5 files at a time to prevent server spikes
+
+  for (let i = 0; i < imageUrls.length; i += batchSize) {
+    const batch = imageUrls.slice(i, i + batchSize);
+    await Promise.all(batch.map(async (imageUrl) => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+        let referer = '';
+        try {
+          referer = new URL(imageUrl).origin;
+        } catch (e) {}
+
+        const response = await fetch(imageUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Referer': referer
+          },
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          throw new Error(`HTTP Error ${response.status}`);
+        }
+
+        const contentType = response.headers.get('content-type');
+        const ext = getExtension(imageUrl, contentType);
+        
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        
+        const randomSuffix = Math.random().toString(36).substr(2, 9);
+        const filename = `${monitorId}_${randomSuffix}.${ext}`;
+        const filePath = path.join(SAVED_DIR, filename);
+
+        await fs.promises.writeFile(filePath, buffer);
+
+        const savedRecord = {
+          id: (Date.now() + Math.floor(Math.random() * 1000)).toString(),
+          monitorId,
+          monitorName: monitor.name,
+          originalUrl: imageUrl,
+          filename,
+          timestamp: new Date().toISOString()
+        };
+        
+        savedRecords.push(savedRecord);
+      } catch (err) {
+        errors.push({ url: imageUrl, error: err.message });
+      }
+    }));
+  }
+
+  // Update DB once
+  if (savedRecords.length > 0) {
+    if (!db.saved) db.saved = [];
+    db.saved.push(...savedRecords);
+    writeDb(db);
+  }
+
+  res.status(200).json({
+    savedCount: savedRecords.length,
+    savedRecords,
+    errorCount: errors.length,
+    errors
+  });
 });
 
 // Get all saved images
