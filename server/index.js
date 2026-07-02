@@ -90,6 +90,40 @@ function writeDb(data) {
 // Polling Checking Logic
 const isChecking = {};
 
+// Node's global fetch (undici) wraps the real network failure in err.cause with a
+// libuv/OpenSSL error code (ENOTFOUND, ECONNREFUSED, CERT_HAS_EXPIRED, ...).
+// The default err.message is just "fetch failed", so map the code to something
+// that actually explains which phase failed and why.
+const NETWORK_ERROR_CODE_MESSAGES = {
+  ENOTFOUND: 'DNS lookup failed - the domain does not exist or cannot be resolved',
+  EAI_AGAIN: 'DNS lookup failed temporarily - the DNS server did not respond',
+  ECONNREFUSED: 'Connection refused - nothing is listening on that host/port',
+  ECONNRESET: 'Connection reset by the server while the request was in progress',
+  EHOSTUNREACH: 'Host unreachable - no network route to the server',
+  ENETUNREACH: 'Network unreachable',
+  ETIMEDOUT: 'Connection attempt timed out at the network level',
+  CERT_HAS_EXPIRED: 'SSL certificate has expired',
+  DEPTH_ZERO_SELF_SIGNED_CERT: 'SSL certificate is self-signed and untrusted',
+  SELF_SIGNED_CERT_IN_CHAIN: 'SSL certificate chain contains a self-signed certificate',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'SSL certificate chain could not be verified',
+  ERR_TLS_CERT_ALTNAME_INVALID: 'SSL certificate hostname mismatch',
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: 'SSL certificate issuer is not trusted'
+};
+
+function describeCheckError(err) {
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    return 'Request timed out (10s) - server did not respond in time';
+  }
+  const code = err.cause?.code;
+  if (code && NETWORK_ERROR_CODE_MESSAGES[code]) {
+    return `${NETWORK_ERROR_CODE_MESSAGES[code]} (${code})`;
+  }
+  if (code) {
+    return `${err.cause.message || err.message} (${code})`;
+  }
+  return err.message || 'Connection failed';
+}
+
 async function checkSite(monitor) {
   const startTime = performance.now();
   const timestamp = new Date().toISOString();
@@ -125,11 +159,7 @@ async function checkSite(monitor) {
   } catch (err) {
     responseTime = Math.round(performance.now() - startTime);
     status = 'down';
-    if (err.name === 'AbortError') {
-      errorMsg = 'Request timed out (10s)';
-    } else {
-      errorMsg = err.message || 'Connection failed';
-    }
+    errorMsg = describeCheckError(err);
   }
 
   // Update DB state
@@ -338,6 +368,57 @@ app.post('/api/monitors/:id/check', async (req, res) => {
   }
 });
 
+// Extracts, filters and type-classifies every image referenced by a page's HTML
+// (both plain <img> tags and JS string-array image maps used by manga readers).
+function extractImagesFromHtml(html, pageUrl) {
+  const images = [];
+  let match;
+
+  // 1. Regex to extract standard img src attributes
+  const imgRegex = /<img\s+[^>]*src=["']([^"']+)["']/gi;
+  while ((match = imgRegex.exec(html)) !== null) {
+    const src = match[1].trim();
+    if (src && !src.startsWith('data:')) {
+      try {
+        images.push(new URL(src, pageUrl).href);
+      } catch (e) {
+        images.push(src);
+      }
+    }
+  }
+
+  // 2. Regex to extract JS image array maps (like "/img/backcat/...")
+  // Captures strings in quotes that end with image extensions
+  const jsImgRegex = /["']([^"'\s>]+\.(?:jpg|jpeg|png|webp|gif|svg))["']/gi;
+  while ((match = jsImgRegex.exec(html)) !== null) {
+    const src = match[1].trim();
+    try {
+      images.push(new URL(src, pageUrl).href);
+    } catch (e) {
+      images.push(src);
+    }
+  }
+
+  // Filter out static site assets (icons, loaders, ads, etc.)
+  const filteredImages = images.filter(url => {
+    const lower = url.toLowerCase();
+    // Ignore theme-specific assets unless they look like chapter files
+    if (lower.includes('/static/') || lower.includes('/theme/') || lower.includes('/assets/')) {
+      if (!lower.includes('chapter') && !lower.includes('ep0') && !lower.includes('ep-') && !lower.includes('backcat')) {
+        return false;
+      }
+    }
+    if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar')) return false;
+    if (lower.includes('ad-') || lower.includes('/ads/') || lower.includes('banner') || lower.includes('advertisement')) return false;
+    if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
+    return true;
+  });
+
+  // Remove duplicates
+  const uniqueImages = [...new Set(filteredImages)];
+  return uniqueImages.map(url => ({ url, type: classifyImageType(url) }));
+}
+
 // Get website images (scrapes both HTML img tags and JS string arrays)
 app.get('/api/monitors/:id/images', async (req, res) => {
   const { id } = req.params;
@@ -359,7 +440,7 @@ app.get('/api/monitors/:id/images', async (req, res) => {
       },
       signal: controller.signal
     });
-    
+
     clearTimeout(timeoutId);
 
     if (!response.ok) {
@@ -367,57 +448,245 @@ app.get('/api/monitors/:id/images', async (req, res) => {
     }
 
     const html = await response.text();
-    const images = [];
-    let match;
-
-    // 1. Regex to extract standard img src attributes
-    const imgRegex = /<img\s+[^>]*src=["']([^"']+)["']/gi;
-    while ((match = imgRegex.exec(html)) !== null) {
-      const src = match[1].trim();
-      if (src && !src.startsWith('data:')) {
-        try {
-          const absoluteUrl = new URL(src, monitor.url).href;
-          images.push(absoluteUrl);
-        } catch (e) {
-          images.push(src);
-        }
-      }
-    }
-
-    // 2. Regex to extract JS image array maps (like "/img/backcat/...")
-    // Captures strings in quotes that end with image extensions
-    const jsImgRegex = /["']([^"'\s>]+\.(?:jpg|jpeg|png|webp|gif|svg))["']/gi;
-    while ((match = jsImgRegex.exec(html)) !== null) {
-      const src = match[1].trim();
-      try {
-        const absoluteUrl = new URL(src, monitor.url).href;
-        images.push(absoluteUrl);
-      } catch (e) {
-        images.push(src);
-      }
-    }
-
-    // Filter out static site assets (icons, loaders, ads, etc.)
-    const filteredImages = images.filter(url => {
-      const lower = url.toLowerCase();
-      // Ignore theme-specific assets unless they look like chapter files
-      if (lower.includes('/static/') || lower.includes('/theme/') || lower.includes('/assets/')) {
-        if (!lower.includes('chapter') && !lower.includes('ep0') && !lower.includes('ep-') && !lower.includes('backcat')) {
-          return false;
-        }
-      }
-      if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar')) return false;
-      if (lower.includes('ad-') || lower.includes('/ads/') || lower.includes('banner') || lower.includes('advertisement')) return false;
-      if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
-      return true;
-    });
-
-    // Remove duplicates
-    const uniqueImages = [...new Set(filteredImages)];
-    res.json({ images: uniqueImages });
+    res.json({ images: extractImagesFromHtml(html, monitor.url) });
   } catch (error) {
     console.error(`Error scraping images from ${monitor.url}:`, error);
     res.status(500).json({ error: `Failed to scrape images: ${error.message}` });
+  }
+});
+
+// Fetches a URL as plain text with a timeout, returning null on any failure
+// (missing file, network error, non-2xx status) instead of throwing - callers
+// use this to probe for optional resources like robots.txt / sitemap.xml.
+async function fetchTextOrNull(url, timeoutMs = 8000) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) return null;
+    return await response.text();
+  } catch (e) {
+    return null;
+  }
+}
+
+function parseSitemapLocs(xml) {
+  const locs = [];
+  const locRegex = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+  let match;
+  while ((match = locRegex.exec(xml)) !== null) {
+    locs.push(match[1].trim());
+  }
+  return locs;
+}
+
+// Minimal robots.txt parser: groups consecutive "User-agent:" lines together,
+// collecting the Disallow paths and Crawl-delay that follow until the next
+// group starts. Only the "*" (or first) group is used - good enough to be a
+// polite crawler without implementing the full robots.txt wildcard spec.
+function parseRobotsRules(robotsText) {
+  const groups = [];
+  let current = null;
+  let groupClosed = true; // forces the first "User-agent:" line to start a group
+
+  for (const rawLine of robotsText.split('\n')) {
+    const line = rawLine.split('#')[0].trim();
+    if (!line) continue;
+    const sepIndex = line.indexOf(':');
+    if (sepIndex === -1) continue;
+    const key = line.slice(0, sepIndex).trim().toLowerCase();
+    const value = line.slice(sepIndex + 1).trim();
+
+    if (key === 'user-agent') {
+      if (groupClosed) {
+        current = { userAgents: [], disallow: [], crawlDelaySeconds: null };
+        groups.push(current);
+        groupClosed = false;
+      }
+      current.userAgents.push(value.toLowerCase());
+    } else if (current) {
+      groupClosed = true;
+      if (key === 'disallow' && value) current.disallow.push(value);
+      if (key === 'crawl-delay') {
+        const seconds = parseFloat(value);
+        if (!isNaN(seconds)) current.crawlDelaySeconds = seconds;
+      }
+    }
+  }
+
+  const group = groups.find(g => g.userAgents.includes('*')) || groups[0] || { disallow: [], crawlDelaySeconds: null };
+  return { disallowPaths: group.disallow, crawlDelaySeconds: group.crawlDelaySeconds };
+}
+
+function isPathDisallowed(pageUrl, disallowPaths) {
+  let pathname;
+  try {
+    pathname = new URL(pageUrl).pathname;
+  } catch (e) {
+    return false;
+  }
+  return disallowPaths.some(rule => pathname.startsWith(rule.replace(/\*+$/, '')));
+}
+
+// A sitemap can itself be a "sitemap index" pointing at other sitemap files
+// (common on large sites that split pages by year/category). Only a bounded
+// number of sub-sitemaps are followed, and only the first MAX_SITEMAP_PAGES
+// page URLs are ever scanned per-page below - crawling "every page" on a
+// site with thousands of URLs would be slow and likely to get the monitor's
+// IP rate-limited or blocked by the target site.
+const MAX_SITEMAP_PAGES = 30;
+const MAX_SUB_SITEMAPS = 5;
+
+async function discoverSitemapPages(monitorUrl) {
+  const origin = new URL(monitorUrl).origin;
+  const robotsText = await fetchTextOrNull(`${origin}/robots.txt`);
+  const robotsRules = robotsText ? parseRobotsRules(robotsText) : { disallowPaths: [], crawlDelaySeconds: null };
+
+  // Prefer whatever sitemap(s) the site itself declares in robots.txt
+  let sitemapEntryUrls = [];
+  if (robotsText) {
+    for (const line of robotsText.split('\n')) {
+      const match = line.match(/^\s*Sitemap:\s*(\S+)/i);
+      if (match) sitemapEntryUrls.push(match[1].trim());
+    }
+  }
+  // Fall back to the conventional location if robots.txt didn't name one
+  if (sitemapEntryUrls.length === 0) {
+    sitemapEntryUrls.push(`${origin}/sitemap.xml`);
+  }
+
+  const allPageUrls = [];
+  let sitemapFound = false;
+
+  for (const sitemapUrl of sitemapEntryUrls.slice(0, MAX_SUB_SITEMAPS)) {
+    const xml = await fetchTextOrNull(sitemapUrl);
+    if (!xml) continue;
+    sitemapFound = true;
+    const locs = parseSitemapLocs(xml);
+
+    if (/<sitemapindex/i.test(xml)) {
+      for (const subUrl of locs.slice(0, MAX_SUB_SITEMAPS)) {
+        const subXml = await fetchTextOrNull(subUrl);
+        if (subXml) allPageUrls.push(...parseSitemapLocs(subXml));
+      }
+    } else {
+      allPageUrls.push(...locs);
+    }
+  }
+
+  const uniquePageUrls = [...new Set(allPageUrls)];
+  const allowedPageUrls = uniquePageUrls.filter(url => !isPathDisallowed(url, robotsRules.disallowPaths));
+
+  return {
+    sitemapFound,
+    totalDiscovered: uniquePageUrls.length,
+    totalAllowed: allowedPageUrls.length,
+    pages: allowedPageUrls.slice(0, MAX_SITEMAP_PAGES),
+    crawlDelaySeconds: robotsRules.crawlDelaySeconds
+  };
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Randomized (jittered) delay between page requests - a perfectly constant
+// gap between requests is itself a bot fingerprint, so a human-like random
+// wait is safer than a fixed one. If the site published a Crawl-delay in
+// robots.txt, that's treated as a floor and never gone below.
+const MIN_PAGE_DELAY_MS = 400;
+const MAX_PAGE_DELAY_MS = 1400;
+
+function computeNextDelayMs(crawlDelaySeconds) {
+  const jitterMs = MIN_PAGE_DELAY_MS + Math.random() * (MAX_PAGE_DELAY_MS - MIN_PAGE_DELAY_MS);
+  const crawlDelayMs = crawlDelaySeconds ? crawlDelaySeconds * 1000 : 0;
+  return Math.max(jitterMs, crawlDelayMs);
+}
+
+// Fetches one page's status (reusing the same rich error diagnosis as the
+// uptime checker) plus every image found on it.
+async function fetchPageDetails(pageUrl) {
+  const startTime = performance.now();
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(pageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+    const responseTime = Math.round(performance.now() - startTime);
+    const statusCode = response.status;
+
+    if (statusCode < 200 || statusCode >= 400) {
+      return { url: pageUrl, status: 'down', statusCode, responseTime, error: `HTTP Error Code: ${statusCode}`, images: [] };
+    }
+
+    const html = await response.text();
+    return { url: pageUrl, status: 'up', statusCode, responseTime, error: null, images: extractImagesFromHtml(html, pageUrl) };
+  } catch (err) {
+    const responseTime = Math.round(performance.now() - startTime);
+    return { url: pageUrl, status: 'down', statusCode: null, responseTime, error: describeCheckError(err), images: [] };
+  }
+}
+
+// Scan every page a site's sitemap.xml declares (bounded), reporting each
+// page's up/down status and the images found on it.
+app.get('/api/monitors/:id/pages', async (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  const monitor = db.monitors.find(m => m.id === id);
+
+  if (!monitor) {
+    return res.status(404).json({ error: 'Monitor not found' });
+  }
+
+  try {
+    const discovery = await discoverSitemapPages(monitor.url);
+    if (!discovery.sitemapFound) {
+      return res.status(404).json({ error: 'ไม่พบ sitemap.xml สำหรับเว็บนี้ (เช็คทั้ง robots.txt และ /sitemap.xml แล้ว)' });
+    }
+
+    // Scan pages one at a time with a randomized delay between them (never
+    // concurrently) - a burst of parallel requests is what got a real site
+    // blocked during testing. Stop immediately if the site starts responding
+    // with 429/403, rather than continuing to hammer a site that's blocking us.
+    const pages = [];
+    let blockedEarly = false;
+    for (let i = 0; i < discovery.pages.length; i++) {
+      if (i > 0) {
+        await sleep(computeNextDelayMs(discovery.crawlDelaySeconds));
+      }
+
+      const detail = await fetchPageDetails(discovery.pages[i]);
+      pages.push(detail);
+
+      if (detail.statusCode === 429 || detail.statusCode === 403) {
+        blockedEarly = true;
+        break;
+      }
+    }
+
+    res.json({
+      totalDiscovered: discovery.totalDiscovered,
+      totalAllowed: discovery.totalAllowed,
+      processedCount: pages.length,
+      limited: discovery.totalAllowed > pages.length,
+      blockedEarly,
+      pages
+    });
+  } catch (error) {
+    console.error(`Error scanning pages for ${monitor.url}:`, error);
+    res.status(500).json({ error: `Failed to scan site pages: ${error.message}` });
   }
 });
 
@@ -438,6 +707,35 @@ function getExtension(url, contentType) {
     }
   }
   return 'png';
+}
+
+// Heuristic classification of an image into ad / manga / content, based on its URL path.
+// No image-recognition is available, so this is a best-effort keyword guess and can misclassify.
+// Only the path+query is inspected (never the hostname) - otherwise a site whose own domain
+// happens to contain a keyword (e.g. "go-manga.com") would tag every single image on it,
+// ads included, as that type.
+const MANGA_TYPE_KEYWORDS = ['chapter', 'backcat', 'manga', 'comic', 'toon'];
+const MANGA_EPISODE_REGEX = /ep[-_]?\d/;
+const AD_TYPE_KEYWORDS = [
+  'ad-', '/ads/', 'banner', 'advertisement', 'promo', 'bonus', 'sponsor',
+  'bet', 'ufa', 'casino', 'lsm', 'joker', 'slot', 'huay', 'lotto', 'crypto',
+  'sa-game', 'sagame', 'sexy', 'gclub', 'baccarat', 'roulette', 'jackpot',
+  'vip', 'deposit', 'withdraw', 'discord', 'facebook', 'fbcdn', 'cdninstagram',
+  'twitter', 'line.me'
+];
+
+function classifyImageType(url) {
+  let pathPortion = url;
+  try {
+    const parsed = new URL(url);
+    pathPortion = parsed.pathname + parsed.search;
+  } catch (e) {
+    // Not an absolute URL - fall back to classifying the raw string.
+  }
+  const lower = pathPortion.toLowerCase();
+  if (AD_TYPE_KEYWORDS.some(k => lower.includes(k))) return 'ad';
+  if (MANGA_TYPE_KEYWORDS.some(k => lower.includes(k)) || MANGA_EPISODE_REGEX.test(lower)) return 'manga';
+  return 'content';
 }
 
 // Save selected website image
@@ -497,6 +795,7 @@ app.post('/api/images/save', async (req, res) => {
       monitorName: monitor.name,
       originalUrl: imageUrl,
       filename,
+      type: classifyImageType(imageUrl),
       timestamp: new Date().toISOString()
     };
 
@@ -573,6 +872,7 @@ app.post('/api/images/save-all', async (req, res) => {
           monitorName: monitor.name,
           originalUrl: imageUrl,
           filename,
+          type: classifyImageType(imageUrl),
           timestamp: new Date().toISOString()
         };
         
@@ -604,6 +904,39 @@ app.get('/api/images/saved', (req, res) => {
   res.json(db.saved || []);
 });
 
+// Delete a specific set of saved images by id (multi-select bulk delete).
+// Registered before the '/:id' route below, otherwise Express would match
+// this path's "bulk" segment as an :id and shadow this handler.
+app.delete('/api/images/saved/bulk', (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'ids array is required' });
+  }
+
+  const db = readDb();
+  if (!db.saved) db.saved = [];
+  const idsSet = new Set(ids);
+  const toDelete = db.saved.filter(item => idsSet.has(item.id));
+
+  if (toDelete.length === 0) {
+    return res.status(404).json({ error: 'No matching saved images found' });
+  }
+
+  toDelete.forEach(record => {
+    const filePath = path.join(SAVED_DIR, record.filename);
+    fs.unlink(filePath, (err) => {
+      if (err && err.code !== 'ENOENT') {
+        console.error(`Failed to delete file ${filePath}:`, err);
+      }
+    });
+  });
+
+  db.saved = db.saved.filter(item => !idsSet.has(item.id));
+  writeDb(db);
+
+  res.json({ message: `Successfully deleted ${toDelete.length} saved images` });
+});
+
 // Delete saved image from server
 app.delete('/api/images/saved/:id', (req, res) => {
   const { id } = req.params;
@@ -631,6 +964,35 @@ app.delete('/api/images/saved/:id', (req, res) => {
   writeDb(db);
 
   res.json({ message: 'Saved image deleted successfully' });
+});
+
+// Delete a group of saved images by monitor ID
+app.delete('/api/images/saved/group/:monitorId', (req, res) => {
+  const { monitorId } = req.params;
+  const db = readDb();
+  
+  if (!db.saved) db.saved = [];
+  const toDelete = db.saved.filter(item => item.monitorId === monitorId);
+  
+  if (toDelete.length === 0) {
+    return res.status(404).json({ error: 'No saved images found for this monitor' });
+  }
+
+  // Delete physical files
+  toDelete.forEach(record => {
+    const filePath = path.join(SAVED_DIR, record.filename);
+    fs.unlink(filePath, (err) => {
+      if (err && err.code !== 'ENOENT') {
+        console.error(`Failed to delete file ${filePath}:`, err);
+      }
+    });
+  });
+
+  // Filter out metadata from DB
+  db.saved = db.saved.filter(item => item.monitorId !== monitorId);
+  writeDb(db);
+
+  res.json({ message: `Successfully deleted ${toDelete.length} saved images for this group` });
 });
 
 // Get alert logs

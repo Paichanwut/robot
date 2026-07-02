@@ -74,6 +74,26 @@ function App() {
   const [savedError, setSavedError] = useState(null);
   const [savingImageUrls, setSavingImageUrls] = useState({});
   const [isSavingAll, setIsSavingAll] = useState(false);
+  const [activeSavedTab, setActiveSavedTab] = useState('');
+  const [visibleTypes, setVisibleTypes] = useState({ ad: true, content: true, manga: true });
+  const [selectedImageIds, setSelectedImageIds] = useState({});
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [selectedGalleryUrls, setSelectedGalleryUrls] = useState({});
+  const [isSavingSelected, setIsSavingSelected] = useState(false);
+  const [isPagesModalOpen, setIsPagesModalOpen] = useState(false);
+  const [pagesMonitorId, setPagesMonitorId] = useState('');
+  const [pagesMonitorName, setPagesMonitorName] = useState('');
+  const [pagesResult, setPagesResult] = useState(null);
+  const [pagesLoading, setPagesLoading] = useState(false);
+  const [pagesError, setPagesError] = useState(null);
+  const [expandedPageUrls, setExpandedPageUrls] = useState({});
+
+  // Metadata (label/icon) for the heuristic image type classification
+  const SAVED_TYPE_META = {
+    ad: { label: 'โฆษณา', icon: '📢' },
+    content: { label: 'ข้อมูล', icon: '📄' },
+    manga: { label: 'อื่นๆ', icon: '📖' }
+  };
 
   // Form states
   const [formName, setFormName] = useState('');
@@ -240,6 +260,7 @@ function App() {
     setGalleryLoading(true);
     setGalleryError(null);
     setIsGalleryModalOpen(true);
+    setSelectedGalleryUrls({});
 
     try {
       const res = await fetch(`/api/monitors/${monitor.id}/images`);
@@ -255,6 +276,35 @@ function App() {
     }
   };
 
+  // Handle Open Site Pages Scan (discovers pages via sitemap.xml, checks each one's status + images)
+  const handleOpenPagesScan = async (monitor) => {
+    setPagesMonitorId(monitor.id);
+    setPagesMonitorName(monitor.name);
+    setPagesResult(null);
+    setPagesLoading(true);
+    setPagesError(null);
+    setExpandedPageUrls({});
+    setIsPagesModalOpen(true);
+
+    try {
+      const res = await fetch(`/api/monitors/${monitor.id}/pages`);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to scan site pages');
+      }
+      setPagesResult(data);
+    } catch (err) {
+      setPagesError(err.message || 'Error occurred while scanning site pages');
+    } finally {
+      setPagesLoading(false);
+    }
+  };
+
+  // Toggle whether a scanned page's image list is expanded
+  const togglePageExpanded = (url) => {
+    setExpandedPageUrls(prev => ({ ...prev, [url]: !prev[url] }));
+  };
+
   // Fetch Saved Images List
   const fetchSavedImages = async () => {
     setSavedLoading(true);
@@ -264,6 +314,18 @@ function App() {
       if (!res.ok) throw new Error('Failed to fetch saved images from server');
       const data = await res.json();
       setSavedImages(data);
+
+      if (data.length > 0) {
+        const uniqueGroups = Array.from(new Set(data.map(item => item.monitorId)));
+        setActiveSavedTab(prev => {
+          if (!prev || !uniqueGroups.includes(prev)) {
+            return uniqueGroups[0];
+          }
+          return prev;
+        });
+      } else {
+        setActiveSavedTab('');
+      }
     } catch (err) {
       setSavedError(err.message);
     } finally {
@@ -274,6 +336,7 @@ function App() {
   // Open Saved Gallery Modal
   const handleOpenSavedGallery = () => {
     setIsSavedGalleryOpen(true);
+    setSelectedImageIds({});
     fetchSavedImages();
   };
 
@@ -316,7 +379,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           monitorId: galleryMonitorId,
-          imageUrls: galleryImages
+          imageUrls: galleryImages.map(img => img.url)
         })
       });
 
@@ -330,6 +393,43 @@ function App() {
       alert(err.message);
     } finally {
       setIsSavingAll(false);
+    }
+  };
+
+  // Toggle a single scraped image's checkbox selection (live gallery)
+  const toggleSelectedGalleryUrl = (url) => {
+    setSelectedGalleryUrls(prev => ({ ...prev, [url]: !prev[url] }));
+  };
+
+  // Save only the checked scraped images to the server
+  const handleSaveSelectedImagesToServer = async () => {
+    const urls = Object.keys(selectedGalleryUrls).filter(url => selectedGalleryUrls[url]);
+    if (urls.length === 0 || !galleryMonitorId) return;
+
+    if (!confirm(`Are you sure you want to download and save the ${urls.length} selected image(s) to the server?`)) return;
+
+    setIsSavingSelected(true);
+    try {
+      const res = await fetch('/api/images/save-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          monitorId: galleryMonitorId,
+          imageUrls: urls
+        })
+      });
+
+      if (!res.ok) throw new Error('Failed to save selected images');
+      const data = await res.json();
+
+      alert(`✓ Saved ${data.savedCount} selected image(s) successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+
+      setSelectedGalleryUrls({});
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsSavingSelected(false);
     }
   };
 
@@ -349,14 +449,67 @@ function App() {
     }
   };
 
-  // Group saved images by website origin name
-  const groupSavedImagesByWebsite = () => {
+  // Delete a group of saved images by monitor ID
+  const handleDeleteSavedGroup = async (monitorId, groupName) => {
+    if (!confirm(`Are you sure you want to delete ALL saved images for "${groupName}" from the server?`)) return;
+
+    try {
+      const res = await fetch(`/api/images/saved/group/${monitorId}`, {
+        method: 'DELETE'
+      });
+
+      if (!res.ok) throw new Error('Failed to delete saved group');
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Toggle a single saved image's checkbox selection
+  const toggleSelectedImage = (id) => {
+    setSelectedImageIds(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  // Toggle whether a given image type (ad/content/manga) is shown
+  const toggleVisibleType = (type) => {
+    setVisibleTypes(prev => ({ ...prev, [type]: !prev[type] }));
+  };
+
+  // Delete all currently checked saved images in one request
+  const handleDeleteSelectedImages = async () => {
+    const ids = Object.keys(selectedImageIds).filter(id => selectedImageIds[id]);
+    if (ids.length === 0) return;
+    if (!confirm(`Are you sure you want to delete the ${ids.length} selected image(s) from the server?`)) return;
+
+    setIsBulkDeleting(true);
+    try {
+      const res = await fetch('/api/images/saved/bulk', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+      });
+
+      if (!res.ok) throw new Error('Failed to delete selected images');
+      setSelectedImageIds({});
+      fetchSavedImages();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsBulkDeleting(false);
+    }
+  };
+
+  // Group saved images by monitorId
+  const getSavedImagesGroups = () => {
     const groups = {};
     savedImages.forEach(img => {
-      if (!groups[img.monitorName]) {
-        groups[img.monitorName] = [];
+      if (!groups[img.monitorId]) {
+        groups[img.monitorId] = {
+          name: img.monitorName,
+          items: []
+        };
       }
-      groups[img.monitorName].push(img);
+      groups[img.monitorId].items.push(img);
     });
     return groups;
   };
@@ -665,6 +818,18 @@ function App() {
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
+                          title="Scan all site pages via sitemap.xml"
+                          disabled={!monitor.active || monitor.status !== 'up'}
+                          onClick={() => handleOpenPagesScan(monitor)}
+                          style={{
+                            cursor: (!monitor.active || monitor.status !== 'up') ? 'not-allowed' : 'pointer',
+                            opacity: (!monitor.active || monitor.status !== 'up') ? 0.5 : 1
+                          }}
+                        >
+                          🗺️
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-icon-only"
                           title="Edit settings"
                           onClick={() => openEditModal(monitor)}
                         >
@@ -934,65 +1099,235 @@ function App() {
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                   <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>
-                    Here are all the {galleryImages.length} unique images found on the homepage. This verifies image asset accessibility.
+                    Here are all the {galleryImages.length} unique images found on the homepage, split by guessed type. This verifies image asset accessibility.
                   </p>
-                  
-                  {/* Images Grid */}
-                  <div className="gallery-grid">
-                    {galleryImages.map((src, index) => (
-                      <div key={index} className="gallery-card">
-                        <div className="gallery-img-container">
-                          <img 
-                            src={src} 
-                            alt={`Scraped asset ${index + 1}`}
-                            onError={(e) => {
-                              e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Error+Loading+Image';
-                            }}
-                          />
-                        </div>
-                        <a 
-                          href={src} 
-                          target="_blank" 
-                          rel="noopener noreferrer" 
-                          className="gallery-img-link"
-                          title={src}
-                        >
-                          Link #{index + 1}
-                        </a>
-                        <button
-                          className="btn btn-secondary"
-                          style={{
-                            padding: '0.2rem 0.5rem',
-                            fontSize: '0.7rem',
-                            marginTop: '0.25rem',
-                            width: '100%',
-                            gap: '0.25rem'
-                          }}
-                          disabled={savingImageUrls[src]}
-                          onClick={() => handleSaveImageToServer(galleryMonitorId, src)}
-                        >
-                          {savingImageUrls[src] ? '⏳ Saving...' : '💾 Save to Server'}
-                        </button>
-                      </div>
+
+                  {/* Type Filter Checkboxes */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+                    <span style={{ color: 'var(--color-text-muted)' }}>แสดง Type:</span>
+                    {Object.entries(SAVED_TYPE_META).map(([type, meta]) => (
+                      <label key={type} style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={visibleTypes[type]}
+                          onChange={() => toggleVisibleType(type)}
+                        />
+                        {meta.icon} {meta.label}
+                      </label>
                     ))}
                   </div>
+
+                  {/* Images Grid, grouped by guessed type */}
+                  {(() => {
+                    const itemsByType = { ad: [], content: [], manga: [] };
+                    galleryImages.forEach(item => {
+                      const type = itemsByType[item.type] ? item.type : 'content';
+                      itemsByType[type].push(item);
+                    });
+
+                    return Object.entries(itemsByType).map(([type, items]) => {
+                      if (items.length === 0 || !visibleTypes[type]) return null;
+                      const meta = SAVED_TYPE_META[type];
+                      return (
+                        <div key={type} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                          <h5 style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)', margin: 0 }}>
+                            {meta.icon} {meta.label} ({items.length})
+                          </h5>
+                          <div className="gallery-grid">
+                            {items.map((item, index) => (
+                              <div key={index} className="gallery-card">
+                                <div className="gallery-img-container" style={{ position: 'relative' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={!!selectedGalleryUrls[item.url]}
+                                    onChange={() => toggleSelectedGalleryUrl(item.url)}
+                                    style={{ position: 'absolute', top: '0.35rem', left: '0.35rem', width: '1.1rem', height: '1.1rem', cursor: 'pointer', zIndex: 1 }}
+                                    title="Select image"
+                                  />
+                                  <img
+                                    src={item.url}
+                                    alt={`Scraped asset ${index + 1}`}
+                                    onError={(e) => {
+                                      e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Error+Loading+Image';
+                                    }}
+                                  />
+                                </div>
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="gallery-img-link"
+                                  title={item.url}
+                                >
+                                  Link #{index + 1}
+                                </a>
+                                <button
+                                  className="btn btn-secondary"
+                                  style={{
+                                    padding: '0.2rem 0.5rem',
+                                    fontSize: '0.7rem',
+                                    marginTop: '0.25rem',
+                                    width: '100%',
+                                    gap: '0.25rem'
+                                  }}
+                                  disabled={savingImageUrls[item.url]}
+                                  onClick={() => handleSaveImageToServer(galleryMonitorId, item.url)}
+                                >
+                                  {savingImageUrls[item.url] ? '⏳ Saving...' : '💾 Save to Server'}
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
                 </div>
               )}
               
-              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+              <div className="modal-footer" style={{ marginTop: '0.5rem', flexWrap: 'wrap' }}>
+                {Object.values(selectedGalleryUrls).some(Boolean) && (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={isSavingSelected}
+                    onClick={handleSaveSelectedImagesToServer}
+                    style={{ marginRight: 'auto' }}
+                  >
+                    {isSavingSelected
+                      ? '⏳ Saving selected...'
+                      : `💾 Save Selected (${Object.values(selectedGalleryUrls).filter(Boolean).length})`}
+                  </button>
+                )}
                 {galleryImages.length > 0 && (
-                  <button 
-                    type="button" 
-                    className="btn btn-primary" 
+                  <button
+                    type="button"
+                    className="btn btn-primary"
                     disabled={isSavingAll}
                     onClick={handleSaveAllImagesToServer}
-                    style={{ marginRight: 'auto' }}
+                    style={{ marginRight: Object.values(selectedGalleryUrls).some(Boolean) ? 0 : 'auto' }}
                   >
                     {isSavingAll ? '⏳ Saving all...' : '💾 Save All to Server'}
                   </button>
                 )}
                 <button type="button" className="btn btn-secondary" onClick={() => setIsGalleryModalOpen(false)}>
                   Close Gallery
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Site Pages Scan Modal (discovers pages via sitemap.xml, checks status + images per page) */}
+      {isPagesModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ maxWidth: '800px', width: '95%' }}>
+            <div className="modal-header">
+              <h3>🗺️ Site Pages: {pagesMonitorName}</h3>
+              <button className="modal-close" onClick={() => setIsPagesModalOpen(false)}>×</button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '75vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
+              {pagesLoading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '3rem 0', gap: '1rem' }}>
+                  <div className="spinner" />
+                  <span style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)' }}>
+                    กำลังหา sitemap.xml และสแกนแต่ละหน้า (อาจใช้เวลาสักครู่)...
+                  </span>
+                </div>
+              ) : pagesError ? (
+                <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
+                  ⚠️ {pagesError}
+                </div>
+              ) : pagesResult && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>
+                    พบทั้งหมด {pagesResult.totalDiscovered} หน้าใน sitemap.xml
+                    {pagesResult.totalAllowed !== pagesResult.totalDiscovered && ` (robots.txt อนุญาตให้เข้าถึง ${pagesResult.totalAllowed} หน้า)`}
+                    {pagesResult.limited && ` — สแกนแค่ ${pagesResult.processedCount} หน้าแรก (จำกัดไว้กันโดนเว็บบล็อก)`}
+                  </p>
+                  {pagesResult.blockedEarly && (
+                    <p style={{ fontSize: '0.85rem', color: 'var(--color-red)' }}>
+                      ⚠️ เว็บเริ่มตอบกลับแบบจำกัด/บล็อก (HTTP 429/403) ระบบเลยหยุดสแกนหน้าที่เหลือให้อัตโนมัติเพื่อความปลอดภัย
+                    </p>
+                  )}
+
+                  {pagesResult.pages.map((page) => {
+                    const typeCounts = page.images.reduce((acc, img) => {
+                      acc[img.type] = (acc[img.type] || 0) + 1;
+                      return acc;
+                    }, {});
+                    const isExpanded = expandedPageUrls[page.url];
+
+                    return (
+                      <div key={page.url} style={{ border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', minWidth: 0 }}>
+                            <a href={page.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-cyan)', fontSize: '0.85rem', wordBreak: 'break-all' }}>
+                              {page.url}
+                            </a>
+                            {page.status === 'down' && (
+                              <span style={{ fontSize: '0.75rem', color: 'var(--color-red)', fontFamily: 'var(--font-mono)' }}>
+                                ⚠️ {page.error}
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexShrink: 0 }}>
+                            {page.status === 'up' ? (
+                              <span className="status-badge badge-up">
+                                <span className="pulse-dot up" /> {page.statusCode} · {page.responseTime}ms
+                              </span>
+                            ) : (
+                              <span className="status-badge badge-down">
+                                <span className="pulse-dot down" /> {page.statusCode || 'Down'}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {page.images.length > 0 && (
+                          <div style={{ marginTop: '0.5rem' }}>
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}
+                              onClick={() => togglePageExpanded(page.url)}
+                            >
+                              {isExpanded ? '▲ ซ่อนรูป' : '▼'} 🖼️ {page.images.length} รูป
+                              {Object.entries(typeCounts).map(([type, count]) => ` · ${SAVED_TYPE_META[type]?.icon || ''}${count}`)}
+                            </button>
+
+                            {isExpanded && (
+                              <div className="gallery-grid" style={{ marginTop: '0.5rem' }}>
+                                {page.images.map((img, idx) => (
+                                  <div key={idx} className="gallery-card">
+                                    <div className="gallery-img-container">
+                                      <img
+                                        src={img.url}
+                                        alt={`Page asset ${idx + 1}`}
+                                        onError={(e) => {
+                                          e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Error+Loading+Image';
+                                        }}
+                                      />
+                                    </div>
+                                    <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textAlign: 'center' }}>
+                                      {SAVED_TYPE_META[img.type]?.icon} {SAVED_TYPE_META[img.type]?.label}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsPagesModalOpen(false)}>
+                  Close
                 </button>
               </div>
             </div>
@@ -1024,55 +1359,147 @@ function App() {
                   📂 No images saved yet. Open a website's image gallery and click "Save to Server" to add photos.
                 </div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-                  {Object.entries(groupSavedImagesByWebsite()).map(([websiteName, items]) => (
-                    <div key={websiteName} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '1.5rem' }}>
-                      <h4 style={{ fontSize: '1.05rem', color: 'var(--color-cyan)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        🌐 {websiteName} <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({items.length} images)</span>
-                      </h4>
-                      <div className="gallery-grid">
-                        {items.map((item) => (
-                          <div key={item.id} className="gallery-card">
-                            <div className="gallery-img-container">
-                              <img 
-                                src={`/api/saved-assets/${item.filename}`} 
-                                alt={item.originalUrl}
-                                onError={(e) => {
-                                  e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
-                                }}
-                              />
-                            </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', padding: '0.25rem 0' }}>
-                              <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textAlign: 'center' }}>
-                                Saved: {new Date(item.timestamp).toLocaleDateString()}
-                              </span>
-                              <div style={{ display: 'flex', gap: '0.25rem', width: '100%', marginTop: '0.25rem' }}>
-                                <a 
-                                  href={`/api/saved-assets/${item.filename}`} 
-                                  download 
-                                  target="_blank" 
-                                  rel="noopener noreferrer" 
-                                  className="btn btn-secondary" 
-                                  style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
-                                  title="View full size image"
-                                >
-                                  🔗 View
-                                </a>
-                                <button 
-                                  className="btn btn-danger" 
-                                  style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
-                                  onClick={() => handleDeleteSavedImage(item.id)}
-                                  title="Delete from server"
-                                >
-                                  🗑️ Delete
-                                </button>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  {/* Tab Bar for Saved Groups */}
+                  <div style={{ display: 'flex', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '0.5rem', marginBottom: '0.5rem', overflowX: 'auto', gap: '0.5rem' }}>
+                    {Object.entries(getSavedImagesGroups()).map(([id, group]) => (
+                      <button
+                        key={id}
+                        className={`tab-btn ${activeSavedTab === id ? 'active' : ''}`}
+                        style={{
+                          background: activeSavedTab === id ? 'var(--gradient-cyan-blue)' : 'rgba(255,255,255,0.05)',
+                          color: '#fff',
+                          border: 'none',
+                          padding: '0.5rem 1rem',
+                          borderRadius: '0.5rem',
+                          cursor: 'pointer',
+                          fontSize: '0.85rem',
+                          fontWeight: activeSavedTab === id ? '600' : 'normal',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          whiteSpace: 'nowrap'
+                        }}
+                        onClick={() => { setActiveSavedTab(id); setSelectedImageIds({}); }}
+                      >
+                        🌐 {group.name} ({group.items.length})
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Type Filter Checkboxes */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+                    <span style={{ color: 'var(--color-text-muted)' }}>แสดง Type:</span>
+                    {Object.entries(SAVED_TYPE_META).map(([type, meta]) => (
+                      <label key={type} style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={visibleTypes[type]}
+                          onChange={() => toggleVisibleType(type)}
+                        />
+                        {meta.icon} {meta.label}
+                      </label>
+                    ))}
+                  </div>
+
+                  {Object.entries(getSavedImagesGroups()).map(([id, group]) => {
+                    if (activeSavedTab !== id) return null;
+                    const itemsByType = { ad: [], content: [], manga: [] };
+                    group.items.forEach(item => {
+                      const type = itemsByType[item.type] ? item.type : 'content';
+                      itemsByType[type].push(item);
+                    });
+                    const selectedCount = group.items.filter(item => selectedImageIds[item.id]).length;
+
+                    return (
+                      <div key={id} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+                          <h4 style={{ fontSize: '1.1rem', color: 'var(--color-cyan)', margin: 0 }}>
+                            🌐 {group.name} <span style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({group.items.length} images)</span>
+                          </h4>
+                          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            {selectedCount > 0 && (
+                              <button
+                                className="btn btn-danger"
+                                style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                                disabled={isBulkDeleting}
+                                onClick={handleDeleteSelectedImages}
+                              >
+                                {isBulkDeleting ? '⏳ Deleting...' : `🗑️ Delete Selected (${selectedCount})`}
+                              </button>
+                            )}
+                            <button
+                              className="btn btn-danger"
+                              style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                              onClick={() => handleDeleteSavedGroup(id, group.name)}
+                            >
+                              🗑️ Delete All ({group.items.length} images)
+                            </button>
+                          </div>
+                        </div>
+
+                        {Object.entries(itemsByType).map(([type, items]) => {
+                          if (items.length === 0 || !visibleTypes[type]) return null;
+                          const meta = SAVED_TYPE_META[type];
+                          return (
+                            <div key={type} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                              <h5 style={{ fontSize: '0.9rem', color: 'var(--color-text-secondary)', margin: 0 }}>
+                                {meta.icon} {meta.label} ({items.length})
+                              </h5>
+                              <div className="gallery-grid">
+                                {items.map((item) => (
+                                  <div key={item.id} className="gallery-card">
+                                    <div className="gallery-img-container" style={{ position: 'relative' }}>
+                                      <input
+                                        type="checkbox"
+                                        checked={!!selectedImageIds[item.id]}
+                                        onChange={() => toggleSelectedImage(item.id)}
+                                        style={{ position: 'absolute', top: '0.35rem', left: '0.35rem', width: '1.1rem', height: '1.1rem', cursor: 'pointer', zIndex: 1 }}
+                                        title="Select image"
+                                      />
+                                      <img
+                                        src={`/api/saved-assets/${item.filename}`}
+                                        alt={item.originalUrl}
+                                        onError={(e) => {
+                                          e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
+                                        }}
+                                      />
+                                    </div>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', padding: '0.25rem 0' }}>
+                                      <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textAlign: 'center' }}>
+                                        Saved: {new Date(item.timestamp).toLocaleDateString()}
+                                      </span>
+                                      <div style={{ display: 'flex', gap: '0.25rem', width: '100%', marginTop: '0.25rem' }}>
+                                        <a
+                                          href={`/api/saved-assets/${item.filename}`}
+                                          download
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="btn btn-secondary"
+                                          style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
+                                          title="View full size image"
+                                        >
+                                          🔗 View
+                                        </a>
+                                        <button
+                                          className="btn btn-danger"
+                                          style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
+                                          onClick={() => handleDeleteSavedImage(item.id)}
+                                          title="Delete from server"
+                                        >
+                                          🗑️ Delete
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
                               </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               
