@@ -534,11 +534,11 @@ function isPathDisallowed(pageUrl, disallowPaths) {
 
 // A sitemap can itself be a "sitemap index" pointing at other sitemap files
 // (common on large sites that split pages by year/category). Only a bounded
-// number of sub-sitemaps are followed, and only the first MAX_SITEMAP_PAGES
-// page URLs are ever scanned per-page below - crawling "every page" on a
-// site with thousands of URLs would be slow and likely to get the monitor's
-// IP rate-limited or blocked by the target site.
-const MAX_SITEMAP_PAGES = 30;
+// number of sub-sitemaps are followed to avoid runaway recursion. Every
+// allowed page URL is scanned (no cap) - the jittered per-request delay and
+// the 429/403 auto-stop below (see blockedEarly) are what actually protect
+// the target site from being hammered, so a page-count cap isn't needed for
+// that anymore. Large sites will just take longer to finish.
 const MAX_SUB_SITEMAPS = 5;
 
 async function discoverSitemapPages(monitorUrl) {
@@ -585,7 +585,7 @@ async function discoverSitemapPages(monitorUrl) {
     sitemapFound,
     totalDiscovered: uniquePageUrls.length,
     totalAllowed: allowedPageUrls.length,
-    pages: allowedPageUrls.slice(0, MAX_SITEMAP_PAGES),
+    pages: allowedPageUrls,
     crawlDelaySeconds: robotsRules.crawlDelaySeconds
   };
 }

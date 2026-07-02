@@ -86,7 +86,6 @@ function App() {
   const [pagesResult, setPagesResult] = useState(null);
   const [pagesLoading, setPagesLoading] = useState(false);
   const [pagesError, setPagesError] = useState(null);
-  const [expandedPageUrls, setExpandedPageUrls] = useState({});
 
   // Metadata (label/icon) for the heuristic image type classification
   const SAVED_TYPE_META = {
@@ -283,7 +282,6 @@ function App() {
     setPagesResult(null);
     setPagesLoading(true);
     setPagesError(null);
-    setExpandedPageUrls({});
     setIsPagesModalOpen(true);
 
     try {
@@ -298,11 +296,6 @@ function App() {
     } finally {
       setPagesLoading(false);
     }
-  };
-
-  // Toggle whether a scanned page's image list is expanded
-  const togglePageExpanded = (url) => {
-    setExpandedPageUrls(prev => ({ ...prev, [url]: !prev[url] }));
   };
 
   // Fetch Saved Images List
@@ -1253,13 +1246,31 @@ function App() {
                     </p>
                   )}
 
-                  {pagesResult.pages.map((page) => {
-                    const typeCounts = page.images.reduce((acc, img) => {
-                      acc[img.type] = (acc[img.type] || 0) + 1;
-                      return acc;
-                    }, {});
-                    const isExpanded = expandedPageUrls[page.url];
+                  {(() => {
+                    const total = pagesResult.pages.length;
+                    const upCount = pagesResult.pages.filter((p) => p.status === 'up').length;
+                    const downPages = pagesResult.pages.filter((p) => p.status === 'down');
+                    return (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+                        <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+                          <span>สแกนแล้วทั้งหมด <strong>{total}</strong> หน้า</span>
+                          <span style={{ color: 'var(--color-green)' }}>ปกติ <strong>{upCount}</strong> หน้า</span>
+                          <span style={{ color: 'var(--color-red)' }}>มีปัญหา <strong>{downPages.length}</strong> หน้า</span>
+                        </div>
+                        {downPages.length > 0 && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                            {downPages.map((p) => (
+                              <div key={p.url} style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', wordBreak: 'break-all' }}>
+                                ⚠️ <span style={{ fontFamily: 'var(--font-mono)' }}>{p.statusCode || 'Down'}</span> — {p.url} — {p.error}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
+                  {pagesResult.pages.map((page) => {
                     return (
                       <div key={page.url} style={{ border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
@@ -1285,40 +1296,6 @@ function App() {
                             )}
                           </div>
                         </div>
-
-                        {page.images.length > 0 && (
-                          <div style={{ marginTop: '0.5rem' }}>
-                            <button
-                              className="btn btn-secondary"
-                              style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}
-                              onClick={() => togglePageExpanded(page.url)}
-                            >
-                              {isExpanded ? '▲ ซ่อนรูป' : '▼'} 🖼️ {page.images.length} รูป
-                              {Object.entries(typeCounts).map(([type, count]) => ` · ${SAVED_TYPE_META[type]?.icon || ''}${count}`)}
-                            </button>
-
-                            {isExpanded && (
-                              <div className="gallery-grid" style={{ marginTop: '0.5rem' }}>
-                                {page.images.map((img, idx) => (
-                                  <div key={idx} className="gallery-card">
-                                    <div className="gallery-img-container">
-                                      <img
-                                        src={img.url}
-                                        alt={`Page asset ${idx + 1}`}
-                                        onError={(e) => {
-                                          e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Error+Loading+Image';
-                                        }}
-                                      />
-                                    </div>
-                                    <span style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', textAlign: 'center' }}>
-                                      {SAVED_TYPE_META[img.type]?.icon} {SAVED_TYPE_META[img.type]?.label}
-                                    </span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        )}
                       </div>
                     );
                   })}
