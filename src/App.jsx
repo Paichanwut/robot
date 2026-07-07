@@ -915,7 +915,15 @@ function App() {
       const res = await fetch(`/api/monitors/${id}/check`, {
         method: 'POST'
       });
-      if (!res.ok) throw new Error('Check request failed');
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        // If it's just 'already in progress', we can silently ignore or show a softer message
+        if (res.status === 429) {
+          console.log('Check already in progress');
+          return;
+        }
+        throw new Error(errorData.error || 'Check request failed');
+      }
       fetchData();
     } catch (err) {
       alert(err.message);
