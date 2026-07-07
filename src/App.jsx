@@ -87,6 +87,42 @@ function App() {
   const [pagesLoading, setPagesLoading] = useState(false);
   const [pagesError, setPagesError] = useState(null);
 
+  // Manga Downloader state
+  const [isMangaModalOpen, setIsMangaModalOpen] = useState(false);
+  const [seriesList, setSeriesList] = useState([]);
+  const [seriesLoading, setSeriesLoading] = useState(false);
+  const [seriesError, setSeriesError] = useState(null);
+  const [selectedSeriesId, setSelectedSeriesId] = useState('');
+  const [newSeriesName, setNewSeriesName] = useState('');
+  const [isAddingSeries, setIsAddingSeries] = useState(false);
+  const [newChapterName, setNewChapterName] = useState('');
+  const [newChapterUrl, setNewChapterUrl] = useState('');
+  const [isAddingChapter, setIsAddingChapter] = useState(false);
+  const [showManualChapterForm, setShowManualChapterForm] = useState(false);
+  const [scrapingChapterIds, setScrapingChapterIds] = useState({});
+  const [expandedChapterId, setExpandedChapterId] = useState('');
+  const [discoverUrl, setDiscoverUrl] = useState('');
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  const [isScrapingAll, setIsScrapingAll] = useState(false);
+  const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
+  const [isExportingSeries, setIsExportingSeries] = useState(false);
+  const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
+  const [showSeriesMetadata, setShowSeriesMetadata] = useState(false);
+  // A series can have hundreds of chapters - rendering every single one as a
+  // full DOM card causes serious jank on every 2s poll refresh (which feels
+  // like constant spinning/lag) and reflows the page enough to visibly kick
+  // the scroll position around. Default to only the chapters still needing
+  // work, and render them a page at a time.
+  const [showDoneChapters, setShowDoneChapters] = useState(false);
+  const [chapterVisibleCount, setChapterVisibleCount] = useState(50);
+  const CHAPTER_PAGE_SIZE = 50;
+
+  // Whole-site crawl state
+  const [siteCrawls, setSiteCrawls] = useState([]);
+  const [crawlSiteUrl, setCrawlSiteUrl] = useState('');
+  const [isStartingCrawl, setIsStartingCrawl] = useState(false);
+  const [expandedCrawlId, setExpandedCrawlId] = useState('');
+
   // Metadata (label/icon) for the heuristic image type classification
   const SAVED_TYPE_META = {
     ad: { label: 'โฆษณา', icon: '📢' },
@@ -296,6 +332,367 @@ function App() {
     } finally {
       setPagesLoading(false);
     }
+  };
+
+  // Fetch all manga series
+  // showSpinner is only true for the initial load - the 2s background poll
+  // (see the polling effect below) must NOT flip seriesLoading, or the
+  // entire series/chapters section unmounts to a bare spinner and remounts
+  // every single poll, which is what was causing the constant "reload"
+  // flicker and resetting the user's scroll position every couple seconds.
+  const fetchSeries = async (showSpinner = true) => {
+    if (showSpinner) setSeriesLoading(true);
+    setSeriesError(null);
+    try {
+      const res = await fetch('/api/series');
+      if (!res.ok) throw new Error('Failed to fetch manga series');
+      const data = await res.json();
+      setSeriesList(data);
+      setSelectedSeriesId(prev => {
+        const nextId = prev && data.some(s => s.id === prev) ? prev : (data.length > 0 ? data[0].id : '');
+        const nextSeries = data.find(s => s.id === nextId);
+        setDiscoverUrl(nextSeries?.seriesUrl || '');
+        return nextId;
+      });
+    } catch (err) {
+      setSeriesError(err.message);
+    } finally {
+      setSeriesLoading(false);
+    }
+  };
+
+  // Select a series in the left pane, syncing the discover-URL input to it
+  const handleSelectSeries = (series) => {
+    setSelectedSeriesId(series.id);
+    setExpandedChapterId('');
+    setDiscoverUrl(series.seriesUrl || '');
+    setChapterVisibleCount(CHAPTER_PAGE_SIZE);
+  };
+
+  // Auto-discover every chapter link from a series' "all chapters" page
+  const handleDiscoverChapters = async (e) => {
+    e.preventDefault();
+    if (!selectedSeriesId || !discoverUrl.trim()) return;
+
+    setIsDiscovering(true);
+    try {
+      const res = await fetch(`/api/series/${selectedSeriesId}/discover-chapters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: discoverUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to discover chapters');
+
+      alert(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''}`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsDiscovering(false);
+    }
+  };
+
+  // Scrape every chapter in the selected series that hasn't finished downloading yet
+  const handleScrapeAllChapters = async (seriesId) => {
+    if (isScrapingAll) return;
+    if (!confirm('บอทจะไล่โหลดทุกตอนที่ยังไม่เสร็จทีละตอน อาจใช้เวลานาน ต้องการดำเนินการต่อหรือไม่?')) return;
+
+    setIsScrapingAll(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/scrape-all`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to scrape all chapters');
+
+      alert(`✓ โหลดไปแล้ว ${data.scrapedCount} ตอน${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsScrapingAll(false);
+    }
+  };
+
+  // (Re-)fetch SEO metadata (synopsis, genres, author/artist, status,
+  // rating, views, ...) from the series' own detail page
+  const handleFetchSeriesMetadata = async (seriesId) => {
+    if (isFetchingMetadata) return;
+    setIsFetchingMetadata(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/fetch-metadata`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to fetch SEO metadata');
+      setShowSeriesMetadata(true);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsFetchingMetadata(false);
+    }
+  };
+
+  // Copy every finished chapter into a human-readable <title>/<chapter>/
+  // export folder alongside a metadata.json carrying the SEO fields above
+  const handleExportSeries = async (seriesId) => {
+    if (isExportingSeries) return;
+    setIsExportingSeries(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/export`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to export series');
+      alert(`✓ Export แล้ว ${data.exportedChapterCount} ตอน\nไปที่: server/data/${data.exportPath}`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsExportingSeries(false);
+    }
+  };
+
+  // Hash every downloaded image in the series and strip out any that turn
+  // out to be byte-identical across 2+ chapters - a translator's ad/credit
+  // slide re-uploaded fresh every chapter, which the URL-based ad filter
+  // can't catch since its URL is different each time.
+  const handleCleanDuplicateImages = async (seriesId) => {
+    if (isCleaningDuplicates) return;
+    setIsCleaningDuplicates(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/clean-duplicate-images`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to clean duplicate images');
+      alert(`✓ ตรวจสอบ ${data.chaptersScanned} ตอน — ลบรูปซ้ำ ${data.imagesRemoved} รูป จาก ${data.chaptersAffected} ตอน\n(เหมือนเป๊ะ ${data.exactDuplicatesRemoved} รูป, หน้าตาคล้ายกันมาก ${data.nearDuplicatesRemoved} รูป)`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsCleaningDuplicates(false);
+    }
+  };
+
+  // Fetch every whole-site crawl job (running, stopped, done, error)
+  const fetchSiteCrawls = async () => {
+    try {
+      const res = await fetch('/api/site-crawls');
+      if (!res.ok) return;
+      setSiteCrawls(await res.json());
+    } catch (err) {
+      // Silent - this is a background poll, the main series list already
+      // surfaces a connection error banner elsewhere.
+    }
+  };
+
+  // Open the Manga Downloader modal
+  const handleOpenMangaModal = () => {
+    setIsMangaModalOpen(true);
+    setExpandedChapterId('');
+    fetchSeries();
+    fetchSiteCrawls();
+  };
+
+  // While the modal is open, poll for fresh chapter/crawl statuses so a
+  // running scrape (single chapter, "scrape all", or a whole-site crawl)
+  // visibly ticks forward as it goes, instead of only updating once
+  // everything finishes.
+  useEffect(() => {
+    if (!isMangaModalOpen) return;
+    const interval = setInterval(() => {
+      fetchSeries(false);
+      fetchSiteCrawls();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [isMangaModalOpen]);
+
+  // Start a whole-site crawl: hand over just the site's root/listing URL and
+  // the bot discovers every series, then every chapter of every series, and
+  // downloads them all on its own - see runSiteCrawl on the server.
+  const handleStartCrawl = async (e) => {
+    e.preventDefault();
+    if (!crawlSiteUrl.trim()) return;
+
+    setIsStartingCrawl(true);
+    try {
+      const res = await fetch('/api/site-crawls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: crawlSiteUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to start site crawl');
+      setCrawlSiteUrl('');
+      fetchSiteCrawls();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsStartingCrawl(false);
+    }
+  };
+
+  // Stop a running crawl - the bot bails out before its next chapter/page
+  const handleStopCrawl = async (crawlId) => {
+    try {
+      const res = await fetch(`/api/site-crawls/${crawlId}/stop`, { method: 'POST' });
+      if (!res.ok) throw new Error('Failed to stop crawl');
+      fetchSiteCrawls();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Resume a stopped/errored crawl from wherever it left off
+  const handleResumeCrawl = async (crawlId) => {
+    try {
+      const res = await fetch(`/api/site-crawls/${crawlId}/resume`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to resume crawl');
+      fetchSiteCrawls();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Remove a crawl job's record (already-downloaded series/chapters are kept)
+  const handleDeleteCrawl = async (crawlId) => {
+    if (!confirm('ลบงานดึงทั้งเว็บนี้? (เรื่อง/ตอนที่โหลดไปแล้วจะยังอยู่ ไม่ถูกลบ)')) return;
+    try {
+      const res = await fetch(`/api/site-crawls/${crawlId}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed to delete crawl');
+      fetchSiteCrawls();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Metadata (label/color) for a crawl job's overall status
+  const CRAWL_STATUS_META = {
+    running: { label: 'กำลังทำงาน', color: 'var(--color-cyan)', icon: '🔄' },
+    stopped: { label: 'หยุดแล้ว', color: 'var(--color-yellow)', icon: '⏸️' },
+    done: { label: 'เสร็จสมบูรณ์', color: 'var(--color-green)', icon: '✅' },
+    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: '⚠️' }
+  };
+
+  // Add a new manga series (a "เรื่อง")
+  const handleAddSeries = async (e) => {
+    e.preventDefault();
+    if (!newSeriesName.trim()) return;
+
+    setIsAddingSeries(true);
+    try {
+      const res = await fetch('/api/series', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newSeriesName })
+      });
+      if (!res.ok) throw new Error('Failed to create series');
+      const created = await res.json();
+      setNewSeriesName('');
+      await fetchSeries();
+      setSelectedSeriesId(created.id);
+      setDiscoverUrl('');
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsAddingSeries(false);
+    }
+  };
+
+  // Delete a manga series and everything downloaded under it
+  const handleDeleteSeries = async (seriesId, seriesName) => {
+    if (!confirm(`Are you sure you want to delete the series "${seriesName}" and all its downloaded chapters?`)) return;
+    try {
+      const res = await fetch(`/api/series/${seriesId}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed to delete series');
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Add a new chapter ("ตอน") to the currently selected series
+  const handleAddChapter = async (e) => {
+    e.preventDefault();
+    if (!selectedSeriesId || !newChapterName.trim() || !newChapterUrl.trim()) return;
+
+    setIsAddingChapter(true);
+    try {
+      const res = await fetch(`/api/series/${selectedSeriesId}/chapters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newChapterName, url: newChapterUrl })
+      });
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || 'Failed to add chapter');
+      }
+      setNewChapterName('');
+      setNewChapterUrl('');
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsAddingChapter(false);
+    }
+  };
+
+  // Delete a chapter and its downloaded images
+  const handleDeleteChapter = async (seriesId, chapterId, chapterName) => {
+    if (!confirm(`Are you sure you want to delete the chapter "${chapterName}"?`)) return;
+    try {
+      const res = await fetch(`/api/series/${seriesId}/chapters/${chapterId}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed to delete chapter');
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Remove a single unwanted image (an ad/translator-credit slide the
+  // automatic filters missed) from a chapter, without deleting the whole chapter
+  const handleDeleteChapterImage = async (seriesId, chapterId, filename) => {
+    if (!confirm('ลบรูปนี้ออกจากตอน?')) return;
+    try {
+      const res = await fetch(`/api/series/${seriesId}/chapters/${chapterId}/images/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete image');
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  // Trigger the bot to scrape a chapter's page for manga-only images and
+  // download them. Anti-block delays mean this can take a while - that's fine.
+  const handleScrapeChapter = async (seriesId, chapterId) => {
+    if (scrapingChapterIds[chapterId]) return;
+
+    setScrapingChapterIds(prev => ({ ...prev, [chapterId]: true }));
+    try {
+      const res = await fetch(`/api/series/${seriesId}/chapters/${chapterId}/scrape`, {
+        method: 'POST'
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to scrape chapter');
+      await fetchSeries();
+      setExpandedChapterId(chapterId);
+    } catch (err) {
+      alert(err.message);
+      fetchSeries();
+    } finally {
+      setScrapingChapterIds(prev => ({ ...prev, [chapterId]: false }));
+    }
+  };
+
+  // Mirrors MAX_CHAPTER_RETRIES on the server - just for the display hint
+  // below, the server is what actually enforces the retry cap.
+  const MAX_CHAPTER_RETRIES_DISPLAY = 3;
+
+  // Metadata (label/color) for a chapter's scrape status
+  const CHAPTER_STATUS_META = {
+    pending: { label: 'ยังไม่โหลด', color: 'var(--color-text-muted)', icon: '⏳' },
+    scraping: { label: 'กำลังโหลด...', color: 'var(--color-cyan)', icon: '🔄' },
+    done: { label: 'โหลดสำเร็จ', color: 'var(--color-green)', icon: '✅' },
+    partial: { label: 'โหลดได้บางส่วน', color: 'var(--color-yellow)', icon: '⚠️' },
+    blocked: { label: 'ถูกบล็อก', color: 'var(--color-red)', icon: '🚫' },
+    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: '⚠️' }
   };
 
   // Fetch Saved Images List
@@ -596,6 +993,9 @@ function App() {
           </div>
         </div>
         <div className="header-actions">
+          <button className="btn btn-secondary" onClick={handleOpenMangaModal} style={{ marginRight: '0.5rem' }}>
+            📖 Manga Downloader
+          </button>
           <button className="btn btn-secondary" onClick={handleOpenSavedGallery} style={{ marginRight: '0.5rem' }}>
             📂 Saved Gallery
           </button>
@@ -1304,6 +1704,494 @@ function App() {
 
               <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
                 <button type="button" className="btn btn-secondary" onClick={() => setIsPagesModalOpen(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manga Downloader Modal */}
+      {isMangaModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ maxWidth: '900px', width: '95%' }}>
+            <div className="modal-header">
+              <h3>📖 Manga Downloader</h3>
+              <button className="modal-close" onClick={() => setIsMangaModalOpen(false)}>×</button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '78vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
+              <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', margin: 0 }}>
+                สร้างเรื่องมังงะที่ต้องการเก็บ แล้วเพิ่มแต่ละตอนพร้อมลิงก์หน้าตอนนั้น บอทจะเข้าไปดึงเฉพาะรูปที่เดาว่าเป็นมังงะเท่านั้น (กรองโฆษณา/ไอคอนออก) และดาวน์โหลดลงเซิร์ฟเวอร์แบบทีละรูปพร้อมหน่วงเวลาแบบสุ่ม เพื่อลดโอกาสโดนเว็บบล็อก ใช้เวลานานแค่ไหนก็ได้
+              </p>
+
+              {/* Whole-site crawl: hand over just the site's root/listing URL and
+                  the bot discovers every series + every chapter on its own,
+                  running in the background on the server (not this browser
+                  tab) until it finishes or is stopped. */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+                <div>
+                  <h4 style={{ margin: '0 0 0.25rem 0', fontSize: '0.95rem' }}>🌐 ดึงทั้งเว็บอัตโนมัติ</h4>
+                  <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
+                    วางลิงก์หน้าแรกของเว็บมังงะ (เช่น https://www.go-manga.com/) บอทจะไล่หาทุกเรื่องในเว็บ (ทุกหน้า) แล้วดึงทุกตอนของทุกเรื่องให้เอง ทำงานอยู่บนเซิร์ฟเวอร์ - ปิดแท็บ/เบราว์เซอร์นี้ได้ งานยังทำงานต่อจนกว่าจะเสร็จหรือสั่งหยุด (แต่ถ้าปิดเครื่องที่รันเซิร์ฟเวอร์เองจะหยุดตามไปด้วย)
+                  </p>
+                </div>
+
+                <form onSubmit={handleStartCrawl} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    placeholder="https://www.go-manga.com/"
+                    value={crawlSiteUrl}
+                    onChange={(e) => setCrawlSiteUrl(e.target.value)}
+                    style={{ flex: '1 1 250px' }}
+                    required
+                  />
+                  <button type="submit" className="btn btn-primary" disabled={isStartingCrawl}>
+                    {isStartingCrawl ? '⏳ กำลังเริ่ม...' : '🚀 เริ่มดึงทั้งเว็บ'}
+                  </button>
+                </form>
+
+                {siteCrawls.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {siteCrawls.map(crawl => {
+                      const meta = CRAWL_STATUS_META[crawl.status] || CRAWL_STATUS_META.stopped;
+                      const totalSeries = crawl.discoveredSeries.length;
+                      const doneSeries = crawl.processedSeriesUrls.length;
+                      return (
+                        <div key={crawl.id} style={{ border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.6rem 0.8rem', fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                            <span style={{ wordBreak: 'break-all' }}>{crawl.siteUrl}</span>
+                            <span style={{ color: meta.color, flexShrink: 0 }}>{meta.icon} {meta.label}</span>
+                          </div>
+                          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', color: 'var(--color-text-secondary)' }}>
+                            <span>เจอเรื่องแล้ว {totalSeries} เรื่อง{!crawl.discoveryDone && ' (กำลังหาเพิ่ม...)'}</span>
+                            <span>ทำเสร็จแล้ว {doneSeries} เรื่อง</span>
+                            <span>โหลดไปแล้ว {crawl.stats.chaptersDownloaded} ตอน</span>
+                          </div>
+                          {crawl.currentSeriesName && crawl.status === 'running' && (
+                            <div style={{ color: 'var(--color-cyan)' }}>🔄 กำลังทำเรื่อง: {crawl.currentSeriesName}</div>
+                          )}
+                          {crawl.lastError && (
+                            <div style={{ color: 'var(--color-yellow)', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>{crawl.lastError}</div>
+                          )}
+                          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                            {crawl.status === 'running' ? (
+                              <button type="button" className="btn btn-secondary" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleStopCrawl(crawl.id)}>
+                                ⏸️ หยุด
+                              </button>
+                            ) : crawl.status !== 'done' && (
+                              <button type="button" className="btn btn-secondary" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleResumeCrawl(crawl.id)}>
+                                ▶️ ทำต่อ
+                              </button>
+                            )}
+                            {totalSeries > 0 && (
+                              <button
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}
+                                onClick={() => setExpandedCrawlId(prev => prev === crawl.id ? '' : crawl.id)}
+                              >
+                                {expandedCrawlId === crawl.id ? '▲ ซ่อนรายชื่อเรื่อง' : `▼ ดูว่าเรื่องไหนเสร็จแล้วบ้าง (${doneSeries}/${totalSeries})`}
+                              </button>
+                            )}
+                            <button type="button" className="btn btn-danger" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleDeleteCrawl(crawl.id)}>
+                              🗑️ ลบงานนี้
+                            </button>
+                          </div>
+
+                          {expandedCrawlId === crawl.id && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', maxHeight: '220px', overflowY: 'auto', marginTop: '0.25rem', borderTop: '1px solid var(--border-color)', paddingTop: '0.4rem' }}>
+                              {crawl.discoveredSeries.map(item => {
+                                const isProcessed = crawl.processedSeriesUrls.includes(item.url);
+                                const isCurrent = crawl.currentSeriesUrl === item.url;
+                                const matchedSeries = seriesList.find(s => s.seriesUrl === item.url);
+                                const chapters = matchedSeries?.chapters || [];
+                                const doneChapters = chapters.filter(c => c.status === 'done').length;
+                                const statusIcon = isCurrent ? '🔄' : isProcessed ? '✅' : '⏳';
+                                const statusColor = isCurrent ? 'var(--color-cyan)' : isProcessed ? 'var(--color-green)' : 'var(--color-text-muted)';
+                                return (
+                                  <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', color: statusColor }}>
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{statusIcon} {item.name}</span>
+                                    <span style={{ flexShrink: 0 }}>{chapters.length > 0 ? `${doneChapters}/${chapters.length} ตอน` : (isProcessed ? '0 ตอน' : '')}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {seriesError && (
+                <div style={{ color: 'var(--color-red)', fontSize: '0.9rem' }}>⚠️ {seriesError}</div>
+              )}
+
+              {/* Add Series Form */}
+              <form onSubmit={handleAddSeries} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="ชื่อเรื่องมังงะ เช่น One Piece"
+                  value={newSeriesName}
+                  onChange={(e) => setNewSeriesName(e.target.value)}
+                  style={{ flex: 1, minWidth: '200px' }}
+                  required
+                />
+                <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
+                  {isAddingSeries ? '⏳ Adding...' : '+ Add Series'}
+                </button>
+              </form>
+
+              {seriesLoading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 0', gap: '1rem' }}>
+                  <div className="spinner" />
+                </div>
+              ) : seriesList.length === 0 ? (
+                <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '2rem 0', fontSize: '0.9rem' }}>
+                  ยังไม่มีเรื่องมังงะ เพิ่มเรื่องแรกด้านบนได้เลย
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: '1rem', alignItems: 'start' }}>
+                  {/* Series list */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                    {seriesList.map(s => (
+                      <div
+                        key={s.id}
+                        onClick={() => handleSelectSeries(s)}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '0.5rem',
+                          padding: '0.5rem 0.65rem',
+                          borderRadius: '0.5rem',
+                          cursor: 'pointer',
+                          background: selectedSeriesId === s.id ? 'var(--gradient-cyan-blue)' : 'rgba(255,255,255,0.05)',
+                          fontSize: '0.85rem'
+                        }}
+                      >
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          📚 {s.name} <span style={{ opacity: 0.7, fontSize: '0.75rem' }}>({(s.chapters || []).length})</span>
+                        </span>
+                        <button
+                          className="btn btn-danger btn-icon-only"
+                          style={{ padding: '0.15rem 0.4rem', fontSize: '0.7rem', flexShrink: 0 }}
+                          title="Delete series"
+                          onClick={(e) => { e.stopPropagation(); handleDeleteSeries(s.id, s.name); }}
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Chapters of selected series */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                    {(() => {
+                      const series = seriesList.find(s => s.id === selectedSeriesId);
+                      if (!series) {
+                        return <div style={{ color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>เลือกเรื่องทางซ้ายเพื่อจัดการตอน</div>;
+                      }
+                      return (
+                        <>
+                          {/* Auto-discover: paste the series' "all chapters" listing page URL
+                              and the bot walks it to find every chapter link itself. */}
+                          <form onSubmit={handleDiscoverChapters} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            <input
+                              type="text"
+                              className="form-input"
+                              placeholder="วางลิงก์หน้ารวมตอนของเรื่องนี้ เช่น https://www.go-manga.com/manga/xxx"
+                              value={discoverUrl}
+                              onChange={(e) => setDiscoverUrl(e.target.value)}
+                              style={{ flex: '1 1 300px' }}
+                              required
+                            />
+                            <button type="submit" className="btn btn-primary" disabled={isDiscovering}>
+                              {isDiscovering ? '⏳ กำลังค้นหา...' : '🔍 ค้นหาตอนทั้งหมดอัตโนมัติ'}
+                            </button>
+                          </form>
+
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                              onClick={() => setShowManualChapterForm(prev => !prev)}
+                            >
+                              {showManualChapterForm ? '▲ ซ่อนการเพิ่มตอนแบบระบุเอง' : '▼ หรือเพิ่มตอนแบบระบุเอง (ทีละตอน)'}
+                            </button>
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                              {(series.chapters || []).some(c => c.status !== 'done') && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isScrapingAll}
+                                  onClick={() => handleScrapeAllChapters(series.id)}
+                                >
+                                  {isScrapingAll ? '⏳ กำลังโหลดทุกตอน...' : '⬇️ Scrape ทุกตอนที่ยังไม่เสร็จ'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                disabled={isFetchingMetadata}
+                                onClick={() => handleFetchSeriesMetadata(series.id)}
+                              >
+                                {isFetchingMetadata ? '⏳ กำลังดึงข้อมูล...' : series.metadata ? '🏷️ รีเฟรชข้อมูล SEO' : '🏷️ ดึงข้อมูล SEO'}
+                              </button>
+                              {(series.chapters || []).some(c => c.status === 'done') && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isCleaningDuplicates}
+                                  onClick={() => handleCleanDuplicateImages(series.id)}
+                                >
+                                  {isCleaningDuplicates ? '⏳ กำลังตรวจสอบ...' : '🧹 ลบรูปโฆษณา/เครดิตซ้ำ'}
+                                </button>
+                              )}
+                              {(series.chapters || []).some(c => c.status === 'done') && (
+                                <button
+                                  type="button"
+                                  className="btn btn-primary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isExportingSeries}
+                                  onClick={() => handleExportSeries(series.id)}
+                                >
+                                  {isExportingSeries ? '⏳ กำลัง Export...' : '📤 Export ตอนที่เสร็จแล้ว'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {series.metadata && (
+                            <div style={{ border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.5rem 0.75rem' }}>
+                              <button
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem', marginBottom: showSeriesMetadata ? '0.5rem' : 0 }}
+                                onClick={() => setShowSeriesMetadata(prev => !prev)}
+                              >
+                                {showSeriesMetadata ? '▼ ซ่อนข้อมูล SEO' : `▶ แสดงข้อมูล SEO ที่ดึงมา${series.metadataFetchedAt ? ` (${new Date(series.metadataFetchedAt).toLocaleString('th-TH')})` : ''}`}
+                              </button>
+                              {showSeriesMetadata && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.8rem' }}>
+                                  {series.metadata.title && <div><strong>ชื่อเรื่อง:</strong> {series.metadata.title}</div>}
+                                  {series.metadata.altTitles?.length > 0 && <div><strong>ชื่ออื่น:</strong> {series.metadata.altTitles.join(', ')}</div>}
+                                  {series.metadata.synopsis && <div><strong>เรื่องย่อ:</strong> {series.metadata.synopsis}</div>}
+                                  {series.metadata.genres?.length > 0 && <div><strong>ประเภท:</strong> {series.metadata.genres.join(', ')}</div>}
+                                  {series.metadata.status && <div><strong>สถานะ:</strong> {series.metadata.status}</div>}
+                                  {series.metadata.type && <div><strong>ชนิด:</strong> {series.metadata.type}</div>}
+                                  {series.metadata.author && <div><strong>นักเขียน:</strong> {series.metadata.author}</div>}
+                                  {series.metadata.artist && <div><strong>นักวาด:</strong> {series.metadata.artist}</div>}
+                                  {series.metadata.released && <div><strong>ปีที่ปล่อย:</strong> {series.metadata.released}</div>}
+                                  {series.metadata.rating && <div><strong>เรตติ้ง:</strong> {series.metadata.rating}{series.metadata.ratingCount ? ` (${series.metadata.ratingCount} โหวต)` : ''}</div>}
+                                  {series.metadata.views && <div><strong>ยอดวิว:</strong> {series.metadata.views}</div>}
+                                  {series.metadata.followers && <div><strong>ผู้ติดตาม:</strong> {series.metadata.followers}</div>}
+                                  {series.metadata.publishedDate && <div><strong>เผยแพร่วันที่:</strong> {series.metadata.publishedDate}</div>}
+                                  {series.metadata.lastUpdatedDate && <div><strong>แก้ไขล่าสุด:</strong> {series.metadata.lastUpdatedDate}</div>}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {showManualChapterForm && (
+                            <form onSubmit={handleAddChapter} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="ชื่อตอน เช่น ตอนที่ 1"
+                                value={newChapterName}
+                                onChange={(e) => setNewChapterName(e.target.value)}
+                                style={{ flex: '1 1 150px' }}
+                                required
+                              />
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="URL หน้าตอนนี้"
+                                value={newChapterUrl}
+                                onChange={(e) => setNewChapterUrl(e.target.value)}
+                                style={{ flex: '2 1 250px' }}
+                                required
+                              />
+                              <button type="submit" className="btn btn-secondary" disabled={isAddingChapter}>
+                                {isAddingChapter ? '⏳' : '+ Add Chapter'}
+                              </button>
+                            </form>
+                          )}
+
+                          {(series.chapters || []).length > 0 && (() => {
+                            const total = series.chapters.length;
+                            const doneCount = series.chapters.filter(c => c.status === 'done').length;
+                            const scrapingChapter = series.chapters.find(c => c.status === 'scraping');
+                            const pendingCount = series.chapters.filter(c => c.status === 'pending').length;
+                            const issueCount = series.chapters.filter(c => ['error', 'blocked', 'partial'].includes(c.status)).length;
+                            return (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.5rem 0.75rem', fontSize: '0.8rem' }}>
+                                <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                                  <span>โหลดเสร็จแล้ว <strong style={{ color: 'var(--color-green)' }}>{doneCount}</strong> / {total} ตอน</span>
+                                  {pendingCount > 0 && <span style={{ color: 'var(--color-text-muted)' }}>ยังไม่โหลด {pendingCount} ตอน</span>}
+                                  {issueCount > 0 && <span style={{ color: 'var(--color-yellow)' }}>มีปัญหา {issueCount} ตอน</span>}
+                                </div>
+                                <div style={{ color: 'var(--color-cyan)', minHeight: '1.1rem' }}>
+                                  {scrapingChapter && `🔄 กำลังโหลดตอน: ${scrapingChapter.name}`}
+                                </div>
+                              </div>
+                            );
+                          })()}
+
+                          {(series.chapters || []).length === 0 ? (
+                            <div style={{ color: 'var(--color-text-muted)', fontSize: '0.85rem', padding: '1rem 0' }}>
+                              ยังไม่มีตอนในเรื่องนี้ เพิ่มตอนแรกด้านบน
+                            </div>
+                          ) : (() => {
+                            // A series can have hundreds of chapters - only render a
+                            // bounded, filtered slice at a time (see chapterVisibleCount
+                            // above) instead of every single one, which is what was
+                            // causing the constant lag/scroll-jump on large series.
+                            const allChapters = series.chapters;
+                            const doneChapterCount = allChapters.filter(c => c.status === 'done').length;
+                            const visibleChapters = showDoneChapters ? allChapters : allChapters.filter(c => c.status !== 'done');
+                            const pageOfChapters = visibleChapters.slice(0, chapterVisibleCount);
+
+                            return (
+                              <>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.75rem' }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                                    onClick={() => { setShowDoneChapters(prev => !prev); setChapterVisibleCount(CHAPTER_PAGE_SIZE); }}
+                                  >
+                                    {showDoneChapters ? `▼ ซ่อนตอนที่เสร็จแล้ว (${doneChapterCount} ตอน)` : `▶ แสดงตอนที่เสร็จแล้วด้วย (${doneChapterCount} ตอน)`}
+                                  </button>
+                                  {visibleChapters.length > 0 && (
+                                    <span style={{ color: 'var(--color-text-muted)' }}>แสดง {pageOfChapters.length} / {visibleChapters.length} ตอน</span>
+                                  )}
+                                </div>
+
+                                {pageOfChapters.map(chapter => {
+                                  const statusMeta = CHAPTER_STATUS_META[chapter.status] || CHAPTER_STATUS_META.pending;
+                                  const isScraping = chapter.status === 'scraping' || scrapingChapterIds[chapter.id];
+                              return (
+                                <div key={chapter.id} style={{ border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', minWidth: 0 }}>
+                                      <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{chapter.name}</span>
+                                      <a href={chapter.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-cyan)', fontSize: '0.75rem', wordBreak: 'break-all' }}>
+                                        {chapter.url}
+                                      </a>
+                                      <span style={{ fontSize: '0.75rem', color: statusMeta.color }}>
+                                        {statusMeta.icon} {statusMeta.label}
+                                        {chapter.images && chapter.images.length > 0 && ` — ${chapter.images.length} รูป`}
+                                        {['error', 'partial', 'blocked'].includes(chapter.status) && chapter.retryCount > 0 &&
+                                          ` (ลองอัตโนมัติแล้ว ${chapter.retryCount}/${MAX_CHAPTER_RETRIES_DISPLAY} ครั้ง)`}
+                                      </span>
+                                      {chapter.error && (
+                                        <span style={{ fontSize: '0.7rem', color: 'var(--color-red)', fontFamily: 'var(--font-mono)' }}>
+                                          {chapter.error}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0, flexWrap: 'wrap' }}>
+                                      <button
+                                        className="btn btn-secondary"
+                                        style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                        disabled={isScraping}
+                                        onClick={() => handleScrapeChapter(series.id, chapter.id)}
+                                      >
+                                        {isScraping ? '⏳ Downloading...' : chapter.images.length > 0 ? '🔄 Re-scrape' : '⬇️ Scrape & Download'}
+                                      </button>
+                                      {chapter.images && chapter.images.length > 0 && (
+                                        <button
+                                          className="btn btn-secondary"
+                                          style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                          onClick={() => setExpandedChapterId(prev => prev === chapter.id ? '' : chapter.id)}
+                                        >
+                                          {expandedChapterId === chapter.id ? 'Hide Images' : 'View Images'}
+                                        </button>
+                                      )}
+                                      <button
+                                        className="btn btn-danger"
+                                        style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                        onClick={() => handleDeleteChapter(series.id, chapter.id, chapter.name)}
+                                      >
+                                        🗑️
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {expandedChapterId === chapter.id && chapter.images && chapter.images.length > 0 && (
+                                    <div className="gallery-grid" style={{ marginTop: '0.75rem' }}>
+                                      {chapter.images.map(img => (
+                                        <div key={img.filename} className="gallery-card">
+                                          <div className="gallery-img-container">
+                                            <img
+                                              src={`/api/saved-assets/${img.relativePath}`}
+                                              alt={`Page ${img.order}`}
+                                              onError={(e) => {
+                                                e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
+                                              }}
+                                            />
+                                          </div>
+                                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.25rem' }}>
+                                            <a
+                                              href={`/api/saved-assets/${img.relativePath}`}
+                                              download
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="gallery-img-link"
+                                            >
+                                              หน้า {img.order}
+                                            </a>
+                                            <button
+                                              type="button"
+                                              className="btn btn-danger"
+                                              title="ลบรูปนี้ (โฆษณา/เครดิตที่หลุดมา)"
+                                              style={{ padding: '0.1rem 0.35rem', fontSize: '0.65rem', flexShrink: 0 }}
+                                              onClick={() => handleDeleteChapterImage(series.id, chapter.id, img.filename)}
+                                            >
+                                              🗑️
+                                            </button>
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                                })}
+
+                                {pageOfChapters.length < visibleChapters.length && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ alignSelf: 'center', fontSize: '0.8rem', padding: '0.4rem 1rem' }}
+                                    onClick={() => setChapterVisibleCount(prev => prev + CHAPTER_PAGE_SIZE)}
+                                  >
+                                    แสดงเพิ่ม ({visibleChapters.length - pageOfChapters.length} ตอนที่เหลือ)
+                                  </button>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsMangaModalOpen(false)}>
                   Close
                 </button>
               </div>
