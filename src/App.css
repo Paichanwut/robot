@@ -1,27 +1,44 @@
 /* App Dashboard Layout */
+.app-wrapper {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+}
+
+.app-sidebar {
+  width: 260px;
+  min-width: 260px;
+  background-color: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 1.5rem;
+}
+
+.app-main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2rem 2.5rem;
+  background-color: var(--bg-primary);
+}
+
 .app-container {
-  max-width: 1400px;
+  max-width: 1200px;
   width: 100%;
   margin: 0 auto;
-  padding: 2.5rem 1.5rem;
   display: flex;
   flex-direction: column;
   gap: 2rem;
 }
 
-/* Header Section */
-.app-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-bottom: 1px solid var(--border-color);
-  padding-bottom: 1.5rem;
-}
-
+/* Sidebar Section */
 .brand-section {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  margin-bottom: 2.5rem;
 }
 
 .logo-icon {
@@ -39,7 +56,7 @@
 }
 
 .brand-section h1 {
-  font-size: 1.75rem;
+  font-size: 1.25rem;
   font-weight: 700;
   letter-spacing: -0.025em;
   background: linear-gradient(to right, var(--color-text-primary), var(--color-text-secondary));
@@ -48,13 +65,42 @@
 }
 
 .brand-section p {
-  font-size: 0.875rem;
+  font-size: 0.75rem;
   color: var(--color-text-muted);
 }
 
-.header-actions {
+.sidebar-nav {
   display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
   gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: transparent;
+  border: none;
+  text-align: left;
+  width: 100%;
+}
+
+.nav-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: var(--color-text-primary);
+}
+
+.nav-item.active {
+  background-color: rgba(6, 182, 212, 0.15);
+  color: var(--color-cyan);
+  border-left: 3px solid var(--color-cyan);
 }
 
 /* Buttons */

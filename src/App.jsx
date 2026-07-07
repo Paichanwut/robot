@@ -68,7 +68,6 @@ function App() {
   const [galleryImages, setGalleryImages] = useState([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
   const [galleryError, setGalleryError] = useState(null);
-  const [isSavedGalleryOpen, setIsSavedGalleryOpen] = useState(false);
   const [savedImages, setSavedImages] = useState([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedError, setSavedError] = useState(null);
@@ -88,7 +87,6 @@ function App() {
   const [pagesError, setPagesError] = useState(null);
 
   // Manga Downloader state
-  const [isMangaModalOpen, setIsMangaModalOpen] = useState(false);
   const [seriesList, setSeriesList] = useState([]);
   const [seriesLoading, setSeriesLoading] = useState(false);
   const [seriesError, setSeriesError] = useState(null);
@@ -97,6 +95,7 @@ function App() {
   const [isAddingSeries, setIsAddingSeries] = useState(false);
   const [newChapterName, setNewChapterName] = useState('');
   const [newChapterUrl, setNewChapterUrl] = useState('');
+  const [currentView, setCurrentView] = useState('monitor'); // 'monitor', 'library', 'downloader', 'gallery'
   const [isAddingChapter, setIsAddingChapter] = useState(false);
   const [showManualChapterForm, setShowManualChapterForm] = useState(false);
   const [scrapingChapterIds, setScrapingChapterIds] = useState({});
@@ -122,6 +121,9 @@ function App() {
   const [crawlSiteUrl, setCrawlSiteUrl] = useState('');
   const [isStartingCrawl, setIsStartingCrawl] = useState(false);
   const [expandedCrawlId, setExpandedCrawlId] = useState('');
+
+  // Manga Library Dashboard state
+  const [libraryFilter, setLibraryFilter] = useState('all'); // all, complete, incomplete
 
   // Metadata (label/icon) for the heuristic image type classification
   const SAVED_TYPE_META = {
@@ -483,7 +485,7 @@ function App() {
 
   // Open the Manga Downloader modal
   const handleOpenMangaModal = () => {
-    setIsMangaModalOpen(true);
+    setCurrentView('downloader');
     setExpandedChapterId('');
     fetchSeries();
     fetchSiteCrawls();
@@ -494,13 +496,13 @@ function App() {
   // visibly ticks forward as it goes, instead of only updating once
   // everything finishes.
   useEffect(() => {
-    if (!isMangaModalOpen) return;
+    if (currentView !== 'downloader' && currentView !== 'library') return;
     const interval = setInterval(() => {
       fetchSeries(false);
       fetchSiteCrawls();
     }, 2000);
     return () => clearInterval(interval);
-  }, [isMangaModalOpen]);
+  }, [currentView]);
 
   // Start a whole-site crawl: hand over just the site's root/listing URL and
   // the bot discovers every series, then every chapter of every series, and
@@ -725,7 +727,7 @@ function App() {
 
   // Open Saved Gallery Modal
   const handleOpenSavedGallery = () => {
-    setIsSavedGalleryOpen(true);
+    setCurrentView('gallery');
     setSelectedImageIds({});
     fetchSavedImages();
   };
@@ -982,28 +984,63 @@ function App() {
   };
 
   return (
-    <div className="app-container">
-      {/* Header */}
-      <header className="app-header">
+    <div className="app-wrapper">
+      {/* Sidebar Navigation */}
+      <aside className="app-sidebar">
         <div className="brand-section">
           <div className="logo-icon">🤖</div>
           <div>
-            <h1>Robot Monitor</h1>
-            <p>Real-time Web Uptime Checker & Alerts</p>
+            <h1>Robot Hub</h1>
+            <p>Monitor & Manga Manager</p>
           </div>
         </div>
-        <div className="header-actions">
-          <button className="btn btn-secondary" onClick={handleOpenMangaModal} style={{ marginRight: '0.5rem' }}>
+        
+        <nav className="sidebar-nav">
+          <button 
+            className={`nav-item ${currentView === 'monitor' ? 'active' : ''}`}
+            onClick={() => setCurrentView('monitor')}
+          >
+            📊 Uptime Monitor
+          </button>
+          <button 
+            className={`nav-item ${currentView === 'library' ? 'active' : ''}`}
+            onClick={() => { setCurrentView('library'); fetchSeries(); }}
+          >
+            📚 Manga Library
+          </button>
+          <button 
+            className={`nav-item ${currentView === 'downloader' ? 'active' : ''}`}
+            onClick={handleOpenMangaModal}
+          >
             📖 Manga Downloader
           </button>
-          <button className="btn btn-secondary" onClick={handleOpenSavedGallery} style={{ marginRight: '0.5rem' }}>
+          <button 
+            className={`nav-item ${currentView === 'gallery' ? 'active' : ''}`}
+            onClick={handleOpenSavedGallery}
+          >
             📂 Saved Gallery
           </button>
-          <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)}>
-            <span>+</span> Add Website
-          </button>
-        </div>
-      </header>
+        </nav>
+        
+        {currentView === 'monitor' && (
+          <div style={{ marginTop: 'auto' }}>
+            <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)} style={{ width: '100%', justifyContent: 'center' }}>
+              <span>+</span> Add Website
+            </button>
+          </div>
+        )}
+      </aside>
+
+      {/* Main Content Area */}
+      <main className="app-main">
+        {currentView === 'monitor' && (
+          <div className="app-container" style={{ margin: 0, maxWidth: '1200px' }}>
+            <header className="app-header" style={{ borderBottom: 'none', paddingBottom: 0 }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: '1.5rem', color: 'var(--color-text-primary)' }}>Uptime Monitor</h2>
+                <p style={{ margin: 0, color: 'var(--color-text-muted)', fontSize: '0.9rem' }}>Real-time Web Uptime Checker & Alerts</p>
+              </div>
+            </header>
 
       {/* Network / Connection Error Warning Banner */}
       {error && (
@@ -1711,19 +1748,180 @@ function App() {
           </div>
         </div>
       )}
+      {/* End Monitor View */}
+          </div>
+        )}
 
-      {/* Manga Downloader Modal */}
-      {isMangaModalOpen && (
-        <div className="modal-overlay">
-          <div className="modal-content" style={{ maxWidth: '900px', width: '95%' }}>
-            <div className="modal-header">
-              <h3>📖 Manga Downloader</h3>
-              <button className="modal-close" onClick={() => setIsMangaModalOpen(false)}>×</button>
+      {/* Manga Library View */}
+      {currentView === 'library' && (
+        <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
+          <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <h2>📚 คลังการ์ตูน (Manga Library)</h2>
+              {seriesLoading && <span className="loading-spinner" />}
             </div>
+          </div>
+            
+            <div className="modal-body" style={{ flex: 1, overflowY: 'auto', padding: '1.25rem', backgroundColor: 'var(--bg-tertiary)' }}>
+              {(() => {
+                const completeSeriesList = seriesList.filter(s => s.chapters?.some(c => c.status === 'done'));
+                if (completeSeriesList.length === 0 && !seriesLoading) {
+                  return (
+                    <div style={{ textAlign: 'center', color: 'var(--color-text-muted)', marginTop: '3rem' }}>
+                      📚 ยังไม่มีตอนที่โหลดเสร็จ (เรื่องไหนที่มีตอนโหลดเสร็จแล้วอย่างน้อย 1 ตอนจะมาแสดงที่นี่ให้กดอ่านได้เลย)
+                    </div>
+                  );
+                }
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem' }}>
+                  {completeSeriesList.map(series => {
+                    const total = series.chapters?.length || 0;
+                    const done = series.chapters?.filter(c => c.status === 'done').length || 0;
+                    const errors = series.chapters?.filter(c => ['error', 'blocked', 'partial'].includes(c.status)).length || 0;
+                    const isComplete = total > 0 && done === total;
+                    
+                    return (
+                      <div key={series.id} style={{ 
+                        backgroundColor: 'var(--bg-secondary)', 
+                        border: `1px solid ${isComplete ? 'var(--color-green)' : 'var(--border-color)'}`,
+                        borderRadius: '0.75rem',
+                        padding: '1rem',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.75rem',
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                          <h3 style={{ margin: 0, fontSize: '1.1rem', wordBreak: 'break-word', color: 'var(--color-text)' }}>
+                            {series.name}
+                          </h3>
+                          {isComplete && <span style={{ color: 'var(--color-green)' }}>✅</span>}
+                        </div>
+                        
+                        <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>
+                          <div>🔗 {series.seriesUrl || 'No URL'}</div>
+                          {series.sourceUrls?.length > 1 && (
+                            <div style={{ marginTop: '0.25rem', color: 'var(--color-blue)' }}>
+                              + {series.sourceUrls.length - 1} sources
+                            </div>
+                          )}
+                        </div>
+
+                        <div style={{ 
+                          marginTop: 'auto', 
+                          padding: '0.75rem', 
+                          backgroundColor: 'var(--bg-tertiary)', 
+                          borderRadius: '0.5rem',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '0.5rem'
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem' }}>
+                            <span>ตอนทั้งหมด: <strong>{total}</strong></span>
+                            <span style={{ color: 'var(--color-green)' }}>เสร็จ: <strong>{done}</strong></span>
+                          </div>
+                          {total > 0 && (
+                            <div style={{ width: '100%', height: '6px', backgroundColor: 'var(--bg-secondary)', borderRadius: '3px', overflow: 'hidden' }}>
+                              <div style={{ width: `${(done / total) * 100}%`, height: '100%', backgroundColor: 'var(--color-green)' }} />
+                            </div>
+                          )}
+                          {errors > 0 && (
+                            <div style={{ color: 'var(--color-red)', fontSize: '0.8rem' }}>
+                              ⚠️ มีปัญหา {errors} ตอน
+                            </div>
+                          )}
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+                          <button 
+                            className="btn btn-secondary" 
+                            style={{ flex: 1, padding: '0.5rem', fontSize: '0.8rem' }}
+                            onClick={() => {
+                              // Expand to show chapters inline instead of jumping to downloader
+                              setExpandedCrawlId(prev => prev === series.id ? '' : series.id);
+                            }}
+                          >
+                            👁️ ดูตอนที่โหลดเสร็จ ({done})
+                          </button>
+                          <button 
+                            className="btn btn-primary" 
+                            style={{ flex: 1, padding: '0.5rem', fontSize: '0.8rem' }}
+                            onClick={() => handleExportSeries(series.id)}
+                            disabled={isExportingSeries}
+                          >
+                            {isExportingSeries ? '⏳' : '💾 Export to DB'}
+                          </button>
+                        </div>
+                        {/* Inline Chapters Viewer */}
+                        {expandedCrawlId === series.id && (
+                          <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                            {series.chapters.filter(c => c.status === 'done').map((chapter, index) => (
+                              <div key={chapter.id} style={{ display: 'flex', flexDirection: 'column' }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.25rem 0', fontSize: '0.85rem' }}>
+                                  <span style={{ color: 'var(--color-text)' }}>ตอนที่ {index + 1} {chapter.name ? `- ${chapter.name}` : ''}</span>
+                                  <button
+                                    className="btn btn-secondary"
+                                    style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setExpandedChapterId(prev => prev === chapter.id ? '' : chapter.id);
+                                    }}
+                                  >
+                                    {expandedChapterId === chapter.id ? '▲ ปิด' : 'ดูรูป'}
+                                  </button>
+                                </div>
+                                {expandedChapterId === chapter.id && chapter.images && chapter.images.length > 0 && (
+                                  <div className="gallery-grid" style={{ marginTop: '0.5rem', marginBottom: '1rem', backgroundColor: 'var(--bg-primary)', padding: '0.5rem', borderRadius: '0.5rem' }}>
+                                    {chapter.images.map(img => (
+                                      <div key={img.filename} className="gallery-card">
+                                        <div className="gallery-img-container">
+                                          <img
+                                            src={`/api/saved-assets/${img.relativePath}`}
+                                            alt={`Page ${img.order}`}
+                                            onError={(e) => {
+                                              e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
+                                            }}
+                                          />
+                                        </div>
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0.25rem' }}>
+                                          <a
+                                            href={`/api/saved-assets/${img.relativePath}`}
+                                            download
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="gallery-img-link"
+                                          >
+                                            หน้า {img.order}
+                                          </a>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+              })()}
+            </div>
+        </div>
+      )}
+
+      {/* Manga Downloader View */}
+      {currentView === 'downloader' && (
+        <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
+          <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
+            <h3>📖 Manga Downloader</h3>
+          </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '78vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
               <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', margin: 0 }}>
-                สร้างเรื่องมังงะที่ต้องการเก็บ แล้วเพิ่มแต่ละตอนพร้อมลิงก์หน้าตอนนั้น บอทจะเข้าไปดึงเฉพาะรูปที่เดาว่าเป็นมังงะเท่านั้น (กรองโฆษณา/ไอคอนออก) และดาวน์โหลดลงเซิร์ฟเวอร์แบบทีละรูปพร้อมหน่วงเวลาแบบสุ่ม เพื่อลดโอกาสโดนเว็บบล็อก ใช้เวลานานแค่ไหนก็ได้
+                หน้านี้คือ <b>"คิวดาวน์โหลด"</b> คุณสามารถเพิ่มหน้าเว็บไซต์หรือเพิ่มเรื่องทิ้งไว้ได้หลายๆ เว็บพร้อมกัน บอทจะทำการโหลดรูปแยกกันตามโดเมนแบบคู่ขนาน (Concurrent) ทันที เมื่อโหลดครบ 100% เรื่องนั้นจะถูกย้ายไปที่ <b>"คลังการ์ตูน"</b> อัตโนมัติ
               </p>
 
               {/* Whole-site crawl: hand over just the site's root/listing URL and
@@ -1859,7 +2057,12 @@ function App() {
                 <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: '1rem', alignItems: 'start' }}>
                   {/* Series list */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-                    {seriesList.map(s => (
+                    {(() => {
+                      const incompleteSeriesList = seriesList.filter(s => !s.chapters || s.chapters.length === 0 || s.chapters.some(c => c.status !== 'done'));
+                      if (incompleteSeriesList.length === 0 && seriesList.length > 0) {
+                        return <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '1rem', fontSize: '0.85rem' }}>✅ ไม่มีคิวที่กำลังโหลด (โหลดเสร็จหมดแล้วจะอยู่ในคลัง)</div>;
+                      }
+                      return incompleteSeriesList.map(s => (
                       <div
                         key={s.id}
                         onClick={() => handleSelectSeries(s)}
@@ -1887,7 +2090,8 @@ function App() {
                           🗑️
                         </button>
                       </div>
-                    ))}
+                      ));
+                    })()}
                   </div>
 
                   {/* Chapters of selected series */}
@@ -2190,25 +2394,20 @@ function App() {
                 </div>
               )}
 
-              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => setIsMangaModalOpen(false)}>
-                  Close
-                </button>
+              <div className="modal-footer" style={{ marginTop: '0.5rem', display: 'none' }}>
+                {/* Footer hidden in view mode */}
               </div>
             </div>
-          </div>
         </div>
       )}
 
-      {/* Saved Gallery Modal */}
-      {isSavedGalleryOpen && (
-        <div className="modal-overlay">
-          <div className="modal-content" style={{ maxWidth: '850px', width: '95%' }}>
-            <div className="modal-header">
-              <h3>📂 Saved Images Gallery</h3>
-              <button className="modal-close" onClick={() => setIsSavedGalleryOpen(false)}>×</button>
-            </div>
-            
+      {/* Saved Gallery View */}
+      {currentView === 'gallery' && (
+        <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
+          <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
+            <h3>📂 Saved Images Gallery</h3>
+          </div>
+          
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', maxHeight: '75vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
               {savedLoading ? (
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '3rem 0', gap: '1rem' }}>
@@ -2367,20 +2566,15 @@ function App() {
                   })}
                 </div>
               )}
-              
-              <div className="modal-footer" style={{ marginTop: '0.5rem' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => setIsSavedGalleryOpen(false)}>
-                  Close Gallery
-                </button>
-              </div>
             </div>
-          </div>
         </div>
       )}
 
-      <footer className="app-footer">
-        <p>Robot Uptime Monitor &copy; 2026. Made with ❤️ for website reliability.</p>
-      </footer>
+
+      {/* End Main Content */}
+      </main>
+
+      {/* Footer remains outside if desired, or can be omitted in sidebar layout. Let's omit or place it in sidebar. */}
     </div>
   );
 }

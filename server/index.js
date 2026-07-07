@@ -1377,13 +1377,35 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+// Helpers for Deduplication
+function normalizeForComparison(str) {
+  if (!str) return '';
+  return str.toLowerCase().replace(/[\W_]+/g, '');
+}
+
+function extractChapterNumber(str) {
+  if (!str) return null;
+  // Match "ตอนที่ 1.5", "Chapter 1", "ep 2", or just a number
+  const match = str.match(/(?:ตอน(?:ที่)?|ch(?:apter)?|ep(?:isode)?)\s*[:.-]?\s*(\d+(?:\.\d+)?)/i) || str.match(/(\d+(?:\.\d+)?)/);
+  return match ? parseFloat(match[1]) : null;
+}
+
+function isSameChapter(c1Name, c2Name) {
+  const n1 = extractChapterNumber(c1Name);
+  const n2 = extractChapterNumber(c2Name);
+  if (n1 !== null && n2 !== null && n1 === n2) {
+    return true;
+  }
+  return normalizeForComparison(c1Name) === normalizeForComparison(c2Name);
+}
+
 // Get all manga series (with their chapters)
 app.get('/api/series', (req, res) => {
   const db = readDb();
   res.json(db.series || []);
 });
 
-// Create a new manga series
+// Create a new manga series (or return existing if matched by name)
 app.post('/api/series', (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) {
@@ -1393,11 +1415,18 @@ app.post('/api/series', (req, res) => {
   const db = readDb();
   if (!db.series) db.series = [];
 
+  const normalizedName = normalizeForComparison(name);
+  const existingSeries = db.series.find(s => normalizeForComparison(s.name) === normalizedName);
+  if (existingSeries) {
+    return res.status(200).json(existingSeries);
+  }
+
   const newSeries = {
     id: Date.now().toString(),
     name: name.trim(),
     createdAt: new Date().toISOString(),
     seriesUrl: null,
+    sourceUrls: [],
     chapters: []
   };
 
@@ -1996,6 +2025,8 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
     const addedChapters = [];
     discovered.forEach((item, index) => {
       if (existingUrls.has(item.url)) return;
+      if (series.chapters.some(c => isSameChapter(c.name, item.name))) return;
+
       const newChapter = {
         id: `${Date.now()}_${index}`,
         name: item.name,
@@ -2010,7 +2041,9 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
       addedChapters.push(newChapter);
     });
 
-    series.seriesUrl = formattedUrl;
+    series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, formattedUrl].filter(Boolean))];
+    if (!series.seriesUrl) series.seriesUrl = formattedUrl;
+    
     writeDb(db);
 
     res.json({
@@ -2607,16 +2640,22 @@ async function runSiteCrawl(crawlId) {
     if (!db.series) db.series = [];
     // Dedup against series already tracked (from a prior crawl, or added by
     // hand) so re-running a crawl never creates a duplicate series entry.
-    let series = db.series.find(s => s.seriesUrl === nextLink.url);
+    // Also dedup by name across sites
+    const normalizedNextName = normalizeForComparison(nextLink.name || nextLink.url);
+    let series = db.series.find(s => s.seriesUrl === nextLink.url || normalizeForComparison(s.name) === normalizedNextName);
+    
     if (!series) {
       series = {
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         name: nextLink.name || nextLink.url,
         createdAt: new Date().toISOString(),
         seriesUrl: nextLink.url,
+        sourceUrls: [nextLink.url],
         chapters: []
       };
       db.series.push(series);
+    } else {
+      series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, nextLink.url].filter(Boolean))];
     }
 
     let seriesRobotsRules = { disallowPaths: [], crawlDelaySeconds: null };
@@ -2635,6 +2674,8 @@ async function runSiteCrawl(crawlId) {
           const existingChapterUrls = new Set(series.chapters.map(c => c.url));
           discoveredChapters.forEach((item, idx) => {
             if (existingChapterUrls.has(item.url)) return;
+            if (series.chapters.some(c => isSameChapter(c.name, item.name))) return;
+            
             series.chapters.push({
               id: `${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
               name: item.name,
