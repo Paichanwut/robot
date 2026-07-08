@@ -107,6 +107,7 @@ function App() {
   const [isExportingSeries, setIsExportingSeries] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
   const [showSeriesMetadata, setShowSeriesMetadata] = useState(false);
+  const [expandedLibrarySeoIds, setExpandedLibrarySeoIds] = useState({});
   // A series can have hundreds of chapters - rendering every single one as a
   // full DOM card causes serious jank on every 2s poll refresh (which feels
   // like constant spinning/lag) and reflows the page enough to visibly kick
@@ -1781,7 +1782,7 @@ function App() {
                   );
                 }
                 return (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem', alignItems: 'flex-start' }}>
                   {completeSeriesList.map(series => {
                     const total = series.chapters?.length || 0;
                     const done = series.chapters?.filter(c => c.status === 'done').length || 0;
@@ -1860,6 +1861,34 @@ function App() {
                             {isExportingSeries ? '⏳' : '💾 Export to DB'}
                           </button>
                         </div>
+
+                        {/* Inline SEO Metadata Viewer */}
+                        {series.metadata && (
+                          <div style={{ marginTop: '0.5rem', border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.5rem 0.75rem', backgroundColor: 'var(--bg-tertiary)' }}>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ width: '100%', padding: '0.3rem', fontSize: '0.75rem', marginBottom: expandedLibrarySeoIds[series.id] ? '0.5rem' : 0 }}
+                              onClick={() => setExpandedLibrarySeoIds(prev => ({ ...prev, [series.id]: !prev[series.id] }))}
+                            >
+                              {expandedLibrarySeoIds[series.id] ? '▼ ซ่อนข้อมูล SEO' : `▶ แสดงข้อมูล SEO ที่ดึงมา`}
+                            </button>
+                            {expandedLibrarySeoIds[series.id] && (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.8rem', color: 'var(--color-text)' }}>
+                                {series.metadata.title && <div><strong>ชื่อเรื่อง:</strong> {series.metadata.title}</div>}
+                                {series.metadata.altTitles?.length > 0 && <div><strong>ชื่ออื่น:</strong> {series.metadata.altTitles.join(', ')}</div>}
+                                {series.metadata.synopsis && <div><strong>เรื่องย่อ:</strong> {series.metadata.synopsis}</div>}
+                                {series.metadata.author && <div><strong>ผู้แต่ง:</strong> {series.metadata.author}</div>}
+                                {series.metadata.artist && <div><strong>ผู้วาด:</strong> {series.metadata.artist}</div>}
+                                {series.metadata.genres?.length > 0 && <div><strong>แนว:</strong> {series.metadata.genres.join(', ')}</div>}
+                                {series.metadata.status && <div><strong>สถานะ:</strong> {series.metadata.status}</div>}
+                                {series.metadata.postedBy && <div><strong>อัพเดทโดย:</strong> {series.metadata.postedBy}</div>}
+                                {series.metadata.lastUpdatedDate && <div><strong>อัพเดทล่าสุด:</strong> {series.metadata.lastUpdatedDate}</div>}
+                                {series.metadata.rating && <div><strong>คะแนน:</strong> {series.metadata.rating}</div>}
+                              </div>
+                            )}
+                          </div>
+                        )}
                         {/* Inline Chapters Viewer */}
                         {expandedCrawlId === series.id && (
                           <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>

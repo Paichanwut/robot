@@ -2016,6 +2016,11 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
       return res.status(502).json({ error: 'ไม่สามารถเปิดหรืออ่านเนื้อหาหน้ารวมตอนนี้ได้' });
     }
 
+    if (!series.metadata) {
+      series.metadata = extractSeriesMetadataFromHtml(html, formattedUrl);
+      series.metadataFetchedAt = new Date().toISOString();
+    }
+
     const discovered = discoverChapterLinksFromHtml(html, formattedUrl);
     if (discovered.length === 0) {
       return res.status(404).json({ error: 'ไม่พบลิงก์ตอนในหน้านี้ ลองตรวจสอบว่านี่เป็นหน้ารวมตอนจริงหรือไม่' });
@@ -2024,10 +2029,21 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
     if (!series.chapters) series.chapters = [];
     const existingUrls = new Set(series.chapters.map(c => c.url));
 
-    const addedChapters = [];
+    let addedCount = 0;
     discovered.forEach((item, index) => {
       if (existingUrls.has(item.url)) return;
-      if (series.chapters.some(c => isSameChapter(c.name, item.name))) return;
+      
+      const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
+      if (existingSameChapter) {
+        if (existingSameChapter.status !== 'done') {
+          existingSameChapter.url = item.url;
+          existingSameChapter.status = 'pending';
+          existingSameChapter.error = null;
+          existingSameChapter.retryCount = 0;
+          addedCount++;
+        }
+        return;
+      }
 
       const newChapter = {
         id: `${Date.now()}_${index}`,
@@ -2040,7 +2056,7 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
         retryCount: 0
       };
       series.chapters.push(newChapter);
-      addedChapters.push(newChapter);
+      addedCount++;
     });
 
     series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, formattedUrl].filter(Boolean))];
@@ -2050,9 +2066,9 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
 
     res.json({
       discoveredCount: discovered.length,
-      addedCount: addedChapters.length,
-      skippedCount: discovered.length - addedChapters.length,
-      addedChapters
+      addedCount: addedCount,
+      skippedCount: discovered.length - addedCount,
+      addedChapters: []
     });
   } catch (error) {
     console.error(`Error discovering chapters from ${formattedUrl}:`, error);
@@ -2672,11 +2688,26 @@ async function runSiteCrawl(crawlId) {
       if (!isPathDisallowed(nextLink.url, seriesRobotsRules.disallowPaths)) {
         const html = await fetchTextOrNull(nextLink.url, 15000);
         if (html) {
+          if (!series.metadata) {
+            series.metadata = extractSeriesMetadataFromHtml(html, nextLink.url);
+            series.metadataFetchedAt = new Date().toISOString();
+          }
+
           const discoveredChapters = discoverChapterLinksFromHtml(html, nextLink.url);
           const existingChapterUrls = new Set(series.chapters.map(c => c.url));
           discoveredChapters.forEach((item, idx) => {
             if (existingChapterUrls.has(item.url)) return;
-            if (series.chapters.some(c => isSameChapter(c.name, item.name))) return;
+            
+            const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
+            if (existingSameChapter) {
+              if (existingSameChapter.status !== 'done') {
+                existingSameChapter.url = item.url;
+                existingSameChapter.status = 'pending';
+                existingSameChapter.error = null;
+                existingSameChapter.retryCount = 0;
+              }
+              return;
+            }
             
             series.chapters.push({
               id: `${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
