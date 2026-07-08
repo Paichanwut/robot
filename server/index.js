@@ -479,7 +479,7 @@ function extractImagesFromHtml(html, pageUrl) {
   // attributes instead. Check them first and only fall back to `src` when
   // none are present, otherwise most pages get silently missed or a
   // placeholder gets downloaded in place of real art.
-  const LAZY_SRC_ATTR_REGEX = /data-(?:src|original|lazy-src|lazy|echo|img|image|url)=["']([^"']+)["']/i;
+  const LAZY_SRC_ATTR_REGEX = /data-(?:src|original|original-src|lazy-src|lazy|echo|img|image|url|srcset|bg)=["']([^"']+)["']/i;
   const imgRegex = /<img\s+([^>]*)>/gi;
   while ((match = imgRegex.exec(html)) !== null) {
     const attrs = match[1];
@@ -501,7 +501,7 @@ function extractImagesFromHtml(html, pageUrl) {
   // Captures strings in quotes that end with image extensions
   const jsImgRegex = /["']([^"'\s>]+\.(?:jpg|jpeg|png|webp|gif|svg))["']/gi;
   while ((match = jsImgRegex.exec(html)) !== null) {
-    const src = match[1].trim();
+    const src = match[1].trim().replace(/\\/g, '');
     try {
       const absoluteUrl = new URL(src, pageUrl).href;
       if (!imagesByUrl.has(absoluteUrl)) imagesByUrl.set(absoluteUrl, '');
@@ -520,7 +520,7 @@ function extractImagesFromHtml(html, pageUrl) {
         return false;
       }
     }
-    if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar')) return false;
+    if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar') || lower.includes('profile_image') || lower.includes('twimg.com')) return false;
     if (lower.includes('ad-') || lower.includes('/ads/') || lower.includes('banner') || lower.includes('advertisement')) return false;
     if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
     // Generic UI-chrome graphics (a lightbox "close" button, "next/prev"
@@ -774,7 +774,7 @@ async function fetchPageDetails(pageUrl) {
   const startTime = performance.now();
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const timeoutId = setTimeout(() => controller.abort(), 20000);
 
     const response = await fetch(pageUrl, {
       headers: {
@@ -1678,7 +1678,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       const imageUrl = mangaImages[i].url;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
 
         const response = await fetch(imageUrl, {
           headers: {
@@ -1851,7 +1851,9 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
 
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
     const isNested = seriesPath !== '' && linkPath.startsWith(`${seriesPath}/`);
-    const looksLikeChapter = CHAPTER_KEYWORD_REGEX.test(text) || CHAPTER_KEYWORD_REGEX.test(linkPath);
+    let decodedLinkPath = linkPath;
+    try { decodedLinkPath = decodeURIComponent(linkPath); } catch(e) {}
+    const looksLikeChapter = CHAPTER_KEYWORD_REGEX.test(text) || CHAPTER_KEYWORD_REGEX.test(decodedLinkPath);
     if (!isNested && !looksLikeChapter) continue;
 
     const href = absoluteUrl.href;
@@ -1957,7 +1959,7 @@ function findNextListingPageUrl(html, pageUrl) {
   }
 
   const NEXT_TEXT_REGEX = /^(next|ถัดไป|»|>|next\s*»|หน้าถัดไป)$/i;
-  const linkRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,60}?)<\/a>/gi;
+  const linkRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,200}?)<\/a>/gi;
   let match;
   while ((match = linkRegex.exec(html)) !== null) {
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
