@@ -122,9 +122,14 @@ function App() {
   const [crawlSiteUrl, setCrawlSiteUrl] = useState('');
   const [isStartingCrawl, setIsStartingCrawl] = useState(false);
   const [expandedCrawlId, setExpandedCrawlId] = useState('');
+  const [useStealthCrawl, setUseStealthCrawl] = useState(false);
+  const [useStealthAdd, setUseStealthAdd] = useState(false);
 
   // Manga Library Dashboard state
   const [libraryFilter, setLibraryFilter] = useState('all'); // all, complete, incomplete
+  const [librarySearch, setLibrarySearch] = useState('');
+  const [libraryPage, setLibraryPage] = useState(1);
+  const LIBRARY_PAGE_SIZE = 24;
 
   // Metadata (label/icon) for the heuristic image type classification
   const SAVED_TYPE_META = {
@@ -352,7 +357,8 @@ function App() {
       const data = await res.json();
       setSeriesList(data);
       setSelectedSeriesId(prev => {
-        const nextId = prev && data.some(s => s.id === prev) ? prev : (data.length > 0 ? data[0].id : '');
+        const incompleteList = data.filter(s => !s.chapters || s.chapters.length === 0 || s.chapters.some(c => c.status !== 'done'));
+        const nextId = prev && incompleteList.some(s => s.id === prev) ? prev : (incompleteList.length > 0 ? incompleteList[0].id : '');
         const nextSeries = data.find(s => s.id === nextId);
         setDiscoverUrl(nextSeries?.seriesUrl || '');
         return nextId;
@@ -517,7 +523,7 @@ function App() {
       const res = await fetch('/api/site-crawls', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: crawlSiteUrl })
+        body: JSON.stringify({ url: crawlSiteUrl, useStealth: useStealthCrawl })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start site crawl');
@@ -583,7 +589,7 @@ function App() {
       const res = await fetch('/api/series', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newSeriesName })
+        body: JSON.stringify({ name: newSeriesName, useStealth: useStealthAdd })
       });
       if (!res.ok) throw new Error('Failed to create series');
       const created = await res.json();
@@ -1765,185 +1771,216 @@ function App() {
       {currentView === 'library' && (
         <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-              <h2>📚 คลังการ์ตูน (Manga Library)</h2>
-              {seriesLoading && <span className="loading-spinner" />}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', width: '100%', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                <h2>📚 คลังการ์ตูน (Manga Library)</h2>
+                {seriesLoading && <span className="loading-spinner" />}
+              </div>
+              <input
+                type="text"
+                className="form-input"
+                placeholder="🔍 ค้นหาชื่อเรื่อง..."
+                value={librarySearch}
+                onChange={(e) => {
+                  setLibrarySearch(e.target.value);
+                  setLibraryPage(1); // Reset to first page on search
+                }}
+                style={{ minWidth: '250px' }}
+              />
             </div>
           </div>
             
             <div className="modal-body" style={{ flex: 1, overflowY: 'auto', padding: '1.25rem', backgroundColor: 'var(--bg-tertiary)' }}>
               {(() => {
-                const completeSeriesList = seriesList.filter(s => s.chapters?.some(c => c.status === 'done'));
+                let completeSeriesList = seriesList.filter(s => s.chapters?.some(c => c.status === 'done'));
+                
+                if (librarySearch.trim()) {
+                  const query = librarySearch.toLowerCase();
+                  completeSeriesList = completeSeriesList.filter(s => s.name.toLowerCase().includes(query));
+                }
+                
                 if (completeSeriesList.length === 0 && !seriesLoading) {
                   return (
                     <div style={{ textAlign: 'center', color: 'var(--color-text-muted)', marginTop: '3rem' }}>
-                      📚 ยังไม่มีตอนที่โหลดเสร็จ (เรื่องไหนที่มีตอนโหลดเสร็จแล้วอย่างน้อย 1 ตอนจะมาแสดงที่นี่ให้กดอ่านได้เลย)
+                      📚 {librarySearch ? 'ไม่พบเรื่องที่ค้นหา' : 'ยังไม่มีตอนที่โหลดเสร็จ (เรื่องไหนที่มีตอนโหลดเสร็จแล้วอย่างน้อย 1 ตอนจะมาแสดงที่นี่ให้กดอ่านได้เลย)'}
                     </div>
                   );
                 }
+
+                const totalPages = Math.ceil(completeSeriesList.length / LIBRARY_PAGE_SIZE);
+                const startIndex = (libraryPage - 1) * LIBRARY_PAGE_SIZE;
+                const paginatedSeries = completeSeriesList.slice(startIndex, startIndex + LIBRARY_PAGE_SIZE);
+
                 return (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem', alignItems: 'flex-start' }}>
-                  {completeSeriesList.map(series => {
-                    const total = series.chapters?.length || 0;
-                    const done = series.chapters?.filter(c => c.status === 'done').length || 0;
-                    const errors = series.chapters?.filter(c => ['error', 'blocked', 'partial'].includes(c.status)).length || 0;
-                    const isComplete = total > 0 && done === total;
-                    
-                    return (
-                      <div key={series.id} style={{ 
-                        backgroundColor: 'var(--bg-secondary)', 
-                        border: `1px solid ${isComplete ? 'var(--color-green)' : 'var(--border-color)'}`,
-                        borderRadius: '0.75rem',
-                        padding: '1rem',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '0.75rem',
-                        boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-                      }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                          <h3 style={{ margin: 0, fontSize: '1.1rem', wordBreak: 'break-word', color: 'var(--color-text)' }}>
-                            {series.name}
-                          </h3>
-                          {isComplete && <span style={{ color: 'var(--color-green)' }}>✅</span>}
-                        </div>
-                        
-                        <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>
-                          <div>🔗 {series.seriesUrl || 'No URL'}</div>
-                          {series.sourceUrls?.length > 1 && (
-                            <div style={{ marginTop: '0.25rem', color: 'var(--color-blue)' }}>
-                              + {series.sourceUrls.length - 1} sources
-                            </div>
-                          )}
-                        </div>
-
-                        <div style={{ 
-                          marginTop: 'auto', 
-                          padding: '0.75rem', 
-                          backgroundColor: 'var(--bg-tertiary)', 
-                          borderRadius: '0.5rem',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '0.5rem'
-                        }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem' }}>
-                            <span>ตอนทั้งหมด: <strong>{total}</strong></span>
-                            <span style={{ color: 'var(--color-green)' }}>เสร็จ: <strong>{done}</strong></span>
-                          </div>
-                          {total > 0 && (
-                            <div style={{ width: '100%', height: '6px', backgroundColor: 'var(--bg-secondary)', borderRadius: '3px', overflow: 'hidden' }}>
-                              <div style={{ width: `${(done / total) * 100}%`, height: '100%', backgroundColor: 'var(--color-green)' }} />
-                            </div>
-                          )}
-                          {errors > 0 && (
-                            <div style={{ color: 'var(--color-red)', fontSize: '0.8rem' }}>
-                              ⚠️ มีปัญหา {errors} ตอน
-                            </div>
-                          )}
-                        </div>
-
-                        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
-                          <button 
-                            className="btn btn-secondary" 
-                            style={{ flex: 1, padding: '0.5rem', fontSize: '0.8rem' }}
-                            onClick={() => {
-                              // Expand to show chapters inline instead of jumping to downloader
-                              setExpandedCrawlId(prev => prev === series.id ? '' : series.id);
-                            }}
-                          >
-                            👁️ ดูตอนที่โหลดเสร็จ ({done})
-                          </button>
-                          <button 
-                            className="btn btn-primary" 
-                            style={{ flex: 1, padding: '0.5rem', fontSize: '0.8rem' }}
-                            onClick={() => handleExportSeries(series.id)}
-                            disabled={isExportingSeries}
-                          >
-                            {isExportingSeries ? '⏳' : '💾 Export to DB'}
-                          </button>
-                        </div>
-
-                        {/* Inline SEO Metadata Viewer */}
-                        {series.metadata && (
-                          <div style={{ marginTop: '0.5rem', border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.5rem 0.75rem', backgroundColor: 'var(--bg-tertiary)' }}>
-                            <button
-                              type="button"
-                              className="btn btn-secondary"
-                              style={{ width: '100%', padding: '0.3rem', fontSize: '0.75rem', marginBottom: expandedLibrarySeoIds[series.id] ? '0.5rem' : 0 }}
-                              onClick={() => setExpandedLibrarySeoIds(prev => ({ ...prev, [series.id]: !prev[series.id] }))}
-                            >
-                              {expandedLibrarySeoIds[series.id] ? '▼ ซ่อนข้อมูล SEO' : `▶ แสดงข้อมูล SEO ที่ดึงมา`}
-                            </button>
-                            {expandedLibrarySeoIds[series.id] && (
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.8rem', color: 'var(--color-text)' }}>
-                                {series.metadata.title && <div><strong>ชื่อเรื่อง:</strong> {series.metadata.title}</div>}
-                                {series.metadata.altTitles?.length > 0 && <div><strong>ชื่ออื่น:</strong> {series.metadata.altTitles.join(', ')}</div>}
-                                {series.metadata.synopsis && <div><strong>เรื่องย่อ:</strong> {series.metadata.synopsis}</div>}
-                                {series.metadata.author && <div><strong>ผู้แต่ง:</strong> {series.metadata.author}</div>}
-                                {series.metadata.artist && <div><strong>ผู้วาด:</strong> {series.metadata.artist}</div>}
-                                {series.metadata.genres?.length > 0 && <div><strong>แนว:</strong> {series.metadata.genres.join(', ')}</div>}
-                                {series.metadata.status && <div><strong>สถานะ:</strong> {series.metadata.status}</div>}
-                                {series.metadata.postedBy && <div><strong>อัพเดทโดย:</strong> {series.metadata.postedBy}</div>}
-                                {series.metadata.lastUpdatedDate && <div><strong>อัพเดทล่าสุด:</strong> {series.metadata.lastUpdatedDate}</div>}
-                                {series.metadata.rating && <div><strong>คะแนน:</strong> {series.metadata.rating}</div>}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                        {/* Inline Chapters Viewer */}
-                        {expandedCrawlId === series.id && (
-                          <div style={{ marginTop: '0.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                            {series.chapters.filter(c => c.status === 'done').map((chapter, index) => (
-                              <div key={chapter.id} style={{ display: 'flex', flexDirection: 'column' }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.25rem 0', fontSize: '0.85rem' }}>
-                                  <span style={{ color: 'var(--color-text)' }}>ตอนที่ {index + 1} {chapter.name ? `- ${chapter.name}` : ''}</span>
-                                  <button
-                                    className="btn btn-secondary"
-                                    style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setExpandedChapterId(prev => prev === chapter.id ? '' : chapter.id);
-                                    }}
-                                  >
-                                    {expandedChapterId === chapter.id ? '▲ ปิด' : 'ดูรูป'}
-                                  </button>
-                                </div>
-                                {expandedChapterId === chapter.id && chapter.images && chapter.images.length > 0 && (
-                                  <div className="gallery-grid" style={{ marginTop: '0.5rem', marginBottom: '1rem', backgroundColor: 'var(--bg-primary)', padding: '0.5rem', borderRadius: '0.5rem' }}>
-                                    {chapter.images.map(img => (
-                                      <div key={img.filename} className="gallery-card">
-                                        <div className="gallery-img-container">
-                                          <img
-                                            src={`/api/saved-assets/${img.relativePath}`}
-                                            alt={`Page ${img.order}`}
-                                            onError={(e) => {
-                                              e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
-                                            }}
-                                          />
-                                        </div>
-                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0.25rem' }}>
-                                          <a
-                                            href={`/api/saved-assets/${img.relativePath}`}
-                                            download
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="gallery-img-link"
-                                          >
-                                            หน้า {img.order}
-                                          </a>
-                                        </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', height: '100%' }}>
+                    <div className="table-responsive" style={{ flex: 1, overflowY: 'auto', backgroundColor: 'var(--bg-secondary)', borderRadius: '0.5rem', border: '1px solid var(--border-color)' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+                        <thead style={{ position: 'sticky', top: 0, backgroundColor: 'var(--bg-tertiary)', zIndex: 1, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+                          <tr style={{ borderBottom: '1px solid var(--border-color)', color: 'var(--color-text-muted)' }}>
+                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>ชื่อเรื่อง</th>
+                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>ความคืบหน้า</th>
+                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>สถานะ</th>
+                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem', textAlign: 'right' }}>การจัดการ</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {paginatedSeries.map(series => {
+                            const total = series.chapters?.length || 0;
+                            const done = series.chapters?.filter(c => c.status === 'done').length || 0;
+                            const errors = series.chapters?.filter(c => ['error', 'blocked', 'partial'].includes(c.status)).length || 0;
+                            const isComplete = total > 0 && done === total;
+                            
+                            return (
+                              <React.Fragment key={series.id}>
+                                <tr style={{ borderBottom: '1px solid var(--border-color)', backgroundColor: 'var(--bg-secondary)', transition: 'background-color 0.2s' }}>
+                                  <td style={{ padding: '0.6rem 0.75rem', maxWidth: '300px' }}>
+                                    <div style={{ fontWeight: '500', color: 'var(--color-text)', fontSize: '0.95rem', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }} title={series.name}>
+                                      {series.name}
+                                    </div>
+                                    <div style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '0.15rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={series.seriesUrl}>
+                                      <a href={series.seriesUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', textDecoration: 'none' }}>
+                                        🔗 {series.seriesUrl || 'No URL'}
+                                      </a>
+                                    </div>
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.75rem', width: '200px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                                      <span>ตอน: {total}</span>
+                                      <span style={{ color: 'var(--color-green)' }}>เสร็จ: {done}</span>
+                                    </div>
+                                    {total > 0 && (
+                                      <div style={{ width: '100%', height: '5px', backgroundColor: 'var(--bg-tertiary)', borderRadius: '3px', overflow: 'hidden' }}>
+                                        <div style={{ width: `${(done / total) * 100}%`, height: '100%', backgroundColor: 'var(--color-green)' }} />
                                       </div>
-                                    ))}
-                                  </div>
+                                    )}
+                                    {errors > 0 && <div style={{ color: 'var(--color-red)', fontSize: '0.75rem', marginTop: '0.2rem' }}>⚠️ มีปัญหา {errors} ตอน</div>}
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.75rem', width: '120px', fontSize: '0.85rem' }}>
+                                    {isComplete ? <span style={{ color: 'var(--color-green)' }}>✅ สมบูรณ์</span> : <span style={{ color: 'var(--color-yellow)' }}>⏳ รอโหลด</span>}
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right' }}>
+                                    <div style={{ display: 'flex', gap: '0.4rem', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                                      {series.metadata && (
+                                        <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setExpandedLibrarySeoIds(prev => ({ ...prev, [series.id]: !prev[series.id] }))}>
+                                          {expandedLibrarySeoIds[series.id] ? '▲ ซ่อน SEO' : '▼ ดู SEO'}
+                                        </button>
+                                      )}
+                                      <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setExpandedCrawlId(prev => prev === series.id ? '' : series.id)}>
+                                        {expandedCrawlId === series.id ? '▲ ซ่อนตอน' : `👁️ ตอน (${done})`}
+                                      </button>
+                                      <button className="btn btn-primary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => handleExportSeries(series.id)} disabled={isExportingSeries}>
+                                        {isExportingSeries ? '⏳' : '💾 Export'}
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                                
+                                {/* Expanded Chapters Viewer */}
+                                {expandedCrawlId === series.id && (
+                                  <tr>
+                                    <td colSpan="4" style={{ padding: '1rem', backgroundColor: 'var(--bg-tertiary)', borderBottom: '2px solid var(--border-color)' }}>
+                                      <h4 style={{ margin: '0 0 1rem 0', color: 'var(--color-text)' }}>ตอนที่โหลดเสร็จ ({done})</h4>
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                                        {series.chapters.filter(c => c.status === 'done').map((chapter, index) => (
+                                          <div key={chapter.id} style={{ display: 'flex', flexDirection: 'column' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.25rem 0', fontSize: '0.85rem' }}>
+                                              <span style={{ color: 'var(--color-text)' }}>ตอนที่ {index + 1} {chapter.name ? `- ${chapter.name}` : ''}</span>
+                                              <button
+                                                className="btn btn-secondary"
+                                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  setExpandedChapterId(prev => prev === chapter.id ? '' : chapter.id);
+                                                }}
+                                              >
+                                                {expandedChapterId === chapter.id ? '▲ ปิด' : 'ดูรูป'}
+                                              </button>
+                                            </div>
+                                            {expandedChapterId === chapter.id && chapter.images && chapter.images.length > 0 && (
+                                              <div className="gallery-grid" style={{ marginTop: '0.5rem', marginBottom: '1rem', backgroundColor: 'var(--bg-primary)', padding: '0.5rem', borderRadius: '0.5rem' }}>
+                                                {chapter.images.map(img => (
+                                                  <div key={img.filename} className="gallery-card">
+                                                    <div className="gallery-img-container">
+                                                      <img
+                                                        src={`/api/saved-assets/${img.relativePath}`}
+                                                        alt={`Page ${img.order}`}
+                                                        onError={(e) => {
+                                                          e.target.src = 'https://placehold.co/150x150/1e293b/64748b?text=Missing+Image';
+                                                        }}
+                                                      />
+                                                    </div>
+                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0.25rem' }}>
+                                                      <a
+                                                        href={`/api/saved-assets/${img.relativePath}`}
+                                                        download
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="gallery-img-link"
+                                                      >
+                                                        หน้า {img.order}
+                                                      </a>
+                                                    </div>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </td>
+                                  </tr>
                                 )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              );
+
+                                {/* Expanded SEO Viewer */}
+                                {expandedLibrarySeoIds[series.id] && series.metadata && (
+                                  <tr>
+                                    <td colSpan="4" style={{ padding: '1rem', backgroundColor: 'var(--bg-tertiary)', borderBottom: '2px solid var(--border-color)' }}>
+                                      <h4 style={{ margin: '0 0 1rem 0', color: 'var(--color-text)' }}>ข้อมูล SEO</h4>
+                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.8rem', color: 'var(--color-text)' }}>
+                                        {series.metadata.title && <div><strong>ชื่อเรื่อง:</strong> {series.metadata.title}</div>}
+                                        {series.metadata.altTitles?.length > 0 && <div><strong>ชื่ออื่น:</strong> {series.metadata.altTitles.join(', ')}</div>}
+                                        {series.metadata.synopsis && <div><strong>เรื่องย่อ:</strong> {series.metadata.synopsis}</div>}
+                                        {series.metadata.author && <div><strong>ผู้แต่ง:</strong> {series.metadata.author}</div>}
+                                        {series.metadata.artist && <div><strong>ผู้วาด:</strong> {series.metadata.artist}</div>}
+                                        {series.metadata.genres?.length > 0 && <div><strong>แนว:</strong> {series.metadata.genres.join(', ')}</div>}
+                                        {series.metadata.status && <div><strong>สถานะ:</strong> {series.metadata.status}</div>}
+                                        {series.metadata.postedBy && <div><strong>อัพเดทโดย:</strong> {series.metadata.postedBy}</div>}
+                                        {series.metadata.lastUpdatedDate && <div><strong>อัพเดทล่าสุด:</strong> {series.metadata.lastUpdatedDate}</div>}
+                                        {series.metadata.rating && <div><strong>คะแนน:</strong> {series.metadata.rating}</div>}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                )}
+                              </React.Fragment>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                {/* Pagination Controls */}
+                {totalPages > 1 && (
+                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '1rem', marginTop: 'auto', paddingTop: '1rem' }}>
+                    <button 
+                      className="btn btn-secondary" 
+                      disabled={libraryPage === 1}
+                      onClick={() => setLibraryPage(p => Math.max(1, p - 1))}
+                    >
+                      ◀ ก่อนหน้า
+                    </button>
+                    <span style={{ fontSize: '0.9rem', color: 'var(--color-text)' }}>
+                      หน้า {libraryPage} จาก {totalPages}
+                    </span>
+                    <button 
+                      className="btn btn-secondary" 
+                      disabled={libraryPage === totalPages}
+                      onClick={() => setLibraryPage(p => Math.min(totalPages, p + 1))}
+                    >
+                      ถัดไป ▶
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
               })()}
             </div>
         </div>
@@ -1973,19 +2010,25 @@ function App() {
                   </p>
                 </div>
 
-                <form onSubmit={handleStartCrawl} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                  <input
-                    type="text"
-                    className="form-input"
-                    placeholder="https://www.go-manga.com/"
-                    value={crawlSiteUrl}
-                    onChange={(e) => setCrawlSiteUrl(e.target.value)}
-                    style={{ flex: '1 1 250px' }}
-                    required
-                  />
-                  <button type="submit" className="btn btn-primary" disabled={isStartingCrawl}>
-                    {isStartingCrawl ? '⏳ กำลังเริ่ม...' : '🚀 เริ่มดึงทั้งเว็บ'}
-                  </button>
+                <form onSubmit={handleStartCrawl} style={{ display: 'flex', gap: '0.5rem', flexDirection: 'column', flex: 'none' }}>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                    <input
+                      type="text"
+                      className="form-input"
+                      placeholder="https://www.go-manga.com/"
+                      value={crawlSiteUrl}
+                      onChange={(e) => setCrawlSiteUrl(e.target.value)}
+                      style={{ flex: '1 1 250px' }}
+                      required
+                    />
+                    <button type="submit" className="btn btn-primary" disabled={isStartingCrawl}>
+                      {isStartingCrawl ? '⏳ กำลังเริ่ม...' : '🚀 เริ่มดึงทั้งเว็บ'}
+                    </button>
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
+                    <input type="checkbox" checked={useStealthCrawl} onChange={(e) => setUseStealthCrawl(e.target.checked)} />
+                    ใช้โหมดล่องหนทะลวง Cloudflare
+                  </label>
                 </form>
 
                 {siteCrawls.length > 0 && (
@@ -2067,19 +2110,25 @@ function App() {
               )}
 
               {/* Add Series Form */}
-              <form onSubmit={handleAddSeries} style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                <input
-                  type="text"
-                  className="form-input"
-                  placeholder="ชื่อเรื่องมังงะ เช่น One Piece"
-                  value={newSeriesName}
-                  onChange={(e) => setNewSeriesName(e.target.value)}
-                  style={{ flex: 1, minWidth: '200px' }}
-                  required
-                />
-                <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
-                  {isAddingSeries ? '⏳ Adding...' : '+ Add Series'}
-                </button>
+              <form onSubmit={handleAddSeries} style={{ display: 'flex', gap: '0.5rem', flexDirection: 'column', flex: 'none', padding: '0.25rem 0' }}>
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    placeholder="ชื่อเรื่องมังงะ เช่น One Piece หรือ URL หน้ารวมตอน"
+                    value={newSeriesName}
+                    onChange={(e) => setNewSeriesName(e.target.value)}
+                    style={{ flex: 1, minWidth: '200px' }}
+                    required
+                  />
+                  <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
+                    {isAddingSeries ? '⏳ Adding...' : '+ Add Series'}
+                  </button>
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
+                  <input type="checkbox" checked={useStealthAdd} onChange={(e) => setUseStealthAdd(e.target.checked)} />
+                  ใช้โหมดล่องหนทะลวง Cloudflare (สำหรับเว็บที่กันบอท)
+                </label>
               </form>
 
               {seriesLoading ? (

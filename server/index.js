@@ -6,6 +6,10 @@ import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import { Jimp, compareHashes } from 'jimp';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
+puppeteer.use(StealthPlugin());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -76,7 +80,8 @@ const defaultDb = {
   logs: [],
   saved: [],
   series: [],
-  siteCrawls: []
+  siteCrawls: [],
+  settings: { puppeteerDomains: [] }
 };
 
 // ---------------------------------------------------------------------------
@@ -337,8 +342,10 @@ app.post('/api/monitors', (req, res) => {
   const db = readDb();
   const newMonitor = {
     id: Date.now().toString(),
-    name: name.trim(),
-    url: formattedUrl,
+    name: name ? name.trim() : formattedUrl,
+    useStealth: !!useStealth,
+    metadata: null,
+    metadataFetchedAt: null,
     interval: parseInt(interval, 10) || 60,
     active: true,
     status: 'unknown',
@@ -577,12 +584,84 @@ app.get('/api/monitors/:id/images', async (req, res) => {
 // Fetches a URL as plain text with a timeout, returning null on any failure
 // (missing file, network error, non-2xx status) instead of throwing - callers
 // use this to probe for optional resources like robots.txt / sitemap.xml.
-async function fetchTextOrNull(url, timeoutMs = 8000) {
+
+let browserInstance = null;
+async function getBrowser() {
+  if (browserInstance) return browserInstance;
+  browserInstance = await puppeteer.launch({
+    headless: false,
+    defaultViewport: null,
+    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800']
+  });
+  return browserInstance;
+}
+
+process.on('SIGINT', async () => {
+  if (browserInstance) await browserInstance.close();
+  process.exit();
+});
+
+async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
+  let page = null;
   try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    
+    let html = await page.content();
+    let title = await page.title();
+    
+    let checks = 0;
+    while ((title.includes('Just a moment') || html.includes('challenge-platform') || html.includes('Cloudflare')) && checks < 60) {
+      console.log(`[Puppeteer] Cloudflare detected on ${url}, waiting for user interaction (${checks}/60)...`);
+      await new Promise(r => setTimeout(r, 1000));
+      html = await page.content();
+      title = await page.title();
+      checks++;
+    }
+    
+    if (checks > 0) {
+      console.log(`[Puppeteer] Cloudflare challenge passed or timed out after ${checks}s on ${url}`);
+    }
+    
+    const finalHtml = await page.content();
+    // Also save cookies to the global map for this domain so we can use them to download images
+    const cookies = await page.cookies();
+    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    const domain = new URL(url).hostname;
+    if (cookieString) {
+      domainCookies[domain] = cookieString;
+    }
+
+    return finalHtml;
+  } catch (e) {
+    console.error('Puppeteer fetch error:', e);
+    return null;
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
+}
+
+const domainCookies = {}; // Store cookies for image fetching
+
+async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false) {
+  try {
+    if (useStealth) {
+      return await fetchTextWithPuppeteer(url, timeoutMs + 5000);
+    }
+
+    const domain = new URL(url).hostname;
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
+    if (domainCookies[domain]) {
+      headers['Cookie'] = domainCookies[domain];
+    }
+
     const response = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      headers,
       signal: controller.signal
     });
     clearTimeout(timeoutId);
@@ -770,29 +849,34 @@ function parseRetryAfterMs(response) {
 
 // Fetches one page's status (reusing the same rich error diagnosis as the
 // uptime checker) plus every image found on it.
-async function fetchPageDetails(pageUrl) {
+async function fetchPageDetails(pageUrl, useStealth = false) {
   const startTime = performance.now();
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 20000);
 
-    const response = await fetch(pageUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-      },
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-    const responseTime = Math.round(performance.now() - startTime);
-    const statusCode = response.status;
-
-    if (statusCode < 200 || statusCode >= 400) {
-      return { url: pageUrl, status: 'down', statusCode, responseTime, error: `HTTP Error Code: ${statusCode}`, images: [] };
+    let html;
+    let statusCode;
+    if (useStealth) {
+        html = await fetchTextWithPuppeteer(pageUrl, 20000);
+        statusCode = html ? 200 : 500;
+    } else {
+        const response = await fetch(pageUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+          },
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        statusCode = response.status;
+        if (statusCode < 200 || statusCode >= 400) {
+            return { url: pageUrl, status: 'down', statusCode, responseTime: Math.round(performance.now() - startTime), error: `HTTP Error Code: ${statusCode}`, images: [] };
+        }
+        html = await response.text();
     }
 
-    const html = await response.text();
+    const responseTime = Math.round(performance.now() - startTime);
     return { url: pageUrl, status: 'up', statusCode, responseTime, error: null, images: extractImagesFromHtml(html, pageUrl) };
   } catch (err) {
     const responseTime = Math.round(performance.now() - startTime);
@@ -828,7 +912,7 @@ app.get('/api/monitors/:id/pages', async (req, res) => {
         await sleep(computeNextDelayMs(discovery.crawlDelaySeconds));
       }
 
-      const detail = await fetchPageDetails(discovery.pages[i]);
+      const detail = await fetchPageDetails(discovery.pages[i], monitor.useStealth);
       pages.push(detail);
 
       if (detail.statusCode === 429 || detail.statusCode === 403) {
@@ -1025,12 +1109,18 @@ app.post('/api/images/save-all', async (req, res) => {
           referer = new URL(imageUrl).origin;
         } catch (e) {}
 
+        const domain = new URL(imageUrl).hostname;
+        const headers = {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          'Referer': referer
+        };
+        if (domainCookies[domain]) {
+          headers['Cookie'] = domainCookies[domain];
+        }
+
         const response = await fetch(imageUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-            'Referer': referer
-          },
+          headers,
           signal: controller.signal
         });
 
@@ -1399,6 +1489,27 @@ function isSameChapter(c1Name, c2Name) {
   return normalizeForComparison(c1Name) === normalizeForComparison(c2Name);
 }
 
+// Get global settings
+app.get('/api/settings', (req, res) => {
+  const db = readDb();
+  if (!db.settings) db.settings = { puppeteerDomains: [] };
+  res.json(db.settings);
+});
+
+// Update global settings
+app.post('/api/settings', (req, res) => {
+  const db = readDb();
+  if (!db.settings) db.settings = { puppeteerDomains: [] };
+  
+  const { puppeteerDomains } = req.body;
+  if (Array.isArray(puppeteerDomains)) {
+    db.settings.puppeteerDomains = puppeteerDomains;
+  }
+  
+  writeDb(db);
+  res.json(db.settings);
+});
+
 // Get all manga series (with their chapters)
 app.get('/api/series', (req, res) => {
   const db = readDb();
@@ -1407,7 +1518,7 @@ app.get('/api/series', (req, res) => {
 
 // Create a new manga series (or return existing if matched by name)
 app.post('/api/series', (req, res) => {
-  const { name } = req.body;
+  const { seriesUrl, name, useStealth } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Series name is required' });
   }
@@ -1424,8 +1535,11 @@ app.post('/api/series', (req, res) => {
   const newSeries = {
     id: Date.now().toString(),
     name: name.trim(),
+    useStealth: !!useStealth,
+    metadata: null,
+    metadataFetchedAt: null,
     createdAt: new Date().toISOString(),
-    seriesUrl: null,
+    seriesUrl: seriesUrl ? seriesUrl.trim() : null,
     sourceUrls: [],
     chapters: []
   };
@@ -1850,11 +1964,40 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
     if (linkPath === seriesPath) continue; // link back to the listing page itself
 
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
-    const isNested = seriesPath !== '' && linkPath.startsWith(`${seriesPath}/`);
     let decodedLinkPath = linkPath;
     try { decodedLinkPath = decodeURIComponent(linkPath); } catch(e) {}
+    
+    // Extract series slug
+    const seriesSlugMatch = seriesPath.match(/\/([^\/]+)$/);
+    const seriesSlug = seriesSlugMatch ? seriesSlugMatch[1] : null;
+    let decodedSeriesSlug = seriesSlug;
+    try { if (seriesSlug) decodedSeriesSlug = decodeURIComponent(seriesSlug); } catch (e) {}
+
+    let isSameSeries = false;
+    if (seriesPath !== '' && seriesPath !== '/') {
+      // 1. Nested: /series/ -> /series/chapter-1
+      if (linkPath.startsWith(`${seriesPath}/`) || decodedLinkPath.startsWith(`${seriesPath}/`)) {
+        isSameSeries = true;
+      } 
+      // 2. Flat with dash: /series -> /series-chapter-1
+      else if (linkPath.startsWith(`${seriesPath}-`) || decodedLinkPath.startsWith(`${seriesPath}-`)) {
+        isSameSeries = true;
+      }
+      // 3. Different base path but shares slug: /manga/series -> /chapter/series-1
+      else if (seriesSlug && (
+        linkPath.includes(`/${seriesSlug}-`) || decodedLinkPath.includes(`/${decodedSeriesSlug}-`) ||
+        linkPath.includes(`/${seriesSlug}/`) || decodedLinkPath.includes(`/${decodedSeriesSlug}/`) ||
+        linkPath.endsWith(`/${seriesSlug}`) || decodedLinkPath.endsWith(`/${decodedSeriesSlug}`)
+      )) {
+        isSameSeries = true;
+      }
+    } else {
+      // If no valid series path, default to accepting anything that looks like a chapter (fallback)
+      isSameSeries = true; 
+    }
+
     const looksLikeChapter = CHAPTER_KEYWORD_REGEX.test(text) || CHAPTER_KEYWORD_REGEX.test(decodedLinkPath);
-    if (!isNested && !looksLikeChapter) continue;
+    if (!isSameSeries || !looksLikeChapter) continue;
 
     const href = absoluteUrl.href;
     if (seen.has(href)) continue;
@@ -2079,7 +2222,7 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
 // Shared by fetch-metadata and export below (both need to politely re-fetch
 // a series' own detail page) - checks robots.txt first, same posture as
 // discover-chapters above.
-async function fetchSeriesPageRespectingRobots(pageUrl) {
+async function fetchSeriesPageRespectingRobots(pageUrl, useStealth = false) {
   return runExclusiveByOrigin(pageUrl, async () => {
     const origin = new URL(pageUrl).origin;
     const robotsText = await fetchTextOrNull(`${origin}/robots.txt`);
@@ -2087,7 +2230,7 @@ async function fetchSeriesPageRespectingRobots(pageUrl) {
     if (isPathDisallowed(pageUrl, robotsRules.disallowPaths)) {
       return { disallowed: true, html: null };
     }
-    return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000) };
+    return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, useStealth) };
   });
 }
 
@@ -2109,7 +2252,7 @@ app.post('/api/series/:id/fetch-metadata', async (req, res) => {
   }
 
   try {
-    const { disallowed, html } = await fetchSeriesPageRespectingRobots(targetUrl);
+    const { disallowed, html } = await fetchSeriesPageRespectingRobots(targetUrl, series.useStealth);
     if (disallowed) {
       return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
     }
@@ -2306,7 +2449,7 @@ app.post('/api/series/:id/export', async (req, res) => {
     // themselves.
     if (!series.metadata && series.seriesUrl) {
       try {
-        const { disallowed, html } = await fetchSeriesPageRespectingRobots(series.seriesUrl);
+        const { disallowed, html } = await fetchSeriesPageRespectingRobots(series.seriesUrl, series.useStealth);
         if (!disallowed && html) {
           series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
           series.metadataFetchedAt = new Date().toISOString();
@@ -2540,12 +2683,12 @@ async function runSiteCrawl(crawlId) {
       // same site (see runExclusiveByOrigin) - a listing-page fetch here
       // shouldn't race a chapter download in progress for the same host.
       const { disallowed, html } = await runExclusiveByOrigin(pageUrl, async () => {
-        const robotsText = await fetchTextOrNull(`${pageOrigin}/robots.txt`);
+        const robotsText = await fetchTextOrNull(`${pageOrigin}/robots.txt`, 8000, false);
         robotsRules = robotsText ? parseRobotsRules(robotsText) : robotsRules;
         if (isPathDisallowed(pageUrl, robotsRules.disallowPaths)) {
           return { disallowed: true, html: null };
         }
-        return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000) };
+        return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, crawl.useStealth) };
       });
 
       if (disallowed) {
@@ -2682,11 +2825,11 @@ async function runSiteCrawl(crawlId) {
       // same site (see runExclusiveByOrigin).
       await runExclusiveByOrigin(nextLink.url, async () => {
       const origin = new URL(nextLink.url).origin;
-      const robotsText = await fetchTextOrNull(`${origin}/robots.txt`);
+      const robotsText = await fetchTextOrNull(`${origin}/robots.txt`, 8000, false);
       seriesRobotsRules = robotsText ? parseRobotsRules(robotsText) : seriesRobotsRules;
 
       if (!isPathDisallowed(nextLink.url, seriesRobotsRules.disallowPaths)) {
-        const html = await fetchTextOrNull(nextLink.url, 15000);
+        const html = await fetchTextOrNull(nextLink.url, 15000, crawl.useStealth);
         if (html) {
           if (!series.metadata) {
             series.metadata = extractSeriesMetadataFromHtml(html, nextLink.url);
@@ -2786,7 +2929,7 @@ async function runSiteCrawl(crawlId) {
 // the background loop off and returns immediately - use GET /api/site-crawls
 // to poll progress.
 app.post('/api/site-crawls', (req, res) => {
-  const { url } = req.body;
+  const { url, useStealth } = req.body;
   if (!url || !url.trim()) {
     return res.status(400).json({ error: 'Site URL is required' });
   }
@@ -2799,9 +2942,30 @@ app.post('/api/site-crawls', (req, res) => {
   const db = readDb();
   if (!db.siteCrawls) db.siteCrawls = [];
 
+  try {
+    const targetOrigin = new URL(formattedUrl).origin;
+    const existingCrawl = db.siteCrawls.find(c => {
+      try { return new URL(c.siteUrl).origin === targetOrigin; } catch { return false; }
+    });
+
+    if (existingCrawl) {
+      existingCrawl.useStealth = !!useStealth;
+      if (existingCrawl.status !== 'running') {
+        existingCrawl.status = 'running';
+        existingCrawl.lastError = null;
+        writeDb(db);
+        runSiteCrawl(existingCrawl.id).catch(console.error);
+      }
+      return res.status(200).json({ message: 'Resumed existing crawl', crawlId: existingCrawl.id });
+    }
+  } catch (e) {
+    // If URL parsing fails, proceed to create a new one (it will likely fail later, but safe fallback)
+  }
+
   const newCrawl = {
     id: Date.now().toString(),
     siteUrl: formattedUrl,
+    useStealth: !!useStealth,
     status: 'running',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
