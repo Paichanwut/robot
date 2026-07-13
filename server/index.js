@@ -943,6 +943,44 @@ function computeNextDelayMs(crawlDelaySeconds) {
   return Math.max(jitterMs, crawlDelayMs);
 }
 
+// Downloads one image, retrying transient failures. Cloudflare 5xx codes
+// (525 = SSL handshake to origin failed, 520-524, plus 500/502/503/504) mean
+// the CDN couldn't reach/complete a request to the ORIGIN server - a blip on
+// their side, not ours - and clear on a retry a second later far more often
+// than not, so losing the page over one is wasteful. Network errors/timeouts
+// are retried the same way. 429/403 are NOT retried here: those mean we're
+// being rate-limited/blocked, which the caller handles by backing off the
+// whole chapter, so they're reported up as { blocked: true } instead.
+async function fetchImageWithRetry(imageUrl, headers, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(imageUrl, { headers, signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (response.status === 429 || response.status === 403) {
+        return { blocked: true, retryAfterMs: parseRetryAfterMs(response) };
+      }
+      if (response.status >= 500 && attempt < attempts) {
+        console.log(`[Image] transient HTTP ${response.status} on ${imageUrl} - retry ${attempt}/${attempts - 1}`);
+        await sleep(1000 * attempt + Math.random() * 500);
+        continue;
+      }
+      if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
+      return { response };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastError = err;
+      if (attempt < attempts) {
+        await sleep(1000 * attempt + Math.random() * 500);
+        continue;
+      }
+    }
+  }
+  throw lastError || new Error('image download failed');
+}
+
 // Per-origin mutex: every scraping entry point (single chapter scrape,
 // scrape-all, a whole-site crawl's discovery + per-series work) all touch
 // the network independently, with no awareness of each other. Without this,
@@ -2046,28 +2084,19 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
 
       const imageUrl = mangaImages[i].url;
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        const download = await fetchImageWithRetry(imageUrl, clearanceHeaders(imageUrl, {
+          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          'Referer': origin
+        }));
 
-        const response = await fetch(imageUrl, {
-          headers: clearanceHeaders(imageUrl, {
-            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-            'Referer': origin
-          }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-
-        if (response.status === 429 || response.status === 403) {
+        if (download.blocked) {
           blockedEarly = true;
           // Some sites tell us exactly how long to back off instead of
           // leaving it to guesswork - honor that over our own jittered delay.
-          retryAfterMs = parseRetryAfterMs(response);
+          retryAfterMs = download.retryAfterMs;
           break;
         }
-        if (!response.ok) {
-          throw new Error(`HTTP Error ${response.status}`);
-        }
+        const response = download.response;
 
         const contentType = response.headers.get('content-type');
         const ext = getExtension(imageUrl, contentType);
