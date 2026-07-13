@@ -6,10 +6,8 @@ import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import { Jimp, compareHashes } from 'jimp';
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-
-puppeteer.use(StealthPlugin());
+import { connect } from 'puppeteer-real-browser';
+import { spawnSync } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -585,54 +583,125 @@ app.get('/api/monitors/:id/images', async (req, res) => {
 // (missing file, network error, non-2xx status) instead of throwing - callers
 // use this to probe for optional resources like robots.txt / sitemap.xml.
 
+// Cloudflare's "Just a moment" interstitial can't be cleared by plain
+// puppeteer + stealth: Cloudflare detects the DevTools Protocol attachment
+// (the `Runtime.enable` leak) and the `--enable-automation` webdriver flag,
+// neither of which the stealth plugin patches. puppeteer-real-browser drives
+// the real installed Chrome through a patched (rebrowser) connection that
+// hides those signals and, with `turnstile: true`, auto-clicks the challenge
+// widget. A persistent profile dir keeps the resulting cf_clearance cookie
+// across pages AND server restarts, so most requests never see a challenge at
+// all (the cookie is IP+UA-bound, which is also why a VPN that changes the IP
+// would invalidate it rather than help).
+const CHROME_PROFILE_DIR = path.join(DATA_DIR, 'chrome-profile');
+
+// puppeteer launches a real Chrome bound to CHROME_PROFILE_DIR. If the server
+// dies without a clean shutdown (crash, SIGKILL, `pkill node`), that Chrome
+// keeps running and keeps an OS lock on the profile - so the NEXT connect()
+// can't launch on it and fails with "connect ECONNREFUSED", which surfaces as
+// a stray blank Chrome window and a crawl that never fetches anything. Kill
+// any Chrome still holding OUR profile before (re)launching. The match is
+// scoped to our profile path, so the user's own Chrome (a different profile)
+// is never touched.
+function killStaleProfileChrome() {
+  try {
+    spawnSync('pkill', ['-9', '-f', CHROME_PROFILE_DIR], { timeout: 5000 });
+  } catch (e) {
+    // pkill unavailable / nothing to kill - ignore
+  }
+}
+
 let browserInstance = null;
+let initialBlankPage = null; // the about:blank tab connect() opens; retired once real work starts
 async function getBrowser() {
   if (browserInstance) return browserInstance;
-  browserInstance = await puppeteer.launch({
+  if (!fs.existsSync(CHROME_PROFILE_DIR)) fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true });
+  killStaleProfileChrome(); // free the profile from any leftover Chrome first
+  const { browser, page } = await connect({
     headless: false,
-    defaultViewport: null,
-    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800']
+    turnstile: true,
+    customConfig: { userDataDir: CHROME_PROFILE_DIR },
+    connectOption: { defaultViewport: null },
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
   });
+  browserInstance = browser;
+  initialBlankPage = page || null;
+  // `turnstile` is wired via browser.on('targetcreated'), so every page opened
+  // from this singleton (below) gets the auto-solver too - no need to reconnect.
+  browserInstance.on('disconnected', () => { browserInstance = null; initialBlankPage = null; });
   return browserInstance;
 }
 
-process.on('SIGINT', async () => {
-  if (browserInstance) await browserInstance.close();
-  process.exit();
-});
+// Opens a fresh tab for a scrape and, once it exists, retires the leftover
+// about:blank tab connect() created - closing that blank tab any earlier could
+// quit Chrome while it's the only open tab.
+async function newScrapePage() {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  if (initialBlankPage) {
+    const stale = initialBlankPage;
+    initialBlankPage = null;
+    stale.close().catch(() => {});
+  }
+  return page;
+}
+
+// Shut the automation Chrome down with the server so it doesn't linger and
+// lock the profile (see killStaleProfileChrome). close() is best-effort; the
+// pkill is the guarantee, and it runs synchronously so it completes before
+// the process exits.
+function shutdownBrowser() {
+  try { if (browserInstance) browserInstance.close(); } catch (e) { /* ignore */ }
+  killStaleProfileChrome();
+}
+process.on('SIGINT', () => { shutdownBrowser(); process.exit(); });
+process.on('SIGTERM', () => { shutdownBrowser(); process.exit(); });
 
 async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
   let page = null;
   try {
-    const browser = await getBrowser();
-    page = await browser.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    
-    let html = await page.content();
-    let title = await page.title();
-    
+    page = await newScrapePage();
+    // A goto timeout is NOT fatal here: while Cloudflare's turnstile is being
+    // solved the page reloads itself, which can keep `domcontentloaded` from
+    // settling before the deadline. Rather than bail (which showed up as
+    // "ไม่สามารถเปิดหน้าได้"), swallow the navigation error and fall through to
+    // the challenge-poll loop below - the tab is live and usually resolves
+    // within the next few seconds.
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } catch (navErr) {
+      console.log(`[Puppeteer] navigation to ${url} didn't settle (${navErr.name}); polling for the real page anyway...`);
+    }
+
+    // While the turnstile is being solved the page reloads itself, which can
+    // destroy the execution context mid-read and throw; treat any failed read
+    // as "still loading" and keep polling rather than crashing the fetch.
+    const readContent = () => page.content().catch(() => '');
+    let html = await readContent();
+    // turnstile:true is clicking the challenge in the background; we just poll
+    // until the real page has loaded (or give up after 60s).
     let checks = 0;
-    while ((title.includes('Just a moment') || html.includes('challenge-platform') || html.includes('Cloudflare')) && checks < 60) {
-      console.log(`[Puppeteer] Cloudflare detected on ${url}, waiting for user interaction (${checks}/60)...`);
+    while (looksLikeCloudflareChallenge(html) && checks < 60) {
+      console.log(`[Puppeteer] Cloudflare challenge on ${url}, waiting for auto-solve (${checks}/60)...`);
       await new Promise(r => setTimeout(r, 1000));
-      html = await page.content();
-      title = await page.title();
+      html = await readContent();
       checks++;
     }
-    
+
     if (checks > 0) {
       console.log(`[Puppeteer] Cloudflare challenge passed or timed out after ${checks}s on ${url}`);
     }
-    
-    const finalHtml = await page.content();
-    // Also save cookies to the global map for this domain so we can use them to download images
-    const cookies = await page.cookies();
-    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    const finalHtml = await readContent();
+    // Remember the cookie AND the User-Agent this page was served with, keyed
+    // by host, so browser-less fetches (page HTML + image downloads) can replay
+    // the clearance without opening Chrome. cf_clearance is UA-bound, so the UA
+    // must be captured here, not assumed.
     const domain = new URL(url).hostname;
-    if (cookieString) {
-      domainCookies[domain] = cookieString;
-    }
+    const cookies = await page.cookies().catch(() => []);
+    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => null);
+    rememberCloudflareClearance(domain, cookieString, userAgent);
 
     return finalHtml;
   } catch (e) {
@@ -643,11 +712,80 @@ async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
   }
 }
 
-const domainCookies = {}; // Store cookies for image fetching
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// Per-domain Cloudflare clearance earned by solving the challenge in the real
+// browser once. cf_clearance is bound to the exact IP + User-Agent that earned
+// it, so BOTH must be replayed together on later plain fetches - hence two maps
+// keyed by hostname, always written and read as a pair.
+const domainCookies = {};       // hostname -> "cf_clearance=...; ..." cookie header
+const domainUserAgents = {};    // hostname -> the UA the browser used when solving
+
+// Cloudflare's interstitial is localized ("Just a moment" / "รอสักครู่" / ...),
+// so detect it by its challenge markup rather than the title text.
+function looksLikeCloudflareChallenge(text) {
+  if (!text) return false;
+  return text.includes('Just a moment') || text.includes('รอสักครู่') ||
+    text.includes('challenge-platform') || text.includes('cf-turnstile') ||
+    text.includes('Verifying you are human');
+}
+
+// Records the cookie + UA a solved page produced, so plain fetches can reuse it.
+function rememberCloudflareClearance(domain, cookieString, userAgent) {
+  if (cookieString) domainCookies[domain] = cookieString;
+  if (userAgent) domainUserAgents[domain] = userAgent;
+}
+
+// Header set for a browser-less asset fetch (image, page) that replays whatever
+// Cloudflare clearance we hold for the host - the same UA that earned the
+// cookie plus the cookie itself, so a Cloudflare-fronted image CDN serves us
+// the same way the browser was served. Falls back to the default UA / no cookie
+// for hosts we've never had to solve.
+function clearanceHeaders(url, extra = {}) {
+  let domain = '';
+  try { domain = new URL(url).hostname; } catch (e) { /* keep domain empty */ }
+  const headers = { 'User-Agent': domainUserAgents[domain] || DEFAULT_USER_AGENT, ...extra };
+  if (domainCookies[domain]) headers['Cookie'] = domainCookies[domain];
+  return headers;
+}
+
+// Plain (browser-less) fetch that replays a previously-earned cf_clearance for
+// the host. Returns the body only when it's the REAL page; returns null when
+// there's no clearance yet or Cloudflare challenged us again (cookie expired /
+// IP changed) so the caller knows to fall back to the browser.
+async function fetchWithClearanceOrNull(url, timeoutMs) {
+  const domain = new URL(url).hostname;
+  if (!domainCookies[domain]) return null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': domainUserAgents[domain] || DEFAULT_USER_AGENT,
+        'Cookie': domainCookies[domain],
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const body = await response.text();
+    return looksLikeCloudflareChallenge(body) ? null : body;
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false) {
   try {
     if (useStealth) {
+      // "solve once, fetch many": try a browser-less fetch with the clearance
+      // we already earned for this host first - the vast majority of requests
+      // go through here and never open Chrome. Only when there's no clearance
+      // yet, or it's expired (challenge came back), do we spin up the real
+      // browser to (re)solve, which refreshes the cookie/UA for next time.
+      const viaCookie = await fetchWithClearanceOrNull(url, timeoutMs + 5000);
+      if (viaCookie) return viaCookie;
       return await fetchTextWithPuppeteer(url, timeoutMs + 5000);
     }
 
@@ -655,7 +793,7 @@ async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false) {
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    const headers = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
+    const headers = { 'User-Agent': domainUserAgents[domain] || DEFAULT_USER_AGENT };
     if (domainCookies[domain]) {
       headers['Cookie'] = domainCookies[domain];
     }
@@ -858,22 +996,44 @@ async function fetchPageDetails(pageUrl, useStealth = false) {
     let html;
     let statusCode;
     if (useStealth) {
-        html = await fetchTextWithPuppeteer(pageUrl, 20000);
+        // Cloudflare-fronted page: go through the clearance path (reuse the
+        // cf_clearance cookie if we have one, only open the browser to
+        // (re)solve). This is what a chapter page on dark-manga needs - a plain
+        // fetch here is exactly what returned HTTP 403.
+        html = await fetchTextOrNull(pageUrl, 15000, true);
         statusCode = html ? 200 : 500;
+        if (!html) {
+            return { url: pageUrl, status: 'down', statusCode, responseTime: Math.round(performance.now() - startTime), error: 'ไม่สามารถผ่าน Cloudflare ได้', images: [] };
+        }
     } else {
         const response = await fetch(pageUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          // Replay any Cloudflare clearance we already hold for this host, so a
+          // page that's quietly behind Cloudflare doesn't 403 on a bare fetch.
+          headers: clearanceHeaders(pageUrl, {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-          },
+          }),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
         statusCode = response.status;
-        if (statusCode < 200 || statusCode >= 400) {
+        html = (statusCode >= 200 && statusCode < 400) ? await response.text() : '';
+
+        // A 403/503 - or a challenge body served with a 200 - from a bare fetch
+        // almost always means the host is behind Cloudflare. Transparently retry
+        // through the clearance/browser path so the user doesn't have to know to
+        // tick "stealth" for that site; the first hit solves it, the rest reuse
+        // the cookie.
+        if (statusCode === 403 || statusCode === 503 || looksLikeCloudflareChallenge(html)) {
+            const solved = await fetchTextOrNull(pageUrl, 15000, true);
+            if (solved) {
+                html = solved;
+                statusCode = 200;
+            } else {
+                return { url: pageUrl, status: 'down', statusCode: statusCode || 500, responseTime: Math.round(performance.now() - startTime), error: 'ไม่สามารถผ่าน Cloudflare ได้', images: [] };
+            }
+        } else if (statusCode < 200 || statusCode >= 400) {
             return { url: pageUrl, status: 'down', statusCode, responseTime: Math.round(performance.now() - startTime), error: `HTTP Error Code: ${statusCode}`, images: [] };
         }
-        html = await response.text();
     }
 
     const responseTime = Math.round(performance.now() - startTime);
@@ -1031,14 +1191,13 @@ app.post('/api/images/save', async (req, res) => {
     } catch (e) {}
 
     const response = await fetch(imageUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      headers: clearanceHeaders(imageUrl, {
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         'Referer': referer
-      },
+      }),
       signal: controller.signal
     });
-    
+
     clearTimeout(timeoutId);
 
     if (!response.ok) {
@@ -1109,15 +1268,10 @@ app.post('/api/images/save-all', async (req, res) => {
           referer = new URL(imageUrl).origin;
         } catch (e) {}
 
-        const domain = new URL(imageUrl).hostname;
-        const headers = {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        const headers = clearanceHeaders(imageUrl, {
           'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
           'Referer': referer
-        };
-        if (domainCookies[domain]) {
-          headers['Cookie'] = domainCookies[domain];
-        }
+        });
 
         const response = await fetch(imageUrl, {
           headers,
@@ -1448,6 +1602,106 @@ async function computePerceptualHash(bufferOrPath) {
   }
 }
 
+// The aggregator burns its own branding/backlink banner onto the pages it
+// serves - a red "GOD MANGA / อ่านมังงะออนไลน์ / www.god-manga.com" graphic
+// that sits on a solid-white strip at the very top of a chapter's first
+// image(s). It is NOT part of the scanlated artwork and shouldn't end up in
+// the exported chapter. It's distinguishable from real page art by a very
+// specific signature: a horizontal band of bright banner-red pixels that is
+// flanked by pure-white margins ABOVE and BELOW (real webtoon art bleeds to
+// the edges and is never preceded by a full-width white strip). This detects
+// that signature at the top edge and crops the whole white+banner+white strip
+// off, leaving the art untouched. It is deliberately conservative: it returns
+// the buffer unchanged whenever the signature isn't a clean match, or when
+// removing it would eat further into the image than a banner ever occupies -
+// so a red-heavy top art panel is never mistaken for the banner.
+const WATERMARK_MAX_STRIP_FRACTION = 0.12; // never crop more than 12% of the height...
+const WATERMARK_MAX_STRIP_PX = 1000;       // ...nor more than this many pixels, whichever is smaller
+const MIME_BY_EXT = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', bmp: 'image/bmp', gif: 'image/gif'
+};
+
+async function stripAggregatorBanner(buffer, ext) {
+  // jimp can't re-encode webp/avif; skip those rather than corrupt the file.
+  const mime = MIME_BY_EXT[(ext || '').toLowerCase()];
+  if (!mime) return { buffer, cropped: false };
+
+  let image;
+  try {
+    image = await Jimp.read(buffer);
+  } catch (err) {
+    return { buffer, cropped: false };
+  }
+
+  const w = image.bitmap.width;
+  const h = image.bitmap.height;
+  const d = image.bitmap.data;
+  if (h < 200 || w < 100) return { buffer, cropped: false };
+
+  const cap = Math.min(WATERMARK_MAX_STRIP_PX, Math.floor(h * WATERMARK_MAX_STRIP_FRACTION));
+
+  // Per-row fractions of bright banner-red and of near-white pixels, sampled
+  // every few columns for speed. Banner rows spike on red; the strip's
+  // padding rows are almost entirely white.
+  function rowStats(y) {
+    let red = 0, white = 0, n = 0;
+    for (let x = 0; x < w; x += 3) {
+      const idx = (y * w + x) * 4;
+      const r = d[idx], g = d[idx + 1], b = d[idx + 2];
+      if (r > 150 && g < 90 && b < 90) red++;
+      if (r > 244 && g > 244 && b > 244) white++;
+      n++;
+    }
+    return { red: red / n, white: white / n };
+  }
+
+  // Locate the red banner band within the top [0, cap) region.
+  let bandStart = -1, bandEnd = -1;
+  for (let y = 0; y < cap; y++) {
+    if (rowStats(y).red > 0.06) {
+      if (bandStart < 0) bandStart = y;
+      bandEnd = y;
+    }
+  }
+  if (bandStart < 0 || bandEnd - bandStart < 20) return { buffer, cropped: false }; // no band / too thin
+
+  // The banner floats on white: require a white margin ABOVE it (art would
+  // instead run right up to the top edge). bandStart must not touch y=0.
+  if (bandStart < 8) return { buffer, cropped: false };
+  let whiteAbove = 0;
+  for (let y = 0; y < bandStart; y++) if (rowStats(y).white > 0.9) whiteAbove++;
+  if (whiteAbove < bandStart * 0.6) return { buffer, cropped: false };
+
+  // Walk past the rest of the banner (the red block PLUS its dark URL text,
+  // which isn't red) to the first SUSTAINED white gap separating it from the
+  // artwork - the art begins right after that gap, and that's the crop line.
+  // If no such gap turns up before the safety cap, the band is bleeding into
+  // real art rather than being a clean banner, so refuse.
+  let gapEndedAt = -1, gapRun = 0;
+  for (let y = bandEnd + 1; y < cap && y < h; y++) {
+    if (rowStats(y).white > 0.9) {
+      gapRun++;
+      if (gapRun >= 8) { // found the separating white gap; advance to where it ends
+        let z = y + 1;
+        while (z < h && rowStats(z).white > 0.9) z++;
+        gapEndedAt = z;
+        break;
+      }
+    } else {
+      gapRun = 0;
+    }
+  }
+  if (gapEndedAt < 0 || gapEndedAt > cap || gapEndedAt >= h) return { buffer, cropped: false };
+
+  try {
+    image.crop({ x: 0, y: gapEndedAt, w, h: h - gapEndedAt });
+    const out = await image.getBuffer(mime);
+    return { buffer: out, cropped: true };
+  } catch (err) {
+    return { buffer, cropped: false };
+  }
+}
+
 // Runs `fn` over `items` with at most `limit` in flight at once. The
 // duplicate-image sweep (see /api/series/:id/clean-duplicate-images) can
 // have thousands of files to hash/decode on a large series - doing that one
@@ -1709,7 +1963,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       return { httpStatus: 403, error: chapter.error };
     }
 
-    const pageDetail = await fetchPageDetails(chapter.url);
+    const pageDetail = await fetchPageDetails(chapter.url, series.useStealth);
     if (pageDetail.status !== 'up') {
       chapter.status = 'error';
       chapter.error = pageDetail.error || 'ไม่สามารถเปิดหน้าตอนนี้ได้';
@@ -1780,6 +2034,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     fs.mkdirSync(chapterDir, { recursive: true });
 
     const downloaded = [];
+    const chapterHashes = new Set(); // content hashes already kept in THIS scrape - catches in-chapter duplicate pages
     let blockedEarly = false;
     let retryAfterMs = null;
     let excludedAsSharedCount = 0; // hash-deduped ad/credit images - not a download failure
@@ -1795,11 +2050,10 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         const timeoutId = setTimeout(() => controller.abort(), 30000);
 
         const response = await fetch(imageUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          headers: clearanceHeaders(imageUrl, {
             'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
             'Referer': origin
-          },
+          }),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
@@ -1818,8 +2072,31 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         const contentType = response.headers.get('content-type');
         const ext = getExtension(imageUrl, contentType);
         const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        let buffer = Buffer.from(arrayBuffer);
+
+        // Crop off the aggregator's branding/backlink banner (a red
+        // "GOD MANGA / god-manga.com" graphic on a solid-white strip at the
+        // top of the page) before the bytes are hashed or saved - it's site
+        // furniture, not page art, so it must never reach the exported
+        // chapter. No-op on pages that don't carry it. Hashing the CLEANED
+        // bytes keeps re-scrapes deterministic and lets the cross-chapter
+        // dedup below still match.
+        try {
+          buffer = (await stripAggregatorBanner(buffer, ext)).buffer;
+        } catch (err) {
+          // any decode/encode failure: fall back to the untouched original
+        }
+
         const contentHash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+        // The site sometimes serves the exact same page file twice within one
+        // chapter (a duplicated splash/banner slide). The cross-chapter checks
+        // below only fire when a hash reappears under a *different* chapter, so
+        // an in-chapter repeat would slip through and get saved twice - drop it.
+        if (chapterHashes.has(contentHash)) {
+          continue;
+        }
+        chapterHashes.add(contentHash);
 
         // Same cross-chapter-reuse check as the URL-based one above, but by
         // content hash - catches a translator's credit slide/ad banner even

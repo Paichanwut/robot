@@ -20,6 +20,7 @@
     "puppeteer": "^25.3.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer-real-browser": "^1.4.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
