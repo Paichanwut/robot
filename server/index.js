@@ -1515,7 +1515,7 @@ const INFO_LABEL_MAP = [
   [/artist|นักวาด/i, 'artist'],
   [/posted\s*by|updated\s*by|อัพเดทโดย/i, 'postedBy'],
   [/posted\s*on|published|เผยแพร่|แผยแพร่/i, 'publishedDate'],
-  [/updated\s*on|last\s*updated|แก้ไขล่าสุด/i, 'lastUpdatedDate'],
+  [/updated\s*on|last\s*updated|แก้ไขล่าสุด|อัปเดต|อัพเดท/i, 'lastUpdatedDate'],
   [/views|ยอดวิว/i, 'views']
 ];
 
@@ -1579,6 +1579,60 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
         if (isoMatch) meta[`${mapped[1]}ISO`] = isoMatch[1];
       }
     }
+  }
+
+  // Fallback for the "sh-*" theme (bully-manga.com and similar) - a custom,
+  // non-WordPress layout the selectors above don't match at all. Each field is
+  // only filled when still missing, so this never clobbers a value the
+  // WordPress-theme extraction already found.
+  if (!meta.title) {
+    const m = /<h1[^>]*class=["'][^"']*sh-title[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+    if (m) meta.title = stripTags(m[1]);
+  }
+  if (!meta.synopsis) {
+    const m = /<p[^>]*class=["'][^"']*sh-synopsis[^"']*["'][^>]*>([\s\S]*?)<\/p>/i.exec(html);
+    if (m) meta.synopsis = stripTags(m[1]);
+  }
+  if (!meta.coverImageUrl) {
+    const m = /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i.exec(html);
+    if (m) { try { meta.coverImageUrl = new URL(m[1], pageUrl).href; } catch (e) { meta.coverImageUrl = m[1]; } }
+  }
+  if (meta.rating == null) {
+    const m = /<span[^>]*class=["'][^"']*\bscore\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+    if (m) { const v = parseFloat(stripTags(m[1])); if (!Number.isNaN(v)) meta.rating = v; }
+  }
+  if (meta.views == null) {
+    const m = /<div[^>]*class=["'][^"']*sh-views-chip[^"']*["'][^>]*>([\s\S]*?)<\/div>/i.exec(html);
+    if (m) { const v = stripTags(m[1]).replace(/[^\d]/g, ''); if (v) meta.views = v; }
+  }
+  if (!meta.type) {
+    const m = /<span[^>]*class=["'][^"']*sh-badge-type[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+    if (m) meta.type = stripTags(m[1]);
+  }
+  if (!meta.status) {
+    const m = /<span[^>]*class=["'][^"']*sh-badge-status[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+    if (m) meta.status = stripTags(m[1]);
+  }
+  if (!meta.genres) {
+    const genreRegex = /<a[^>]*class=["'][^"']*sh-genre[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+    const shGenres = [];
+    let gm;
+    while ((gm = genreRegex.exec(html)) !== null) {
+      const g = stripTags(gm[1]);
+      if (g) shGenres.push(g);
+    }
+    if (shGenres.length > 0) meta.genres = shGenres;
+  }
+  // Key/value "meta pills": <span class="sh-meta-k">อัปเดต</span><span class="sh-meta-v">2026-07-13 ...</span>
+  const pillRegex = /<span[^>]*class=["'][^"']*sh-meta-k[^"']*["'][^>]*>([\s\S]*?)<\/span>\s*<span[^>]*class=["'][^"']*sh-meta-v[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi;
+  let pm;
+  while ((pm = pillRegex.exec(html)) !== null) {
+    const label = stripTags(pm[1]);
+    const value = stripTags(pm[2]);
+    if (!label || !value) continue;
+    if (!(label in meta.raw)) meta.raw[label] = value;
+    const mapped = INFO_LABEL_MAP.find(([re]) => re.test(label));
+    if (mapped && !meta[mapped[1]]) meta[mapped[1]] = value;
   }
 
   return meta;
@@ -2244,18 +2298,51 @@ app.post('/api/series/:id/chapters/:chapterId/scrape', async (req, res) => {
 // sites nest chapter URLs under their series slug) or whose text/URL
 // contains an explicit chapter/episode keyword. This lets a user hand over
 // just the one series page instead of typing every chapter URL by hand.
+// Pulls a chapter number out of a URL path, preferring an explicit chapter
+// token (ep0014 / chapter-14 / episode_14 / ตอนที่-14) over a bare trailing
+// number - the token is far less likely to grab an unrelated digit that
+// happens to sit in the slug (a year, a volume, ...) than "first number
+// anywhere" would.
+function chapterNumberFromPath(decodedPath) {
+  const tokenMatch = decodedPath.match(/(?:ep|episode|chapter|ตอน(?:ที่)?)[-_.\s]*(\d+(?:\.\d+)?)/i);
+  if (tokenMatch) return parseFloat(tokenMatch[1]);
+  const tailMatch = decodedPath.match(/[-/](\d+(?:\.\d+)?)\/?$/);
+  return tailMatch ? parseFloat(tailMatch[1]) : null;
+}
+
+// Link labels that are page furniture pointing AT a chapter (the "read first /
+// latest chapter" buttons, prev/next arrows) rather than a real chapter list
+// entry - we still keep the URL, but its text must not become the chapter's
+// name, and a real list entry for the same URL should win over it.
+const CHAPTER_NAV_LABEL_REGEX = /^(อ่าน(ตอน)?(แรก|ล่าสุด|ต่อ)|ตอน(แรก|ล่าสุด|ก่อน(หน้า)?|ถัดไป)|บท(ก่อน(หน้า)?|ถัดไป)|กลับ|first|last|prev(ious)?|next|latest|newest|oldest|read\s*(first|last|now))\b/i;
+
+// Strips a trailing "N สัปดาห์ / 3 วัน / 2 hours ago" freshness stamp that
+// these listings tack onto each chapter row, so it never lands in the name (or,
+// worse, gets read as the chapter number).
+function cleanChapterName(text) {
+  return text
+    .replace(/\s*\d+\s*(สัปดาห์|วัน|ชั่วโมง|นาที|เดือน|ปี|weeks?|days?|hrs?|hours?|mins?|minutes?|months?|years?)\s*(ที่แล้ว|ago)?\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function discoverChapterLinksFromHtml(html, pageUrl) {
   const cleanedHtml = stripNavChrome(html);
   const seriesPath = new URL(pageUrl).pathname.replace(/\/+$/, '');
   const CHAPTER_KEYWORD_REGEX = /(chapter|ตอน|ep[-_.]?\d|episode)/i;
   const NUMBER_REGEX = /(\d+(?:\.\d+)?)/;
 
-  const linkRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  // Capture the whole opening <a ...> tag so per-chapter data-* attributes
+  // (e.g. bully-manga's data-title="14") are available for a clean number/name.
+  const linkRegex = /<a\s+([^>]*?)>([\s\S]*?)<\/a>/gi;
   const seen = new Map();
   let match;
 
   while ((match = linkRegex.exec(cleanedHtml)) !== null) {
-    const rawHref = match[1].trim();
+    const attrs = match[1];
+    const hrefMatch = /href=["']([^"']+)["']/i.exec(attrs);
+    if (!hrefMatch) continue;
+    const rawHref = hrefMatch[1].trim();
     if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:')) continue;
 
     let absoluteUrl;
@@ -2272,7 +2359,7 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
     let decodedLinkPath = linkPath;
     try { decodedLinkPath = decodeURIComponent(linkPath); } catch(e) {}
-    
+
     // Extract series slug
     const seriesSlugMatch = seriesPath.match(/\/([^\/]+)$/);
     const seriesSlug = seriesSlugMatch ? seriesSlugMatch[1] : null;
@@ -2284,7 +2371,7 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
       // 1. Nested: /series/ -> /series/chapter-1
       if (linkPath.startsWith(`${seriesPath}/`) || decodedLinkPath.startsWith(`${seriesPath}/`)) {
         isSameSeries = true;
-      } 
+      }
       // 2. Flat with dash: /series -> /series-chapter-1
       else if (linkPath.startsWith(`${seriesPath}-`) || decodedLinkPath.startsWith(`${seriesPath}-`)) {
         isSameSeries = true;
@@ -2299,23 +2386,50 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
       }
     } else {
       // If no valid series path, default to accepting anything that looks like a chapter (fallback)
-      isSameSeries = true; 
+      isSameSeries = true;
     }
 
     const looksLikeChapter = CHAPTER_KEYWORD_REGEX.test(text) || CHAPTER_KEYWORD_REGEX.test(decodedLinkPath);
     if (!isSameSeries || !looksLikeChapter) continue;
 
     const href = absoluteUrl.href;
-    if (seen.has(href)) continue;
 
-    const numberMatch = (text.match(NUMBER_REGEX) || linkPath.match(NUMBER_REGEX));
-    const number = numberMatch ? parseFloat(numberMatch[1]) : null;
-    const name = text || (number !== null ? `ตอนที่ ${number}` : href);
+    // Chapter number: prefer an explicit data-* attribute (grid layouts like
+    // bully-manga expose the clean number there), then the URL's chapter token,
+    // then a number in the link text as a last resort.
+    const dataAttrMatch = /data-(?:title|ep|chapter|num|number)=["'](\d+(?:\.\d+)?)["']/i.exec(attrs);
+    const cleanedText = cleanChapterName(text);
+    const number = dataAttrMatch ? parseFloat(dataAttrMatch[1])
+      : (chapterNumberFromPath(decodedLinkPath)
+        ?? (cleanedText.match(NUMBER_REGEX) ? parseFloat(cleanedText.match(NUMBER_REGEX)[1]) : null));
 
-    seen.set(href, { url: href, name, number });
+    // Name + priority. A "read first/latest" nav button must never name the
+    // chapter (priority 0); a clean data-attr grid cell is most trustworthy
+    // (priority 3); a normal text label that reads like a chapter is priority 2;
+    // a bare number-only fallback is priority 1. On a duplicate URL the highest
+    // priority wins, so the real list entry beats the nav button.
+    const isNav = CHAPTER_NAV_LABEL_REGEX.test(cleanedText);
+    let name, priority;
+    if (dataAttrMatch && number !== null) {
+      name = `ตอนที่ ${number}`;
+      priority = 3;
+    } else if (!isNav && cleanedText && CHAPTER_KEYWORD_REGEX.test(cleanedText)) {
+      name = cleanedText;
+      priority = 2;
+    } else if (number !== null) {
+      name = `ตอนที่ ${number}`;
+      priority = isNav ? 0 : 1;
+    } else {
+      name = cleanedText || href;
+      priority = 0;
+    }
+
+    const existing = seen.get(href);
+    if (existing && existing.priority >= priority) continue;
+    seen.set(href, { url: href, name, number, priority });
   }
 
-  const results = [...seen.values()];
+  const results = [...seen.values()].map(({ url, name, number }) => ({ url, name, number }));
   const allNumbered = results.length > 0 && results.every(r => r.number !== null);
   if (allNumbered) {
     results.sort((a, b) => a.number - b.number);
@@ -2336,7 +2450,11 @@ const CONTENT_PREFIX_REGEX = /^(manga|mangas|series|comic|comics|title|titles|st
 const CHAPTER_LIKE_PATH_REGEX = /(chapter|ตอน|ep[-_.]?\d|episode)/i;
 // Generic nav/account link labels (English and Thai) - a real series title
 // is never just "Bookmark" or "หมวดหมู่อื่นๆ" (other categories).
-const NON_SERIES_NAME_REGEX = /^(home|login|log\s*in|register|sign\s*up|sign\s*in|logout|log\s*out|bookmark(s)?|all\s*manga|all|genre(s)?|categor(y|ies)|about(\s*us)?|contact(\s*us)?|privacy(\s*policy)?|terms([\s-](of[\s-]service|and[\s-]conditions))?|dmca|faq|advertise|search|หมวดหมู่.*|ทั้งหมด|บุ๊คมาร์ค|เข้าสู่ระบบ|สมัครสมาชิก|ติดต่อเรา|เกี่ยวกับเรา|ค้นหา|รายการโปรด|หน้าแรก|นโยบาย.*|ข้อตกลง.*)$/i;
+// "อ่านเรื่องนี้ →" / "อ่านต่อ" / "Read now" etc. are hero/CTA buttons that
+// point at a real series URL but whose LABEL is the call to action, not the
+// title - drop them so a series never gets named "อ่านเรื่องนี้" (the real
+// series is still discovered from its poster card elsewhere on the page).
+const NON_SERIES_NAME_REGEX = /^(home|login|log\s*in|register|sign\s*up|sign\s*in|logout|log\s*out|bookmark(s)?|all\s*manga|all|genre(s)?|categor(y|ies)|about(\s*us)?|contact(\s*us)?|privacy(\s*policy)?|terms([\s-](of[\s-]service|and[\s-]conditions))?|dmca|faq|advertise|search|read\s*(now|this|more).*|หมวดหมู่.*|ทั้งหมด|บุ๊คมาร์ค|เข้าสู่ระบบ|สมัครสมาชิก|ติดต่อเรา|เกี่ยวกับเรา|ค้นหา|รายการโปรด|หน้าแรก|อ่านเรื่อง.*|อ่านต่อ.*|อ่านเลย.*|อ่านตอน.*|นโยบาย.*|ข้อตกลง.*)$/i;
 
 // Strips repeated site-wide chrome (nav/header/footer/sidebar) out of a page
 // before link discovery runs over it - this chrome repeats on every page of
@@ -2414,6 +2532,49 @@ function findNextListingPageUrl(html, pageUrl) {
     const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
     if (NEXT_TEXT_REGEX.test(text)) {
       try { return new URL(match[1].trim(), pageUrl).href; } catch (e) { continue; }
+    }
+  }
+
+  // JS-driven pagers (next/prev <button>s that page client-side, e.g.
+  // bully-manga's "หน้า 1 / 40" grid or its homepage "หน้า 1" feed) expose no
+  // <a href> to follow, but the pages still live at predictable URLs. Only act
+  // when there's a real next control on the page, so a lone "หน้า"/"page" word
+  // elsewhere never triggers phantom pagination.
+  const hasNextControl = /id=["']nextBtn["']|ถัดไป|หน้าถัดไป|class=["'][^"']*(?:pagination|pager|pg-)/i.test(html);
+  if (hasNextControl) {
+    // A disabled next button = we're on the last page.
+    const nextDisabled = /<button[^>]*id=["']nextBtn["'][^>]*\bdisabled\b/i.test(html)
+      || /<button[^>]*\bdisabled\b[^>]*id=["']nextBtn["']/i.test(html);
+    if (nextDisabled) return null;
+
+    const currentMatch = /(?:หน้า|page)\s*(?:<[^>]*>\s*)?(\d+)/i.exec(html);
+    const current = currentMatch ? parseInt(currentMatch[1], 10) : null;
+    if (current !== null && current >= 1) {
+      // Stop at the last page when a total is shown ("หน้า X / Y").
+      const totalMatch = /(?:หน้า|page)\s*(?:<[^>]*>\s*)?\d+(?:\s*<\/[^>]*>)?\s*(?:\/|of|จาก)\s*(\d+)/i.exec(html);
+      if (totalMatch && current >= parseInt(totalMatch[1], 10)) return null;
+
+      const nextPageNum = current + 1;
+      // Prefer the site's OWN next-page URL, lifted from its pager JS
+      // (`location.href = `/page/${page + 1}``) - the path convention differs by
+      // section (bully-manga's homepage is /page/N, its catalog is /genres/all/N),
+      // so a blind numeric-segment bump would 404 on the homepage.
+      const tplMatch = /location\.href\s*=\s*[`"']([^`"'${]*)\$\{\s*[a-zA-Z_$][\w$]*\s*\+\s*1\s*\}([^`"']*)[`"']/.exec(html);
+      if (tplMatch) {
+        try { return new URL(`${tplMatch[1]}${nextPageNum}${tplMatch[2]}`, pageUrl).href; } catch (e) { /* fall through */ }
+      }
+      // Fallback: increment/append a trailing numeric path segment.
+      try {
+        const nextUrl = new URL(pageUrl);
+        const segments = nextUrl.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+        if (segments.length > 0 && /^\d+$/.test(segments[segments.length - 1])) {
+          segments[segments.length - 1] = String(nextPageNum);
+        } else {
+          segments.push(String(nextPageNum));
+        }
+        nextUrl.pathname = '/' + segments.join('/');
+        return nextUrl.href;
+      } catch (e) { /* fall through */ }
     }
   }
   return null;
@@ -2839,6 +3000,75 @@ const scrapingSeries = {}; // seriesId -> true while a bulk scrape-all is in-fli
 // page that briefly 500'd, ...) is automatically retried in the next round
 // instead of being left incomplete forever - only a manual "Re-scrape"
 // click bypasses this retry budget once it's exhausted.
+// Downloads every not-yet-done chapter of a series, retrying incomplete ones
+// across up to MAX_CHAPTER_RETRIES rounds (a longer, gentler gap between
+// rounds). Shared by /scrape-all and /retry-problem-chapters. Assumes the
+// caller holds the scrapingSeries[id] lock. Returns { scrapedCount, blockedEarly }.
+async function runScrapeAllForSeries(db, series) {
+  const findEligible = () => (series.chapters || []).filter(
+    c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
+  );
+
+  let scrapedCount = 0;
+  let blockedEarly = false;
+  let lastRetryAfterMs = null;
+
+  for (let round = 0; round < MAX_CHAPTER_RETRIES; round++) {
+    const chaptersToScrape = findEligible();
+    if (chaptersToScrape.length === 0) break;
+
+    if (round > 0) {
+      // A longer, gentler gap before retrying anything that failed the
+      // first time - a transient block/hiccup needs more than a second
+      // to clear, and this also naturally slows down retries against a
+      // site that's still actively rate-limiting. If the site told us via
+      // Retry-After exactly how long to wait, that takes priority over
+      // our own guess.
+      await sleep(Math.max(computeNextDelayMs(null) * 3, lastRetryAfterMs || 0));
+      lastRetryAfterMs = null;
+    }
+
+    let blockedThisRound = false;
+    for (let i = 0; i < chaptersToScrape.length; i++) {
+      if (i > 0) {
+        await sleep(computeNextDelayMs(null));
+      }
+
+      const chapter = chaptersToScrape[i];
+      scrapingChapters[chapter.id] = true;
+      let result;
+      try {
+        result = await scrapeChapterCore(db, series, chapter);
+      } finally {
+        scrapingChapters[chapter.id] = false;
+      }
+      if (result.retryAfterMs) lastRetryAfterMs = result.retryAfterMs;
+
+      scrapedCount++;
+      if (chapter.status === 'blocked') {
+        blockedThisRound = true;
+        break;
+      }
+    }
+
+    if (blockedThisRound && !lastRetryAfterMs) {
+      // Blocked with no explicit signal for how long to wait - an
+      // ambiguous 429/403 is treated as "stop touching this site right
+      // now" rather than guessing at a backoff. If the site DID send a
+      // Retry-After, that's an explicit "come back after N seconds"
+      // instruction, safe to honor and let the next round retry -
+      // handled by the delay above instead of aborting here.
+      blockedEarly = true;
+      break;
+    }
+  }
+
+  // Reflects the final state after every round (including one that ran out of
+  // retries while still blocked), not just whether a round broke out early.
+  blockedEarly = blockedEarly || (series.chapters || []).some(c => c.status === 'blocked');
+  return { scrapedCount, blockedEarly };
+}
+
 app.post('/api/series/:id/scrape-all', async (req, res) => {
   const { id } = req.params;
   const db = readDb();
@@ -2850,75 +3080,50 @@ app.post('/api/series/:id/scrape-all', async (req, res) => {
     return res.status(429).json({ error: 'This series is already being scraped' });
   }
 
-  const findEligible = () => (series.chapters || []).filter(
+  const eligible = (series.chapters || []).filter(
     c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
   );
-
-  if (findEligible().length === 0) {
+  if (eligible.length === 0) {
     return res.json({ scrapedCount: 0, blockedEarly: false, message: 'ไม่มีตอนที่ต้องโหลดเพิ่ม' });
   }
 
   scrapingSeries[id] = true;
-  let scrapedCount = 0;
-  let blockedEarly = false;
-  let lastRetryAfterMs = null;
-
   try {
-    for (let round = 0; round < MAX_CHAPTER_RETRIES; round++) {
-      const chaptersToScrape = findEligible();
-      if (chaptersToScrape.length === 0) break;
+    const result = await runScrapeAllForSeries(db, series);
+    res.json(result);
+  } finally {
+    scrapingSeries[id] = false;
+  }
+});
 
-      if (round > 0) {
-        // A longer, gentler gap before retrying anything that failed the
-        // first time - a transient block/hiccup needs more than a second
-        // to clear, and this also naturally slows down retries against a
-        // site that's still actively rate-limiting. If the site told us via
-        // Retry-After exactly how long to wait, that takes priority over
-        // our own guess.
-        await sleep(Math.max(computeNextDelayMs(null) * 3, lastRetryAfterMs || 0));
-        lastRetryAfterMs = null;
-      }
+// Re-download the chapters that ended up incomplete (error / partial / blocked),
+// INCLUDING the ones that already used up their automatic retry budget - the
+// retry cap only stops the unattended passes from hammering forever; an
+// explicit click here means "try these again now", so it resets their counter
+// first and then runs the same download-with-retries loop as /scrape-all.
+app.post('/api/series/:id/retry-problem-chapters', async (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  const series = findSeries(db, id);
+  if (!series) {
+    return res.status(404).json({ error: 'Series not found' });
+  }
+  if (scrapingSeries[id]) {
+    return res.status(429).json({ error: 'This series is already being scraped' });
+  }
 
-      let blockedThisRound = false;
-      for (let i = 0; i < chaptersToScrape.length; i++) {
-        if (i > 0) {
-          await sleep(computeNextDelayMs(null));
-        }
+  const problemChapters = (series.chapters || []).filter(c => c.status !== 'done' && !scrapingChapters[c.id]);
+  if (problemChapters.length === 0) {
+    return res.json({ scrapedCount: 0, blockedEarly: false, message: 'ไม่มีตอนที่มีปัญหาให้ลองใหม่' });
+  }
+  // Clear the retry budget so chapters stuck at the cap become eligible again.
+  problemChapters.forEach(c => { c.retryCount = 0; });
+  writeDb(db);
 
-        const chapter = chaptersToScrape[i];
-        scrapingChapters[chapter.id] = true;
-        let result;
-        try {
-          result = await scrapeChapterCore(db, series, chapter);
-        } finally {
-          scrapingChapters[chapter.id] = false;
-        }
-        if (result.retryAfterMs) lastRetryAfterMs = result.retryAfterMs;
-
-        scrapedCount++;
-        if (chapter.status === 'blocked') {
-          blockedThisRound = true;
-          break;
-        }
-      }
-
-      if (blockedThisRound && !lastRetryAfterMs) {
-        // Blocked with no explicit signal for how long to wait - an
-        // ambiguous 429/403 is treated as "stop touching this site right
-        // now" rather than guessing at a backoff. If the site DID send a
-        // Retry-After, that's an explicit "come back after N seconds"
-        // instruction, safe to honor and let the next round retry -
-        // handled by the delay above instead of aborting here.
-        blockedEarly = true;
-        break;
-      }
-    }
-
-    // Reflects the final state after every round (including one that ran
-    // out of retries while still blocked), not just whether a round broke
-    // out early above.
-    blockedEarly = blockedEarly || (series.chapters || []).some(c => c.status === 'blocked');
-    res.json({ scrapedCount, blockedEarly });
+  scrapingSeries[id] = true;
+  try {
+    const result = await runScrapeAllForSeries(db, series);
+    res.json({ ...result, retriedProblemCount: problemChapters.length });
   } finally {
     scrapingSeries[id] = false;
   }
@@ -2943,6 +3148,14 @@ app.post('/api/series/:id/scrape-all', async (req, res) => {
 const MAX_LISTING_PAGES = 60;
 const MAX_DISCOVERED_SERIES_PER_CRAWL = 500;
 const MAX_CONSECUTIVE_BLOCKED_SERIES = 3;
+// After the normal per-chapter retries are spent, the crawl keeps doing full
+// "recheck" sweeps over any chapters that are STILL incomplete - lifting the
+// per-chapter retry cap and waiting an escalating cooldown between sweeps - so
+// a series briefly blocked by a 429/403 gets picked back up automatically
+// instead of staying stuck. Bounded so genuinely-dead chapters (404 art, etc.)
+// don't loop the crawl forever.
+const MAX_RECHECK_ROUNDS = 5;
+const RECHECK_COOLDOWN_BASE_MS = 3 * 60 * 1000; // 3, 6, 9, 12, 15 min between rounds
 
 function findCrawl(db, crawlId) {
   return (db.siteCrawls || []).find(c => c.id === crawlId);
@@ -3058,12 +3271,53 @@ async function runSiteCrawl(crawlId) {
       }
 
       if (!retryChapter) {
-        crawl.status = 'done';
+        // No chapter is under the per-chapter retry cap anymore. If chapters
+        // are STILL incomplete (usually ones a 429/403 block stopped short),
+        // don't give up: wait an escalating cooldown to let the site recover,
+        // lift the retry cap on those chapters, and sweep again - up to
+        // MAX_RECHECK_ROUNDS times - so a series doesn't stay stuck for long
+        // while the crawl has already moved on. Only when everything is done,
+        // or the recheck budget is spent, does the crawl actually finish.
+        const incompleteChapters = [];
+        for (const s of (db.series || [])) {
+          if (!crawlSeriesUrls.has(s.seriesUrl)) continue;
+          for (const c of (s.chapters || [])) {
+            if (c.status !== 'done') incompleteChapters.push(c);
+          }
+        }
+
+        if (incompleteChapters.length === 0 || (crawl.recheckRound || 0) >= MAX_RECHECK_ROUNDS) {
+          crawl.status = 'done';
+          crawl.currentSeriesUrl = null;
+          crawl.currentSeriesName = null;
+          crawl.updatedAt = new Date().toISOString();
+          writeDb(db);
+          return;
+        }
+
+        crawl.recheckRound = (crawl.recheckRound || 0) + 1;
+        crawl.lastError = `รอบตรวจซ้ำ ${crawl.recheckRound}/${MAX_RECHECK_ROUNDS}: ยังมี ${incompleteChapters.length} ตอนที่ไม่ครบ กำลังพัก cooldown แล้วลองใหม่`;
+        incompleteChapters.forEach(c => { c.retryCount = 0; }); // give them a fresh retry budget
+        crawl.consecutiveBlockedSeries = 0; // fresh block budget after the cooldown
         crawl.currentSeriesUrl = null;
         crawl.currentSeriesName = null;
         crawl.updatedAt = new Date().toISOString();
         writeDb(db);
-        return;
+
+        // Escalating cooldown between recheck rounds (3, 6, 9, ... minutes) so a
+        // rate-limiting site gets progressively more time to recover. Sleep in
+        // short steps so a stop request still lands promptly.
+        const cooldownMs = RECHECK_COOLDOWN_BASE_MS * crawl.recheckRound;
+        for (let waited = 0; waited < cooldownMs; waited += 3000) {
+          if (crawlControl[crawlId].stopRequested) {
+            crawl.status = 'stopped';
+            crawl.updatedAt = new Date().toISOString();
+            writeDb(db);
+            return;
+          }
+          await sleep(Math.min(3000, cooldownMs - waited));
+        }
+        continue;
       }
 
       crawl.currentSeriesUrl = retrySeries.seriesUrl;
@@ -3178,35 +3432,47 @@ async function runSiteCrawl(crawlId) {
     writeDb(db);
     await sleep(computeNextDelayMs(seriesRobotsRules.crawlDelaySeconds));
 
-    // Scrape every not-yet-downloaded chapter of this series, checking the
-    // stop signal (cheap in-memory read) before every single chapter so a
-    // stop request lands promptly even mid-series.
-    const chaptersToScrape = series.chapters.filter(c => c.status !== 'done');
+    // Scrape every not-yet-done chapter of this series, then keep sweeping the
+    // ones that came out incomplete until they either finish or use up their
+    // retry budget - so a transient failure (a 525 blip, a brief rate-limit) is
+    // fixed right here, before moving to the next series, instead of waiting for
+    // the end-of-crawl retry pass which on a big site could be hours away. Each
+    // failed scrape bumps retryCount (see scrapeChapterCore), so a chapter drops
+    // out of `pending` after MAX_CHAPTER_RETRIES sweeps - the loop can't spin.
+    // The stop signal is checked before every chapter so a stop lands promptly.
     let seriesBlocked = false;
     let seriesRetryAfterMs = null;
-    for (let i = 0; i < chaptersToScrape.length; i++) {
-      if (crawlControl[crawlId].stopRequested) {
-        crawl.status = 'stopped';
-        crawl.updatedAt = new Date().toISOString();
-        writeDb(db);
-        return;
-      }
-      if (i > 0) await sleep(computeNextDelayMs(null));
+    let firstChapterOfSeries = true;
+    while (!seriesBlocked) {
+      const pending = series.chapters.filter(
+        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+      );
+      if (pending.length === 0) break;
 
-      const chapter = chaptersToScrape[i];
-      scrapingChapters[chapter.id] = true;
-      let result;
-      try {
-        result = await scrapeChapterCore(db, series, chapter);
-      } finally {
-        scrapingChapters[chapter.id] = false;
-      }
+      for (const chapter of pending) {
+        if (crawlControl[crawlId].stopRequested) {
+          crawl.status = 'stopped';
+          crawl.updatedAt = new Date().toISOString();
+          writeDb(db);
+          return;
+        }
+        if (!firstChapterOfSeries) await sleep(computeNextDelayMs(null));
+        firstChapterOfSeries = false;
 
-      crawl.stats.chaptersDownloaded += 1;
-      if (chapter.status === 'blocked') {
-        seriesBlocked = true;
-        seriesRetryAfterMs = result.retryAfterMs || null;
-        break;
+        scrapingChapters[chapter.id] = true;
+        let result;
+        try {
+          result = await scrapeChapterCore(db, series, chapter);
+        } finally {
+          scrapingChapters[chapter.id] = false;
+        }
+
+        crawl.stats.chaptersDownloaded += 1;
+        if (chapter.status === 'blocked') {
+          seriesBlocked = true;
+          seriesRetryAfterMs = result.retryAfterMs || null;
+          break;
+        }
       }
     }
 
@@ -3283,6 +3549,7 @@ app.post('/api/site-crawls', (req, res) => {
     currentSeriesUrl: null,
     currentSeriesName: null,
     consecutiveBlockedSeries: 0,
+    recheckRound: 0,
     lastError: null,
     stats: { seriesProcessed: 0, chaptersDownloaded: 0 }
   };

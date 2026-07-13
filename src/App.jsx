@@ -103,6 +103,7 @@ function App() {
   const [discoverUrl, setDiscoverUrl] = useState('');
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [isScrapingAll, setIsScrapingAll] = useState(false);
+  const [isRetryingProblems, setIsRetryingProblems] = useState(false);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
   const [isExportingSeries, setIsExportingSeries] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
@@ -419,6 +420,30 @@ function App() {
       alert(err.message);
     } finally {
       setIsScrapingAll(false);
+    }
+  };
+
+  // Re-download the chapters that ended up incomplete (error/partial/blocked),
+  // even the ones that already used up their auto-retry budget - resets their
+  // counter server-side and runs the same download loop as scrape-all.
+  const handleRetryProblemChapters = async (seriesId) => {
+    if (isRetryingProblems || isScrapingAll) return;
+    if (!confirm('ลองโหลดเฉพาะตอนที่มีปัญหา (error/โหลดไม่ครบ) ใหม่ทั้งหมด รวมตอนที่ครบ 3 ครั้งแล้วด้วย ต้องการดำเนินการต่อหรือไม่?')) return;
+
+    setIsRetryingProblems(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/retry-problem-chapters`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to retry problem chapters');
+
+      alert(data.message
+        ? data.message
+        : `✓ ลองโหลดตอนที่มีปัญหา ${data.retriedProblemCount ?? ''} ตอนใหม่ (โหลดไป ${data.scrapedCount} ครั้ง)${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsRetryingProblems(false);
     }
   };
 
@@ -2225,6 +2250,17 @@ function App() {
                                   onClick={() => handleScrapeAllChapters(series.id)}
                                 >
                                   {isScrapingAll ? '⏳ กำลังโหลดทุกตอน...' : '⬇️ Scrape ทุกตอนที่ยังไม่เสร็จ'}
+                                </button>
+                              )}
+                              {(series.chapters || []).some(c => ['error', 'partial', 'blocked'].includes(c.status)) && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isRetryingProblems || isScrapingAll}
+                                  onClick={() => handleRetryProblemChapters(series.id)}
+                                >
+                                  {isRetryingProblems ? '⏳ กำลังลองตอนที่มีปัญหา...' : '🔁 ลองตอนที่มีปัญหาใหม่'}
                                 </button>
                               )}
                               <button
