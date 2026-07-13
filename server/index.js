@@ -3781,7 +3781,13 @@ function resumeRunningSiteCrawls() {
 // toggle with settings.autoRetryEnabled.
 // ---------------------------------------------------------------------------
 const AUTO_RETRY_TICK_MS = 10 * 60 * 1000;      // how often the watchdog wakes up
-const AUTO_RETRY_SERIES_COOLDOWN_MS = 30 * 60 * 1000; // don't re-hit the same series more often than this
+// Per-series cooldown ESCALATES the longer a series stays stuck: retry soon at
+// first (a transient 429/403 block usually clears within minutes), then back
+// off geometrically toward a 2-hour ceiling so a stubborn series keeps getting
+// retried forever - automatically, gently, no manual clicks - without hammering
+// the source. Cooldown = min(BASE * 2^streak, MAX): 10m, 20m, 40m, 80m, 2h, 2h…
+const AUTO_RETRY_BASE_COOLDOWN_MS = 10 * 60 * 1000;   // first retry ~10 min after a failure
+const AUTO_RETRY_MAX_COOLDOWN_MS = 2 * 60 * 60 * 1000; // ...capped at every 2 hours forever
 let autoRetryRunning = false;
 
 async function autoRetryProblemChaptersSweep() {
@@ -3803,18 +3809,31 @@ async function autoRetryProblemChaptersSweep() {
       const problems = (series.chapters || []).filter(
         c => c.status !== 'done' && !scrapingChapters[c.id]
       );
-      if (problems.length === 0) continue;
+      if (problems.length === 0) {
+        // Nothing wrong anymore - clear the back-off streak so a future problem
+        // gets retried promptly again rather than starting at a long cooldown.
+        if (series.autoRetryStreak) { series.autoRetryStreak = 0; writeDb(db); }
+        continue;
+      }
 
+      // Escalating back-off: the more consecutive sweeps this series has stayed
+      // stuck, the longer we wait before the next retry (10m → 20m → … → 2h cap).
+      const streak = series.autoRetryStreak || 0;
+      const cooldown = Math.min(AUTO_RETRY_BASE_COOLDOWN_MS * Math.pow(2, streak), AUTO_RETRY_MAX_COOLDOWN_MS);
       const lastAt = series.lastAutoRetryAt ? new Date(series.lastAutoRetryAt).getTime() : 0;
-      if (Date.now() - lastAt < AUTO_RETRY_SERIES_COOLDOWN_MS) continue;
+      if (Date.now() - lastAt < cooldown) continue;
 
       scrapingSeries[seriesId] = true;
       try {
         problems.forEach(c => { c.retryCount = 0; }); // fresh retry budget
         series.lastAutoRetryAt = new Date().toISOString();
         writeDb(db);
-        console.log(`[AutoRetry] retrying ${problems.length} problem chapter(s) in "${series.name}"`);
+        console.log(`[AutoRetry] retrying ${problems.length} problem chapter(s) in "${series.name}" (streak ${streak}, next in ~${Math.round(Math.min(AUTO_RETRY_BASE_COOLDOWN_MS * Math.pow(2, streak + 1), AUTO_RETRY_MAX_COOLDOWN_MS) / 60000)}m if still stuck)`);
         await runScrapeAllForSeries(db, series);
+        // Bump the streak if it's still not fully done (keeps backing off toward
+        // the 2h ceiling); reset to 0 the moment everything downloaded.
+        const stillStuck = (series.chapters || []).some(c => c.status !== 'done');
+        series.autoRetryStreak = stillStuck ? streak + 1 : 0;
         writeDb(db);
       } catch (err) {
         console.error(`[AutoRetry] series ${seriesId} failed:`, err);
