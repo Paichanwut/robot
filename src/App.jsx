@@ -105,6 +105,8 @@ function App() {
   const [isScrapingAll, setIsScrapingAll] = useState(false);
   const [isRetryingProblems, setIsRetryingProblems] = useState(false);
   const [autoRetryEnabled, setAutoRetryEnabled] = useState(true);
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(true);
+  const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
   const [isExportingSeries, setIsExportingSeries] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
@@ -358,13 +360,19 @@ function App() {
       if (!res.ok) throw new Error('Failed to fetch manga series');
       const data = await res.json();
       setSeriesList(data);
-      setSelectedSeriesId(prev => {
-        const incompleteList = data.filter(s => !s.chapters || s.chapters.length === 0 || s.chapters.some(c => c.status !== 'done'));
-        const nextId = prev && incompleteList.some(s => s.id === prev) ? prev : (incompleteList.length > 0 ? incompleteList[0].id : '');
-        const nextSeries = data.find(s => s.id === nextId);
-        setDiscoverUrl(nextSeries?.seriesUrl || '');
-        return nextId;
-      });
+      // Auto-pick a series and sync the discover-URL field ONLY on an explicit
+      // load (showSpinner), never on the 2s background poll - otherwise the poll
+      // overwrites whatever the user is typing in the URL box (and yanks their
+      // selection) every couple seconds, which is why text kept "disappearing".
+      if (showSpinner) {
+        setSelectedSeriesId(prev => {
+          const incompleteList = data.filter(s => !s.chapters || s.chapters.length === 0 || s.chapters.some(c => c.status !== 'done'));
+          const nextId = prev && incompleteList.some(s => s.id === prev) ? prev : (incompleteList.length > 0 ? incompleteList[0].id : '');
+          const nextSeries = data.find(s => s.id === nextId);
+          setDiscoverUrl(nextSeries?.seriesUrl || '');
+          return nextId;
+        });
+      }
     } catch (err) {
       setSeriesError(err.message);
     } finally {
@@ -516,28 +524,51 @@ function App() {
     }
   };
 
-  // Load the global auto-retry flag (bot re-downloads problem chapters on its own).
+  // Load the global bot-automation flags (auto-retry problem chapters, auto-check
+  // for newly-released chapters).
   const fetchAutoRetrySetting = async () => {
     try {
       const res = await fetch('/api/settings');
       const data = await res.json();
       if (typeof data.autoRetryEnabled === 'boolean') setAutoRetryEnabled(data.autoRetryEnabled);
-    } catch (err) { /* keep current value on failure */ }
+      if (typeof data.autoUpdateEnabled === 'boolean') setAutoUpdateEnabled(data.autoUpdateEnabled);
+    } catch (err) { /* keep current values on failure */ }
   };
 
-  const handleToggleAutoRetry = async (enabled) => {
-    setAutoRetryEnabled(enabled); // optimistic
+  const saveBotSetting = async (key, enabled, setter) => {
+    setter(enabled); // optimistic
     try {
       const res = await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ autoRetryEnabled: enabled }),
+        body: JSON.stringify({ [key]: enabled }),
       });
       const data = await res.json();
-      if (typeof data.autoRetryEnabled === 'boolean') setAutoRetryEnabled(data.autoRetryEnabled);
+      if (typeof data[key] === 'boolean') setter(data[key]);
     } catch (err) {
-      setAutoRetryEnabled(!enabled); // revert on failure
+      setter(!enabled); // revert on failure
       alert('บันทึกการตั้งค่าไม่สำเร็จ');
+    }
+  };
+  const handleToggleAutoRetry = (enabled) => saveBotSetting('autoRetryEnabled', enabled, setAutoRetryEnabled);
+  const handleToggleAutoUpdate = (enabled) => saveBotSetting('autoUpdateEnabled', enabled, setAutoUpdateEnabled);
+
+  // Manually check a series for newly-released chapters and download just the new ones.
+  const handleCheckUpdates = async (seriesId) => {
+    if (isCheckingUpdates) return;
+    setIsCheckingUpdates(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/check-updates`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to check updates');
+      alert(data.newChapters > 0
+        ? `✓ พบตอนใหม่ ${data.newChapters} ตอน กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`
+        : '✓ ไม่มีตอนใหม่ — เป็นเวอร์ชันล่าสุดแล้ว');
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsCheckingUpdates(false);
     }
   };
 
@@ -2185,6 +2216,10 @@ function App() {
                   <input type="checkbox" checked={autoRetryEnabled} onChange={(e) => handleToggleAutoRetry(e.target.checked)} />
                   🤖 ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
                 </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะเช็คเรื่องที่โหลดไว้ทุก ~3 ชั่วโมงว่ามีตอนใหม่ออกไหม ถ้ามีก็โหลดมาเพิ่มให้เองอัตโนมัติ (ไม่โหลดตอนเดิมซ้ำ)">
+                  <input type="checkbox" checked={autoUpdateEnabled} onChange={(e) => handleToggleAutoUpdate(e.target.checked)} />
+                  🔄 ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
+                </label>
               </form>
 
               {seriesLoading ? (
@@ -2292,6 +2327,18 @@ function App() {
                                   onClick={() => handleRetryProblemChapters(series.id)}
                                 >
                                   {isRetryingProblems ? '⏳ กำลังลองตอนที่มีปัญหา...' : '🔁 ลองตอนที่มีปัญหาใหม่'}
+                                </button>
+                              )}
+                              {series.seriesUrl && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isCheckingUpdates}
+                                  title="เช็คว่ามีตอนใหม่ออกไหม แล้วโหลดเฉพาะตอนใหม่ (ไม่โหลดตอนเดิมซ้ำ)"
+                                  onClick={() => handleCheckUpdates(series.id)}
+                                >
+                                  {isCheckingUpdates ? '⏳ กำลังเช็คตอนใหม่...' : '🔄 เช็คตอนใหม่'}
                                 </button>
                               )}
                               <button

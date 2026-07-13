@@ -1839,8 +1839,9 @@ function isSameChapter(c1Name, c2Name) {
 app.get('/api/settings', (req, res) => {
   const db = readDb();
   if (!db.settings) db.settings = { puppeteerDomains: [] };
-  // Auto-retry defaults ON when the flag has never been set.
+  // Auto-retry / auto-update both default ON when never set.
   if (db.settings.autoRetryEnabled === undefined) db.settings.autoRetryEnabled = true;
+  if (db.settings.autoUpdateEnabled === undefined) db.settings.autoUpdateEnabled = true;
   res.json(db.settings);
 });
 
@@ -1849,12 +1850,15 @@ app.post('/api/settings', (req, res) => {
   const db = readDb();
   if (!db.settings) db.settings = { puppeteerDomains: [] };
 
-  const { puppeteerDomains, autoRetryEnabled } = req.body;
+  const { puppeteerDomains, autoRetryEnabled, autoUpdateEnabled } = req.body;
   if (Array.isArray(puppeteerDomains)) {
     db.settings.puppeteerDomains = puppeteerDomains;
   }
   if (typeof autoRetryEnabled === 'boolean') {
     db.settings.autoRetryEnabled = autoRetryEnabled;
+  }
+  if (typeof autoUpdateEnabled === 'boolean') {
+    db.settings.autoUpdateEnabled = autoUpdateEnabled;
   }
 
   writeDb(db);
@@ -2608,81 +2612,24 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
   }
 
   try {
-    // Serialize against every other scrape/crawl currently touching this
-    // same site (see runExclusiveByOrigin) - discovery is a burst of a
-    // couple requests, no reason to let it race a chapter download in
-    // progress for the same host.
-    const { disallowed, html } = await runExclusiveByOrigin(formattedUrl, async () => {
-      const origin = new URL(formattedUrl).origin;
-      const robotsText = await fetchTextOrNull(`${origin}/robots.txt`);
-      const robotsRules = robotsText ? parseRobotsRules(robotsText) : { disallowPaths: [], crawlDelaySeconds: null };
+    const result = await discoverAndAddNewChapters(db, series, formattedUrl);
 
-      if (isPathDisallowed(formattedUrl, robotsRules.disallowPaths)) {
-        return { disallowed: true, html: null };
-      }
-
-      return { disallowed: false, html: await fetchTextOrNull(formattedUrl, 15000) };
-    });
-
-    if (disallowed) {
+    if (result.disallowed) {
       return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
     }
-    if (!html) {
+    if (result.fetchFailed) {
       return res.status(502).json({ error: 'ไม่สามารถเปิดหรืออ่านเนื้อหาหน้ารวมตอนนี้ได้' });
     }
-
-    if (!series.metadata) {
-      series.metadata = extractSeriesMetadataFromHtml(html, formattedUrl);
-      series.metadataFetchedAt = new Date().toISOString();
-    }
-
-    const discovered = discoverChapterLinksFromHtml(html, formattedUrl);
-    if (discovered.length === 0) {
+    if (result.discoveredCount === 0) {
       return res.status(404).json({ error: 'ไม่พบลิงก์ตอนในหน้านี้ ลองตรวจสอบว่านี่เป็นหน้ารวมตอนจริงหรือไม่' });
     }
 
-    if (!series.chapters) series.chapters = [];
-    const existingUrls = new Set(series.chapters.map(c => c.url));
-
-    let addedCount = 0;
-    discovered.forEach((item, index) => {
-      if (existingUrls.has(item.url)) return;
-      
-      const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
-      if (existingSameChapter) {
-        if (existingSameChapter.status !== 'done') {
-          existingSameChapter.url = item.url;
-          existingSameChapter.status = 'pending';
-          existingSameChapter.error = null;
-          existingSameChapter.retryCount = 0;
-          addedCount++;
-        }
-        return;
-      }
-
-      const newChapter = {
-        id: `${Date.now()}_${index}`,
-        name: item.name,
-        url: item.url,
-        status: 'pending',
-        images: [],
-        error: null,
-        scrapedAt: null,
-        retryCount: 0
-      };
-      series.chapters.push(newChapter);
-      addedCount++;
-    });
-
-    series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, formattedUrl].filter(Boolean))];
-    if (!series.seriesUrl) series.seriesUrl = formattedUrl;
-    
     writeDb(db);
 
     res.json({
-      discoveredCount: discovered.length,
-      addedCount: addedCount,
-      skippedCount: discovered.length - addedCount,
+      discoveredCount: result.discoveredCount,
+      addedCount: result.addedCount,
+      skippedCount: result.discoveredCount - result.addedCount,
       addedChapters: []
     });
   } catch (error) {
@@ -2704,6 +2651,64 @@ async function fetchSeriesPageRespectingRobots(pageUrl, useStealth = false) {
     }
     return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, useStealth) };
   });
+}
+
+// Re-fetches a series' listing page and adds any chapters that aren't tracked
+// yet - i.e. newly released episodes. Crucially it NEVER re-downloads or resets
+// a chapter that's already 'done'; it only appends brand-new chapters (as
+// 'pending') and re-arms not-yet-finished ones. Shared by the manual
+// /discover-chapters endpoint and the automatic update-checker watchdog, so
+// both behave identically. Returns { discoveredCount, addedCount, disallowed,
+// fetchFailed }.
+async function discoverAndAddNewChapters(db, series, listingUrl) {
+  const { disallowed, html } = await fetchSeriesPageRespectingRobots(listingUrl, series.useStealth);
+  if (disallowed) return { discoveredCount: 0, addedCount: 0, disallowed: true };
+  if (!html) return { discoveredCount: 0, addedCount: 0, fetchFailed: true };
+
+  if (!series.metadata) {
+    series.metadata = extractSeriesMetadataFromHtml(html, listingUrl);
+    series.metadataFetchedAt = new Date().toISOString();
+  }
+
+  const discovered = discoverChapterLinksFromHtml(html, listingUrl);
+  if (!series.chapters) series.chapters = [];
+  const existingUrls = new Set(series.chapters.map(c => c.url));
+
+  let addedCount = 0;
+  discovered.forEach((item, index) => {
+    if (existingUrls.has(item.url)) return; // already tracked by URL - skip
+
+    const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
+    if (existingSameChapter) {
+      // Same chapter number under a slightly different URL: only re-arm it if it
+      // never finished. A chapter already downloaded ('done') is left untouched.
+      if (existingSameChapter.status !== 'done') {
+        existingSameChapter.url = item.url;
+        existingSameChapter.status = 'pending';
+        existingSameChapter.error = null;
+        existingSameChapter.retryCount = 0;
+        addedCount++;
+      }
+      return;
+    }
+
+    series.chapters.push({
+      id: `${Date.now()}_${index}`,
+      name: item.name,
+      url: item.url,
+      status: 'pending',
+      images: [],
+      error: null,
+      scrapedAt: null,
+      retryCount: 0
+    });
+    addedCount++;
+  });
+
+  series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, listingUrl].filter(Boolean))];
+  if (!series.seriesUrl) series.seriesUrl = listingUrl;
+
+  return { discoveredCount: discovered.length, addedCount };
 }
 
 // Scrapes (or re-scrapes) a series' SEO metadata from its own detail page -
@@ -3129,6 +3134,45 @@ app.post('/api/series/:id/retry-problem-chapters', async (req, res) => {
   try {
     const result = await runScrapeAllForSeries(db, series);
     res.json({ ...result, retriedProblemCount: problemChapters.length });
+  } finally {
+    scrapingSeries[id] = false;
+  }
+});
+
+// Manually check a series for newly-released chapters and download just the new
+// ones (same thing the auto-update watchdog does on a schedule). Never touches
+// chapters already downloaded.
+app.post('/api/series/:id/check-updates', async (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  const series = findSeries(db, id);
+  if (!series) {
+    return res.status(404).json({ error: 'Series not found' });
+  }
+  if (!series.seriesUrl) {
+    return res.status(400).json({ error: 'ซีรีส์นี้ไม่มี URL หน้ารวมตอน เลยเช็คตอนใหม่ให้ไม่ได้' });
+  }
+  if (scrapingSeries[id]) {
+    return res.status(429).json({ error: 'This series is already being scraped' });
+  }
+
+  scrapingSeries[id] = true;
+  try {
+    const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
+    series.lastUpdateCheckAt = new Date().toISOString();
+    writeDb(db);
+
+    if (result.disallowed) return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
+    if (result.fetchFailed) return res.status(502).json({ error: 'เปิดหน้ารวมตอนไม่ได้' });
+
+    let scrape = { scrapedCount: 0, blockedEarly: false };
+    if (result.addedCount > 0) {
+      scrape = await runScrapeAllForSeries(db, series);
+      writeDb(db);
+    }
+    res.json({ newChapters: result.addedCount, ...scrape });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างเช็คตอนใหม่' });
   } finally {
     scrapingSeries[id] = false;
   }
@@ -3788,10 +3832,76 @@ function startAutoRetryWatchdog() {
   setInterval(() => { autoRetryProblemChaptersSweep().catch(console.error); }, AUTO_RETRY_TICK_MS);
 }
 
+// ---------------------------------------------------------------------------
+// Auto-update watchdog: keeps already-downloaded series current. Periodically
+// re-checks each series' own listing page for chapters that have been released
+// since it was last scraped, and if any turned up, downloads just those new
+// ones (never re-downloading what's already 'done'). This is what makes a
+// "complete" series pick up new episodes on its own, no clicking required.
+// On by default; toggle with settings.autoUpdateEnabled.
+// ---------------------------------------------------------------------------
+const AUTO_UPDATE_TICK_MS = 3 * 60 * 60 * 1000;         // sweep every 3 hours
+const AUTO_UPDATE_SERIES_COOLDOWN_MS = 3 * 60 * 60 * 1000; // ...and re-check a given series at most that often
+let autoUpdateRunning = false;
+
+async function autoUpdateCheckSweep() {
+  if (autoUpdateRunning) return;
+  const settingsDb = readDb();
+  if (settingsDb.settings && settingsDb.settings.autoUpdateEnabled === false) return;
+
+  autoUpdateRunning = true;
+  try {
+    const seriesIds = (readDb().series || []).map(s => s.id);
+    for (const seriesId of seriesIds) {
+      const db = readDb();
+      const series = findSeries(db, seriesId);
+      if (!series || !series.seriesUrl) continue;
+      if (scrapingSeries[seriesId]) continue; // busy being scraped/retried
+
+      const lastAt = series.lastUpdateCheckAt ? new Date(series.lastUpdateCheckAt).getTime() : 0;
+      if (Date.now() - lastAt < AUTO_UPDATE_SERIES_COOLDOWN_MS) continue;
+
+      let added = 0;
+      try {
+        const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
+        added = result.addedCount || 0;
+        series.lastUpdateCheckAt = new Date().toISOString();
+        writeDb(db);
+      } catch (err) {
+        console.error(`[AutoUpdate] discover failed for "${series.name}":`, err);
+        continue;
+      }
+
+      if (added > 0 && !scrapingSeries[seriesId]) {
+        console.log(`[AutoUpdate] "${series.name}": found ${added} new chapter(s), downloading...`);
+        scrapingSeries[seriesId] = true;
+        try {
+          await runScrapeAllForSeries(db, series);
+          writeDb(db);
+        } catch (err) {
+          console.error(`[AutoUpdate] download failed for "${series.name}":`, err);
+        } finally {
+          scrapingSeries[seriesId] = false;
+        }
+      }
+    }
+  } finally {
+    autoUpdateRunning = false;
+  }
+}
+
+function startAutoUpdateWatchdog() {
+  console.log('Auto-update watchdog started...');
+  // First sweep 2 minutes after boot (let resumed crawls settle), then every tick.
+  setTimeout(() => { autoUpdateCheckSweep().catch(console.error); }, 2 * 60 * 1000);
+  setInterval(() => { autoUpdateCheckSweep().catch(console.error); }, AUTO_UPDATE_TICK_MS);
+}
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   startScheduler();
   resumeRunningSiteCrawls();
   startAutoRetryWatchdog();
+  startAutoUpdateWatchdog();
 });
