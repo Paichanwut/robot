@@ -104,6 +104,7 @@ function App() {
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [isScrapingAll, setIsScrapingAll] = useState(false);
   const [isRetryingProblems, setIsRetryingProblems] = useState(false);
+  const [autoRetryEnabled, setAutoRetryEnabled] = useState(true);
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
   const [isExportingSeries, setIsExportingSeries] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
@@ -515,12 +516,38 @@ function App() {
     }
   };
 
+  // Load the global auto-retry flag (bot re-downloads problem chapters on its own).
+  const fetchAutoRetrySetting = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      const data = await res.json();
+      if (typeof data.autoRetryEnabled === 'boolean') setAutoRetryEnabled(data.autoRetryEnabled);
+    } catch (err) { /* keep current value on failure */ }
+  };
+
+  const handleToggleAutoRetry = async (enabled) => {
+    setAutoRetryEnabled(enabled); // optimistic
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ autoRetryEnabled: enabled }),
+      });
+      const data = await res.json();
+      if (typeof data.autoRetryEnabled === 'boolean') setAutoRetryEnabled(data.autoRetryEnabled);
+    } catch (err) {
+      setAutoRetryEnabled(!enabled); // revert on failure
+      alert('บันทึกการตั้งค่าไม่สำเร็จ');
+    }
+  };
+
   // Open the Manga Downloader modal
   const handleOpenMangaModal = () => {
     setCurrentView('downloader');
     setExpandedChapterId('');
     fetchSeries();
     fetchSiteCrawls();
+    fetchAutoRetrySetting();
   };
 
   // While the modal is open, poll for fresh chapter/crawl statuses so a
@@ -2153,6 +2180,10 @@ function App() {
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
                   <input type="checkbox" checked={useStealthAdd} onChange={(e) => setUseStealthAdd(e.target.checked)} />
                   ใช้โหมดล่องหนทะลวง Cloudflare (สำหรับเว็บที่กันบอท)
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะวนกลับมาโหลดตอนที่มีปัญหา (error/โหลดไม่ครบ) ให้เองอัตโนมัติทุก ~10 นาที ไม่ต้องกดเอง">
+                  <input type="checkbox" checked={autoRetryEnabled} onChange={(e) => handleToggleAutoRetry(e.target.checked)} />
+                  🤖 ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
                 </label>
               </form>
 

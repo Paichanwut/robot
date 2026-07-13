@@ -1839,6 +1839,8 @@ function isSameChapter(c1Name, c2Name) {
 app.get('/api/settings', (req, res) => {
   const db = readDb();
   if (!db.settings) db.settings = { puppeteerDomains: [] };
+  // Auto-retry defaults ON when the flag has never been set.
+  if (db.settings.autoRetryEnabled === undefined) db.settings.autoRetryEnabled = true;
   res.json(db.settings);
 });
 
@@ -1846,12 +1848,15 @@ app.get('/api/settings', (req, res) => {
 app.post('/api/settings', (req, res) => {
   const db = readDb();
   if (!db.settings) db.settings = { puppeteerDomains: [] };
-  
-  const { puppeteerDomains } = req.body;
+
+  const { puppeteerDomains, autoRetryEnabled } = req.body;
   if (Array.isArray(puppeteerDomains)) {
     db.settings.puppeteerDomains = puppeteerDomains;
   }
-  
+  if (typeof autoRetryEnabled === 'boolean') {
+    db.settings.autoRetryEnabled = autoRetryEnabled;
+  }
+
   writeDb(db);
   res.json(db.settings);
 });
@@ -3721,9 +3726,72 @@ function resumeRunningSiteCrawls() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Auto-retry watchdog: a standing background job so the user never has to click
+// "retry problem chapters" by hand. Every tick it sweeps ALL series, and for
+// any that still have incomplete chapters (error / partial / blocked) - and
+// that aren't already being scraped and haven't been auto-retried too recently
+// - it lifts the retry cap on those chapters and re-runs the same download loop
+// as /scrape-all. So a chapter a 429/403 briefly blocked heals itself once the
+// site cools off, without the crawl having to stay parked on it. On by default;
+// toggle with settings.autoRetryEnabled.
+// ---------------------------------------------------------------------------
+const AUTO_RETRY_TICK_MS = 10 * 60 * 1000;      // how often the watchdog wakes up
+const AUTO_RETRY_SERIES_COOLDOWN_MS = 30 * 60 * 1000; // don't re-hit the same series more often than this
+let autoRetryRunning = false;
+
+async function autoRetryProblemChaptersSweep() {
+  if (autoRetryRunning) return; // never overlap two sweeps
+  const settingsDb = readDb();
+  if (settingsDb.settings && settingsDb.settings.autoRetryEnabled === false) return;
+
+  autoRetryRunning = true;
+  try {
+    const seriesIds = (readDb().series || []).map(s => s.id);
+    for (const seriesId of seriesIds) {
+      // Re-read fresh each time - a scrape/crawl running in parallel may have
+      // changed this series (or another one) since the sweep started.
+      const db = readDb();
+      const series = findSeries(db, seriesId);
+      if (!series) continue;
+      if (scrapingSeries[seriesId]) continue; // a scrape/crawl already owns it
+
+      const problems = (series.chapters || []).filter(
+        c => c.status !== 'done' && !scrapingChapters[c.id]
+      );
+      if (problems.length === 0) continue;
+
+      const lastAt = series.lastAutoRetryAt ? new Date(series.lastAutoRetryAt).getTime() : 0;
+      if (Date.now() - lastAt < AUTO_RETRY_SERIES_COOLDOWN_MS) continue;
+
+      scrapingSeries[seriesId] = true;
+      try {
+        problems.forEach(c => { c.retryCount = 0; }); // fresh retry budget
+        series.lastAutoRetryAt = new Date().toISOString();
+        writeDb(db);
+        console.log(`[AutoRetry] retrying ${problems.length} problem chapter(s) in "${series.name}"`);
+        await runScrapeAllForSeries(db, series);
+        writeDb(db);
+      } catch (err) {
+        console.error(`[AutoRetry] series ${seriesId} failed:`, err);
+      } finally {
+        scrapingSeries[seriesId] = false;
+      }
+    }
+  } finally {
+    autoRetryRunning = false;
+  }
+}
+
+function startAutoRetryWatchdog() {
+  console.log('Auto-retry watchdog started...');
+  setInterval(() => { autoRetryProblemChaptersSweep().catch(console.error); }, AUTO_RETRY_TICK_MS);
+}
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   startScheduler();
   resumeRunningSiteCrawls();
+  startAutoRetryWatchdog();
 });
