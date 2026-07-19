@@ -704,7 +704,7 @@ function App() {
 
   // Metadata (label/color) for a crawl job's overall status
   const CRAWL_STATUS_META = {
-    running: { label: 'กำลังทำงาน', color: 'var(--color-cyan)', icon: <Icon name="refresh" size={13} /> },
+    running: { label: 'กำลังทำงาน', color: 'var(--color-blue)', icon: <Icon name="refresh" size={13} /> },
     stopped: { label: 'หยุดแล้ว', color: 'var(--color-yellow)', icon: <Icon name="pause" size={13} /> },
     done: { label: 'เสร็จสมบูรณ์', color: 'var(--color-green)', icon: <Icon name="check" size={13} /> },
     error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: <Icon name="alert-triangle" size={13} /> }
@@ -831,7 +831,7 @@ function App() {
   // Metadata (label/color) for a chapter's scrape status
   const CHAPTER_STATUS_META = {
     pending: { label: 'ยังไม่โหลด', color: 'var(--color-text-muted)', icon: <Icon name="clock" size={12} /> },
-    scraping: { label: 'กำลังโหลด...', color: 'var(--color-cyan)', icon: <Icon name="refresh" size={12} /> },
+    scraping: { label: 'กำลังโหลด...', color: 'var(--color-blue)', icon: <Icon name="refresh" size={12} /> },
     done: { label: 'โหลดสำเร็จ', color: 'var(--color-green)', icon: <Icon name="check" size={12} /> },
     partial: { label: 'โหลดได้บางส่วน', color: 'var(--color-yellow)', icon: <Icon name="alert-triangle" size={12} /> },
     blocked: { label: 'ถูกบล็อก', color: 'var(--color-red)', icon: <Icon name="ban" size={12} /> },
@@ -1867,7 +1867,7 @@ function App() {
                       <div key={page.url} style={{ border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', minWidth: 0 }}>
-                            <a href={page.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-cyan)', fontSize: '0.85rem', wordBreak: 'break-all' }}>
+                            <a href={page.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', fontSize: '0.85rem', wordBreak: 'break-all' }}>
                               {page.url}
                             </a>
                             {page.status === 'down' && (
@@ -2159,7 +2159,7 @@ function App() {
                   the bot discovers every series + every chapter on its own,
                   running in the background on the server (not this browser
                   tab) until it finishes or is stopped. */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem', border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '1.1rem 1.25rem', background: 'var(--bg-card)' }}>
                 <div>
                   <h4 style={{ margin: '0 0 0.25rem 0', fontSize: '0.95rem' }}>ดึงทั้งเว็บอัตโนมัติ</h4>
                   <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
@@ -2206,7 +2206,7 @@ function App() {
                             <span>โหลดไปแล้ว {crawl.stats.chaptersDownloaded} ตอน</span>
                           </div>
                           {crawl.currentSeriesName && crawl.status === 'running' && (
-                            <div style={{ color: 'var(--color-cyan)' }}>กำลังทำเรื่อง: {crawl.currentSeriesName}</div>
+                            <div style={{ color: 'var(--color-blue)' }}>กำลังทำเรื่อง: {crawl.currentSeriesName}</div>
                           )}
                           {crawl.lastError && (
                             <div style={{ color: 'var(--color-yellow)', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>{crawl.lastError}</div>
@@ -2245,7 +2245,7 @@ function App() {
                                 const chapters = matchedSeries?.chapters || [];
                                 const doneChapters = chapters.filter(c => c.status === 'done').length;
                                 const statusIcon = isCurrent ? 'refresh' : isProcessed ? 'check' : 'clock';
-                                const statusColor = isCurrent ? 'var(--color-cyan)' : isProcessed ? 'var(--color-green)' : 'var(--color-text-muted)';
+                                const statusColor = isCurrent ? 'var(--color-blue)' : isProcessed ? 'var(--color-green)' : 'var(--color-text-muted)';
                                 return (
                                   <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', color: statusColor }}>
                                     <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -2269,44 +2269,47 @@ function App() {
               )}
 
               {/* Add Series Form */}
-              <form onSubmit={handleAddSeries} style={{ display: 'flex', gap: '0.5rem', flexDirection: 'column', flex: 'none', padding: '0.25rem 0' }}>
-                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
-                  <input
-                    type="text"
-                    className="form-input"
-                    placeholder="ชื่อเรื่องมังงะ เช่น One Piece หรือ URL หน้ารวมตอน"
-                    value={newSeriesName}
-                    onChange={(e) => setNewSeriesName(e.target.value)}
-                    style={{ flex: 1, minWidth: '200px' }}
-                    required
-                  />
-                  <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
-                    {isAddingSeries ? 'Adding...' : '+ Add Series'}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem', border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '1.1rem 1.25rem', background: 'var(--bg-card)' }}>
+                <h4 style={{ margin: 0, fontSize: '0.95rem' }}>เพิ่มเรื่องใหม่</h4>
+                <form onSubmit={handleAddSeries} style={{ display: 'flex', gap: '0.85rem', flexDirection: 'column', flex: 'none' }}>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                    <input
+                      type="text"
+                      className="form-input"
+                      placeholder="ชื่อเรื่องมังงะ เช่น One Piece หรือ URL หน้ารวมตอน"
+                      value={newSeriesName}
+                      onChange={(e) => setNewSeriesName(e.target.value)}
+                      style={{ flex: 1, minWidth: '200px' }}
+                      required
+                    />
+                    <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
+                      {isAddingSeries ? 'Adding...' : '+ Add Series'}
+                    </button>
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
+                    <input type="checkbox" checked={useStealthAdd} onChange={(e) => setUseStealthAdd(e.target.checked)} />
+                    ใช้โหมดล่องหนทะลวง Cloudflare (สำหรับเว็บที่กันบอท)
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะวนกลับมาโหลดตอนที่มีปัญหา (error/โหลดไม่ครบ) ให้เองอัตโนมัติทุก ~10 นาที ไม่ต้องกดเอง">
+                    <input type="checkbox" checked={autoRetryEnabled} onChange={(e) => handleToggleAutoRetry(e.target.checked)} />
+                    ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะเช็คเรื่องที่โหลดไว้ทุก ~3 ชั่วโมงว่ามีตอนใหม่ออกไหม ถ้ามีก็โหลดมาเพิ่มให้เองอัตโนมัติ (ไม่โหลดตอนเดิมซ้ำ)">
+                    <input type="checkbox" checked={autoUpdateEnabled} onChange={(e) => handleToggleAutoUpdate(e.target.checked)} />
+                    ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
+                  </label>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', alignSelf: 'flex-start' }}
+                    disabled={isDownloadingCovers}
+                    title="ดาวน์โหลดรูปปกของทุกเรื่อง แยกเก็บไว้ต่างหาก - เรื่องที่มีปกอยู่แล้วจะไม่โหลดซ้ำ"
+                    onClick={handleDownloadAllCovers}
+                  >
+                    {isDownloadingCovers ? 'กำลังดาวน์โหลดปก...' : 'ดาวน์โหลดปกทั้งหมด'}
                   </button>
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
-                  <input type="checkbox" checked={useStealthAdd} onChange={(e) => setUseStealthAdd(e.target.checked)} />
-                  ใช้โหมดล่องหนทะลวง Cloudflare (สำหรับเว็บที่กันบอท)
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะวนกลับมาโหลดตอนที่มีปัญหา (error/โหลดไม่ครบ) ให้เองอัตโนมัติทุก ~10 นาที ไม่ต้องกดเอง">
-                  <input type="checkbox" checked={autoRetryEnabled} onChange={(e) => handleToggleAutoRetry(e.target.checked)} />
-                  ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะเช็คเรื่องที่โหลดไว้ทุก ~3 ชั่วโมงว่ามีตอนใหม่ออกไหม ถ้ามีก็โหลดมาเพิ่มให้เองอัตโนมัติ (ไม่โหลดตอนเดิมซ้ำ)">
-                  <input type="checkbox" checked={autoUpdateEnabled} onChange={(e) => handleToggleAutoUpdate(e.target.checked)} />
-                  ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
-                </label>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', alignSelf: 'flex-start' }}
-                  disabled={isDownloadingCovers}
-                  title="ดาวน์โหลดรูปปกของทุกเรื่อง แยกเก็บไว้ต่างหาก - เรื่องที่มีปกอยู่แล้วจะไม่โหลดซ้ำ"
-                  onClick={handleDownloadAllCovers}
-                >
-                  {isDownloadingCovers ? 'กำลังดาวน์โหลดปก...' : 'ดาวน์โหลดปกทั้งหมด'}
-                </button>
-              </form>
+                </form>
+              </div>
 
               {seriesLoading ? (
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2rem 0', gap: '1rem' }}>
@@ -2533,7 +2536,7 @@ function App() {
                                   {pendingCount > 0 && <span style={{ color: 'var(--color-text-muted)' }}>ยังไม่โหลด {pendingCount} ตอน</span>}
                                   {issueCount > 0 && <span style={{ color: 'var(--color-yellow)' }}>มีปัญหา {issueCount} ตอน</span>}
                                 </div>
-                                <div style={{ color: 'var(--color-cyan)', minHeight: '1.1rem' }}>
+                                <div style={{ color: 'var(--color-blue)', minHeight: '1.1rem' }}>
                                   {scrapingChapter && `กำลังโหลดตอน: ${scrapingChapter.name}`}
                                 </div>
                               </div>
@@ -2578,7 +2581,7 @@ function App() {
                                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', minWidth: 0 }}>
                                       <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{chapter.name}</span>
-                                      <a href={chapter.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-cyan)', fontSize: '0.75rem', wordBreak: 'break-all' }}>
+                                      <a href={chapter.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', fontSize: '0.75rem', wordBreak: 'break-all' }}>
                                         {chapter.url}
                                       </a>
                                       <span style={{ fontSize: '0.75rem', color: statusMeta.color }}>
@@ -2752,7 +2755,7 @@ function App() {
                     return (
                       <div key={id} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
-                          <h4 style={{ fontSize: '1.1rem', color: 'var(--color-cyan)', margin: 0 }}>
+                          <h4 style={{ fontSize: '1.1rem', color: 'var(--color-blue)', margin: 0 }}>
                             {group.name} <span style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({group.items.length} images)</span>
                           </h4>
                           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>

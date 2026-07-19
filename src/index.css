@@ -58,6 +58,11 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--color-cyan);
+}
+
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

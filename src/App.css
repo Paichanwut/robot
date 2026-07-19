@@ -140,9 +140,9 @@
 }
 
 .btn-secondary {
-  background-color: rgba(238, 227, 206, 0.04);
+  background-color: rgba(238, 227, 206, 0.045);
   color: var(--color-text-primary);
-  border-color: var(--border-color);
+  border-color: rgba(238, 227, 206, 0.14);
 }
 
 .btn-secondary:hover {
@@ -369,7 +369,7 @@
 }
 
 .monitor-url:hover {
-  color: var(--color-cyan);
+  color: var(--color-blue);
 }
 
 .monitor-status-section {
@@ -837,7 +837,7 @@
 }
 
 .gallery-card:hover .gallery-img-link {
-  color: var(--color-cyan);
+  color: var(--color-blue);
 }
 
 /* Small inline spinner (next to a heading/label, unlike the larger .spinner block) */
@@ -911,12 +911,12 @@
 }
 
 .library-table th {
-  padding: 0.75rem;
+  padding: 0.9rem 1rem;
   font-weight: 500;
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   color: var(--color-text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
   border-bottom: 1px solid var(--border-color);
 }
 
@@ -935,7 +935,7 @@
 }
 
 .library-table td {
-  padding: 0.65rem 0.75rem;
+  padding: 0.85rem 1rem;
   vertical-align: top;
   border-bottom: 1px solid var(--border-color);
 }
@@ -970,12 +970,12 @@
 .crawl-card {
   border: 1px solid var(--border-color);
   border-radius: 0.5rem;
-  padding: 0.85rem 1rem;
+  padding: 1rem 1.15rem;
   font-size: 0.8rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
-  background: rgba(255, 255, 255, 0.02);
+  gap: 0.5rem;
+  background: var(--bg-card);
   transition: border-color 0.15s;
 }
 
@@ -1088,7 +1088,7 @@
 }
 
 .toast-info {
-  border-left: 3px solid var(--color-cyan);
+  border-left: 3px solid var(--color-blue);
 }
 
 /* Confirm modal (reuses .modal-overlay / .modal-content shell) */
