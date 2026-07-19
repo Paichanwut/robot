@@ -1828,6 +1828,40 @@ async function stripAggregatorBanner(buffer, ext) {
   }
 }
 
+// Caps chapter-page resolution and recompresses everything to JPEG - source
+// sites routinely serve pages far wider than any screen needs for reading,
+// and PNG's lossless encoding is enormously wasteful on photographic/halftone
+// manga art (a scanned page rarely benefits from pixel-perfect PNG the way a
+// screenshot or logo would). Skipped for formats Jimp can't safely round-trip
+// (webp/avif/svg/gif - same limitation as stripAggregatorBanner above) and
+// falls back to the original buffer/ext on any decode failure or if the
+// "optimized" output somehow comes back larger.
+const MAX_IMAGE_WIDTH_PX = 1600;
+const JPEG_QUALITY = 85;
+
+async function optimizeMangaImage(buffer, ext) {
+  const mime = MIME_BY_EXT[(ext || '').toLowerCase()];
+  if (!mime) return { buffer, ext };
+
+  let image;
+  try {
+    image = await Jimp.read(buffer);
+  } catch (err) {
+    return { buffer, ext };
+  }
+
+  try {
+    if (image.bitmap.width > MAX_IMAGE_WIDTH_PX) {
+      image.resize({ w: MAX_IMAGE_WIDTH_PX });
+    }
+    const out = await image.getBuffer('image/jpeg', { quality: JPEG_QUALITY });
+    if (out.length >= buffer.length) return { buffer, ext };
+    return { buffer: out, ext: 'jpg' };
+  } catch (err) {
+    return { buffer, ext };
+  }
+}
+
 // Runs `fn` over `items` with at most `limit` in flight at once. The
 // duplicate-image sweep (see /api/series/:id/clean-duplicate-images) can
 // have thousands of files to hash/decode on a large series - doing that one
@@ -1869,6 +1903,31 @@ function isSameChapter(c1Name, c2Name) {
   return normalizeForComparison(c1Name) === normalizeForComparison(c2Name);
 }
 
+// Finds gaps in a series' chapter numbering - e.g. tracked chapters go
+// 1, 2, 3, 5, 6 with no 4 anywhere. Only whole-number chapters count toward
+// continuity: a bonus/side chapter like "3.5" is optional extra content, not
+// a hole in the main numbering, so it's never reported as missing and never
+// creates a false gap around it. Best-effort: chapters whose name has no
+// extractable number are ignored entirely, since there's nothing to place
+// them at in the sequence.
+function findChapterGaps(chapters) {
+  const wholeNumbers = new Set();
+  (chapters || []).forEach(c => {
+    const n = extractChapterNumber(c.name);
+    if (n !== null && Number.isInteger(n)) wholeNumbers.add(n);
+  });
+
+  if (wholeNumbers.size === 0) return { min: null, max: null, missing: [] };
+
+  const min = Math.min(...wholeNumbers);
+  const max = Math.max(...wholeNumbers);
+  const missing = [];
+  for (let n = min; n <= max; n++) {
+    if (!wholeNumbers.has(n)) missing.push(n);
+  }
+  return { min, max, missing };
+}
+
 // Get global settings
 app.get('/api/settings', (req, res) => {
   const db = readDb();
@@ -1905,7 +1964,52 @@ app.get('/api/series', (req, res) => {
   res.json(db.series || []);
 });
 
-// Create a new manga series (or return existing if matched by name)
+// Comparable "identity" tokens for a series: its display name plus, when it's
+// a URL-shaped name (added by pasting a listing URL with no title typed in
+// yet), the path slug too - normalizeForComparison already strips non-ASCII
+// (Thai) text along with punctuation, so "Magic Emperor ราชาจอมเวทย์" and
+// ".../magic-emperor/" both collapse down to a comparable "magicemperor".
+function seriesIdentityTokens(series) {
+  const tokens = new Set();
+  const add = (str) => {
+    const n = normalizeForComparison(str);
+    if (n && n.length >= MIN_DUPLICATE_TOKEN_LENGTH) tokens.add(n);
+  };
+  add(series.name);
+  add(series.metadata?.title);
+  (series.metadata?.altTitles || []).forEach(add);
+  [series.seriesUrl, ...(series.sourceUrls || [])].filter(Boolean).forEach(url => {
+    try {
+      const segments = new URL(url).pathname.split('/').filter(Boolean);
+      if (segments.length > 0) add(segments[segments.length - 1]);
+    } catch (e) { /* not a real URL - nothing to extract */ }
+  });
+  return [...tokens];
+}
+
+// Below this, a normalized token is too generic/short to mean anything on its
+// own ("app", "1") - only tokens at least this long are trusted as a
+// meaningful title/slug fragment for duplicate detection.
+const MIN_DUPLICATE_TOKEN_LENGTH = 6;
+
+// Best-effort "this might already be tracked under a different name/site"
+// check - one token containing another (in full) is a strong enough signal
+// to warn about without blocking the add; a manga's title rarely fully
+// contains another unrelated manga's title once punctuation/Thai text is
+// stripped out.
+function findPossibleDuplicateSeries(db, candidateSeries) {
+  const candidateTokens = seriesIdentityTokens(candidateSeries);
+  if (candidateTokens.length === 0) return [];
+
+  return (db.series || [])
+    .filter(s => s.id !== candidateSeries.id)
+    .filter(s => {
+      const existingTokens = seriesIdentityTokens(s);
+      return existingTokens.some(et => candidateTokens.some(ct => et.includes(ct) || ct.includes(et)));
+    })
+    .map(s => ({ id: s.id, name: s.name }));
+}
+
 app.post('/api/series', (req, res) => {
   const { seriesUrl, name, useStealth } = req.body;
   if (!name || !name.trim()) {
@@ -1933,10 +2037,26 @@ app.post('/api/series', (req, res) => {
     chapters: []
   };
 
+  const possibleDuplicates = findPossibleDuplicateSeries(db, newSeries);
+
   db.series.push(newSeries);
   writeDb(db);
 
-  res.status(201).json(newSeries);
+  res.status(201).json({ ...newSeries, possibleDuplicates });
+});
+
+// Reports holes in a series' chapter numbering (e.g. has 1-255, 257-880 but
+// no 256) so a stuck/incomplete source doesn't go unnoticed just because the
+// chapters it does have all show "done".
+app.get('/api/series/:id/chapter-gaps', (req, res) => {
+  const { id } = req.params;
+  const db = readDb();
+  const series = findSeries(db, id);
+  if (!series) {
+    return res.status(404).json({ error: 'Series not found' });
+  }
+
+  res.json(findChapterGaps(series.chapters));
 });
 
 // Delete a manga series (and every chapter/image saved under it)
@@ -2196,7 +2316,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         const response = download.response;
 
         const contentType = response.headers.get('content-type');
-        const ext = getExtension(imageUrl, contentType);
+        let ext = getExtension(imageUrl, contentType);
         const arrayBuffer = await response.arrayBuffer();
         let buffer = Buffer.from(arrayBuffer);
 
@@ -2209,6 +2329,17 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         // dedup below still match.
         try {
           buffer = (await stripAggregatorBanner(buffer, ext)).buffer;
+        } catch (err) {
+          // any decode/encode failure: fall back to the untouched original
+        }
+
+        // Downsize oversized pages and recompress to JPEG before it ever
+        // touches disk - happens before hashing too, same reasoning as the
+        // banner strip above (re-scrapes stay deterministic).
+        try {
+          const optimized = await optimizeMangaImage(buffer, ext);
+          buffer = optimized.buffer;
+          ext = optimized.ext;
         } catch (err) {
           // any decode/encode failure: fall back to the untouched original
         }

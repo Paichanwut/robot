@@ -2,20 +2,27 @@
 
 :root {
   --bg-main: #0b0f19;
+  --bg-primary: var(--bg-main);
+  --bg-secondary: #0e1420;
+  --bg-tertiary: #141b2b;
   --bg-card: rgba(17, 24, 39, 0.7);
   --bg-card-hover: rgba(23, 37, 84, 0.4);
+  --bg-elevated: #111827;
   --border-color: rgba(255, 255, 255, 0.08);
   --border-focus: rgba(6, 182, 212, 0.5);
-  
+
   --color-text-primary: #f8fafc;
   --color-text-secondary: #94a3b8;
   --color-text-muted: #64748b;
-  
+  --color-text: var(--color-text-primary);
+
   --color-cyan: #06b6d4;
+  --color-blue: #60a5fa;
   --color-green: #10b981;
   --color-red: #ef4444;
   --color-yellow: #f59e0b;
-  
+  --gradient-cyan-blue: linear-gradient(135deg, var(--color-cyan), var(--color-blue));
+
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -2px rgba(0, 0, 0, 0.15);
