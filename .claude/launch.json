@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "robot-dev",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "PATH=/Users/chanwut/.nvm/versions/node/v22.20.0/bin:$PATH PORT=3001 npm run dev"],
+      "port": 5173
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
+import { useNotifications } from './components/Notifications';
 
 // Sparkline component to display a neat visual grid of recent check results.
 function Sparkline({ checks }) {
@@ -49,6 +50,8 @@ function Sparkline({ checks }) {
 }
 
 function App() {
+  const { notify, confirmAction, ToastStack, ConfirmModal } = useNotifications();
+
   const [monitors, setMonitors] = useState([]);
   const [logs, setLogs] = useState([]);
   const [stats, setStats] = useState({ total: 0, up: 0, down: 0, unknown: 0, avgResponseTime: 0 });
@@ -214,7 +217,7 @@ function App() {
       // Refresh
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -255,7 +258,7 @@ function App() {
       // Refresh
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -273,7 +276,7 @@ function App() {
       if (!res.ok) throw new Error('Failed to toggle status');
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -296,7 +299,7 @@ function App() {
       setDeletingMonitor(null);
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -404,10 +407,10 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to discover chapters');
 
-      alert(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''} — กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`);
+      notify.success(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''} — กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsDiscovering(false);
     }
@@ -416,7 +419,7 @@ function App() {
   // Scrape every chapter in the selected series that hasn't finished downloading yet
   const handleScrapeAllChapters = async (seriesId) => {
     if (isScrapingAll) return;
-    if (!confirm('บอทจะไล่โหลดทุกตอนที่ยังไม่เสร็จทีละตอน อาจใช้เวลานาน ต้องการดำเนินการต่อหรือไม่?')) return;
+    if (!(await confirmAction('บอทจะไล่โหลดทุกตอนที่ยังไม่เสร็จทีละตอน อาจใช้เวลานาน ต้องการดำเนินการต่อหรือไม่?'))) return;
 
     setIsScrapingAll(true);
     try {
@@ -424,10 +427,10 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to scrape all chapters');
 
-      alert(`✓ โหลดไปแล้ว ${data.scrapedCount} ตอน${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
+      notify.success(`✓ โหลดไปแล้ว ${data.scrapedCount} ตอน${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsScrapingAll(false);
     }
@@ -438,7 +441,7 @@ function App() {
   // counter server-side and runs the same download loop as scrape-all.
   const handleRetryProblemChapters = async (seriesId) => {
     if (isRetryingProblems || isScrapingAll) return;
-    if (!confirm('ลองโหลดเฉพาะตอนที่มีปัญหา (error/โหลดไม่ครบ) ใหม่ทั้งหมด รวมตอนที่ครบ 3 ครั้งแล้วด้วย ต้องการดำเนินการต่อหรือไม่?')) return;
+    if (!(await confirmAction('ลองโหลดเฉพาะตอนที่มีปัญหา (error/โหลดไม่ครบ) ใหม่ทั้งหมด รวมตอนที่ครบ 3 ครั้งแล้วด้วย ต้องการดำเนินการต่อหรือไม่?'))) return;
 
     setIsRetryingProblems(true);
     try {
@@ -446,12 +449,12 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to retry problem chapters');
 
-      alert(data.message
+      notify.success(data.message
         ? data.message
         : `✓ ลองโหลดตอนที่มีปัญหา ${data.retriedProblemCount ?? ''} ตอนใหม่ (โหลดไป ${data.scrapedCount} ครั้ง)${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsRetryingProblems(false);
     }
@@ -469,9 +472,33 @@ function App() {
       setShowSeriesMetadata(true);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsFetchingMetadata(false);
+    }
+  };
+
+  // Checks whether a series' tracked chapters have any holes in their
+  // numbering (e.g. has 1-255 and 257-880 but no 256 anywhere) - separate
+  // from download status, since a "gap" here means the chapter was never
+  // even discovered, not just left pending.
+  const [isCheckingGaps, setIsCheckingGaps] = useState(false);
+  const handleCheckChapterGaps = async (seriesId) => {
+    if (isCheckingGaps) return;
+    setIsCheckingGaps(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}/chapter-gaps`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to check chapter gaps');
+      if (data.missing.length === 0) {
+        notify.success(`✓ ตอนที่ ${data.min}-${data.max} ครบทุกตอน ไม่มีตอนขาดหาย`);
+      } else {
+        notify.info(`⚠️ ขาดตอนที่: ${data.missing.join(', ')} (จากช่วง ${data.min}-${data.max})`);
+      }
+    } catch (err) {
+      notify.error(err.message);
+    } finally {
+      setIsCheckingGaps(false);
     }
   };
 
@@ -484,10 +511,10 @@ function App() {
       const res = await fetch(`/api/series/${seriesId}/export`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to export series');
-      alert(`✓ Export แล้ว ${data.exportedChapterCount} ตอน\nไปที่: server/data/${data.exportPath}`);
+      notify.success(`✓ Export แล้ว ${data.exportedChapterCount} ตอน\nไปที่: server/data/${data.exportPath}`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsExportingSeries(false);
     }
@@ -504,10 +531,10 @@ function App() {
       const res = await fetch(`/api/series/${seriesId}/clean-duplicate-images`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to clean duplicate images');
-      alert(`✓ ตรวจสอบ ${data.chaptersScanned} ตอน — ลบรูปซ้ำ ${data.imagesRemoved} รูป จาก ${data.chaptersAffected} ตอน\n(เหมือนเป๊ะ ${data.exactDuplicatesRemoved} รูป, หน้าตาคล้ายกันมาก ${data.nearDuplicatesRemoved} รูป)`);
+      notify.success(`✓ ตรวจสอบ ${data.chaptersScanned} ตอน — ลบรูปซ้ำ ${data.imagesRemoved} รูป จาก ${data.chaptersAffected} ตอน\n(เหมือนเป๊ะ ${data.exactDuplicatesRemoved} รูป, หน้าตาคล้ายกันมาก ${data.nearDuplicatesRemoved} รูป)`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsCleaningDuplicates(false);
     }
@@ -548,7 +575,7 @@ function App() {
       if (typeof data[key] === 'boolean') setter(data[key]);
     } catch (err) {
       setter(!enabled); // revert on failure
-      alert('บันทึกการตั้งค่าไม่สำเร็จ');
+      notify.error('บันทึกการตั้งค่าไม่สำเร็จ');
     }
   };
   const handleToggleAutoRetry = (enabled) => saveBotSetting('autoRetryEnabled', enabled, setAutoRetryEnabled);
@@ -562,12 +589,12 @@ function App() {
       const res = await fetch(`/api/series/${seriesId}/check-updates`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to check updates');
-      alert(data.newChapters > 0
+      notify.success(data.newChapters > 0
         ? `✓ พบตอนใหม่ ${data.newChapters} ตอน กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`
         : '✓ ไม่มีตอนใหม่ — เป็นเวอร์ชันล่าสุดแล้ว');
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsCheckingUpdates(false);
     }
@@ -583,10 +610,10 @@ function App() {
       const res = await fetch('/api/series/download-covers', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to download covers');
-      alert(`✓ เช็คแล้ว ${data.checked} เรื่อง — ดาวน์โหลดปกใหม่ ${data.downloaded} เรื่อง`);
+      notify.success(`✓ เช็คแล้ว ${data.checked} เรื่อง — ดาวน์โหลดปกใหม่ ${data.downloaded} เรื่อง`);
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsDownloadingCovers(false);
     }
@@ -633,7 +660,7 @@ function App() {
       setCrawlSiteUrl('');
       fetchSiteCrawls();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsStartingCrawl(false);
     }
@@ -646,7 +673,7 @@ function App() {
       if (!res.ok) throw new Error('Failed to stop crawl');
       fetchSiteCrawls();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -658,19 +685,19 @@ function App() {
       if (!res.ok) throw new Error(data.error || 'Failed to resume crawl');
       fetchSiteCrawls();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
   // Remove a crawl job's record (already-downloaded series/chapters are kept)
   const handleDeleteCrawl = async (crawlId) => {
-    if (!confirm('ลบงานดึงทั้งเว็บนี้? (เรื่อง/ตอนที่โหลดไปแล้วจะยังอยู่ ไม่ถูกลบ)')) return;
+    if (!(await confirmAction('ลบงานดึงทั้งเว็บนี้? (เรื่อง/ตอนที่โหลดไปแล้วจะยังอยู่ ไม่ถูกลบ)', { danger: true }))) return;
     try {
       const res = await fetch(`/api/site-crawls/${crawlId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete crawl');
       fetchSiteCrawls();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -700,8 +727,11 @@ function App() {
       await fetchSeries();
       setSelectedSeriesId(created.id);
       setDiscoverUrl('');
+      if (created.possibleDuplicates?.length > 0) {
+        notify.info(`⚠️ เรื่องนี้อาจซ้ำกับที่มีอยู่แล้ว: ${created.possibleDuplicates.map(d => d.name).join(', ')} — เช็คก่อนโหลดตอน จะได้ไม่โหลดซ้ำ`);
+      }
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsAddingSeries(false);
     }
@@ -709,13 +739,13 @@ function App() {
 
   // Delete a manga series and everything downloaded under it
   const handleDeleteSeries = async (seriesId, seriesName) => {
-    if (!confirm(`Are you sure you want to delete the series "${seriesName}" and all its downloaded chapters?`)) return;
+    if (!(await confirmAction(`Are you sure you want to delete the series "${seriesName}" and all its downloaded chapters?`, { danger: true }))) return;
     try {
       const res = await fetch(`/api/series/${seriesId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete series');
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -739,7 +769,7 @@ function App() {
       setNewChapterUrl('');
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsAddingChapter(false);
     }
@@ -747,27 +777,27 @@ function App() {
 
   // Delete a chapter and its downloaded images
   const handleDeleteChapter = async (seriesId, chapterId, chapterName) => {
-    if (!confirm(`Are you sure you want to delete the chapter "${chapterName}"?`)) return;
+    if (!(await confirmAction(`Are you sure you want to delete the chapter "${chapterName}"?`, { danger: true }))) return;
     try {
       const res = await fetch(`/api/series/${seriesId}/chapters/${chapterId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete chapter');
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
   // Remove a single unwanted image (an ad/translator-credit slide the
   // automatic filters missed) from a chapter, without deleting the whole chapter
   const handleDeleteChapterImage = async (seriesId, chapterId, filename) => {
-    if (!confirm('ลบรูปนี้ออกจากตอน?')) return;
+    if (!(await confirmAction('ลบรูปนี้ออกจากตอน?', { danger: true }))) return;
     try {
       const res = await fetch(`/api/series/${seriesId}/chapters/${chapterId}/images/${encodeURIComponent(filename)}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to delete image');
       fetchSeries();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -786,7 +816,7 @@ function App() {
       await fetchSeries();
       setExpandedChapterId(chapterId);
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
       fetchSeries();
     } finally {
       setScrapingChapterIds(prev => ({ ...prev, [chapterId]: false }));
@@ -859,10 +889,10 @@ function App() {
         throw new Error(errorData.error || 'Failed to save image to server');
       }
 
-      alert('✓ Image saved to server storage successfully!');
+      notify.success('✓ Image saved to server storage successfully!');
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setSavingImageUrls(prev => ({ ...prev, [imageUrl]: false }));
     }
@@ -872,7 +902,7 @@ function App() {
   const handleSaveAllImagesToServer = async () => {
     if (galleryImages.length === 0 || !galleryMonitorId) return;
 
-    if (!confirm(`Are you sure you want to download and save all ${galleryImages.length} images to the server?`)) return;
+    if (!(await confirmAction(`Are you sure you want to download and save all ${galleryImages.length} images to the server?`))) return;
 
     setIsSavingAll(true);
     try {
@@ -888,11 +918,11 @@ function App() {
       if (!res.ok) throw new Error('Failed to save all images');
       const data = await res.json();
       
-      alert(`✓ Batch download finished!\nSaved: ${data.savedCount} images successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+      notify.success(`✓ Batch download finished!\nSaved: ${data.savedCount} images successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
       
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsSavingAll(false);
     }
@@ -908,7 +938,7 @@ function App() {
     const urls = Object.keys(selectedGalleryUrls).filter(url => selectedGalleryUrls[url]);
     if (urls.length === 0 || !galleryMonitorId) return;
 
-    if (!confirm(`Are you sure you want to download and save the ${urls.length} selected image(s) to the server?`)) return;
+    if (!(await confirmAction(`Are you sure you want to download and save the ${urls.length} selected image(s) to the server?`))) return;
 
     setIsSavingSelected(true);
     try {
@@ -924,12 +954,12 @@ function App() {
       if (!res.ok) throw new Error('Failed to save selected images');
       const data = await res.json();
 
-      alert(`✓ Saved ${data.savedCount} selected image(s) successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+      notify.success(`✓ Saved ${data.savedCount} selected image(s) successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
 
       setSelectedGalleryUrls({});
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsSavingSelected(false);
     }
@@ -937,7 +967,7 @@ function App() {
 
   // Delete Saved Image from Server
   const handleDeleteSavedImage = async (savedImageId) => {
-    if (!confirm('Are you sure you want to delete this saved image from the server?')) return;
+    if (!(await confirmAction('Are you sure you want to delete this saved image from the server?', { danger: true }))) return;
 
     try {
       const res = await fetch(`/api/images/saved/${savedImageId}`, {
@@ -947,13 +977,13 @@ function App() {
       if (!res.ok) throw new Error('Failed to delete saved image');
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
   // Delete a group of saved images by monitor ID
   const handleDeleteSavedGroup = async (monitorId, groupName) => {
-    if (!confirm(`Are you sure you want to delete ALL saved images for "${groupName}" from the server?`)) return;
+    if (!(await confirmAction(`Are you sure you want to delete ALL saved images for "${groupName}" from the server?`, { danger: true }))) return;
 
     try {
       const res = await fetch(`/api/images/saved/group/${monitorId}`, {
@@ -963,7 +993,7 @@ function App() {
       if (!res.ok) throw new Error('Failed to delete saved group');
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -981,7 +1011,7 @@ function App() {
   const handleDeleteSelectedImages = async () => {
     const ids = Object.keys(selectedImageIds).filter(id => selectedImageIds[id]);
     if (ids.length === 0) return;
-    if (!confirm(`Are you sure you want to delete the ${ids.length} selected image(s) from the server?`)) return;
+    if (!(await confirmAction(`Are you sure you want to delete the ${ids.length} selected image(s) from the server?`, { danger: true }))) return;
 
     setIsBulkDeleting(true);
     try {
@@ -995,7 +1025,7 @@ function App() {
       setSelectedImageIds({});
       fetchSavedImages();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setIsBulkDeleting(false);
     }
@@ -1036,7 +1066,7 @@ function App() {
       }
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     } finally {
       setCheckingIds(prev => ({ ...prev, [id]: false }));
     }
@@ -1050,7 +1080,7 @@ function App() {
       setIsClearLogsModalOpen(false);
       fetchData();
     } catch (err) {
-      alert(err.message);
+      notify.error(err.message);
     }
   };
 
@@ -1103,6 +1133,9 @@ function App() {
 
   return (
     <div className="app-wrapper">
+      <ToastStack />
+      <ConfirmModal />
+
       {/* Sidebar Navigation */}
       <aside className="app-sidebar">
         <div className="brand-section">
@@ -1308,28 +1341,30 @@ function App() {
                         {monitor.active ? renderStatusBadge(monitor.status) : <span className="status-badge badge-unknown">Paused</span>}
                       </div>
 
-                      {/* Stats */}
-                      <div className="monitor-meta">
-                        <span className="meta-label">Uptime</span>
-                        <span className="meta-value" style={{ color: parseFloat(mStats.uptime) > 95 ? 'var(--color-green)' : parseFloat(mStats.uptime) > 80 ? 'var(--color-yellow)' : 'var(--color-red)' }}>
-                          {monitor.active ? mStats.uptime : '—'}
-                        </span>
-                      </div>
-
-                      <div className="monitor-meta">
-                        <span className="meta-label">Avg Response</span>
-                        <span className="meta-value">{monitor.active ? mStats.avgResponse : '—'}</span>
-                      </div>
-
-                      {/* Sparkline Response Grid */}
-                      {monitor.active ? (
-                        <Sparkline checks={monitor.checks} />
-                      ) : (
-                        <div className="sparkline-container">
-                          <span className="meta-label">History</span>
-                          <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', lineHeight: '24px' }}>Monitoring paused</span>
+                      {/* Stats + history */}
+                      <div className="monitor-metrics">
+                        <div className="monitor-meta">
+                          <span className="meta-label">Uptime</span>
+                          <span className="meta-value" style={{ color: parseFloat(mStats.uptime) > 95 ? 'var(--color-green)' : parseFloat(mStats.uptime) > 80 ? 'var(--color-yellow)' : 'var(--color-red)' }}>
+                            {monitor.active ? mStats.uptime : '—'}
+                          </span>
                         </div>
-                      )}
+
+                        <div className="monitor-meta">
+                          <span className="meta-label">Avg Response</span>
+                          <span className="meta-value">{monitor.active ? mStats.avgResponse : '—'}</span>
+                        </div>
+
+                        {/* Sparkline Response Grid */}
+                        {monitor.active ? (
+                          <Sparkline checks={monitor.checks} />
+                        ) : (
+                          <div className="sparkline-container">
+                            <span className="meta-label">History</span>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', lineHeight: '24px' }}>Monitoring paused</span>
+                          </div>
+                        )}
+                      </div>
 
                       {/* Action buttons */}
                       <div className="monitor-actions">
@@ -1875,9 +1910,9 @@ function App() {
         <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', width: '100%', flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
                 <h2>📚 คลังการ์ตูน (Manga Library)</h2>
-                {seriesLoading && <span className="loading-spinner" />}
+                {seriesLoading && <span className="spinner-inline" title="กำลังโหลด..." />}
               </div>
               <input
                 type="text"
@@ -1916,14 +1951,20 @@ function App() {
 
                 return (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', height: '100%' }}>
-                    <div className="table-responsive" style={{ flex: 1, overflowY: 'auto', backgroundColor: 'var(--bg-secondary)', borderRadius: '0.5rem', border: '1px solid var(--border-color)' }}>
-                      <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
-                        <thead style={{ position: 'sticky', top: 0, backgroundColor: 'var(--bg-tertiary)', zIndex: 1, boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
-                          <tr style={{ borderBottom: '1px solid var(--border-color)', color: 'var(--color-text-muted)' }}>
-                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>ชื่อเรื่อง</th>
-                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>ความคืบหน้า</th>
-                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem' }}>สถานะ</th>
-                            <th style={{ padding: '0.75rem', fontWeight: '500', fontSize: '0.9rem', textAlign: 'right' }}>การจัดการ</th>
+                    <div className="table-responsive">
+                      <table className="library-table">
+                        <colgroup>
+                          <col className="col-title" />
+                          <col className="col-progress" />
+                          <col className="col-status" />
+                          <col className="col-actions" />
+                        </colgroup>
+                        <thead>
+                          <tr>
+                            <th>ชื่อเรื่อง</th>
+                            <th>ความคืบหน้า</th>
+                            <th>สถานะ</th>
+                            <th style={{ textAlign: 'right' }}>การจัดการ</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1932,12 +1973,12 @@ function App() {
                             const done = series.chapters?.filter(c => c.status === 'done').length || 0;
                             const errors = series.chapters?.filter(c => ['error', 'blocked', 'partial'].includes(c.status)).length || 0;
                             const isComplete = total > 0 && done === total;
-                            
+
                             return (
                               <React.Fragment key={series.id}>
-                                <tr style={{ borderBottom: '1px solid var(--border-color)', backgroundColor: 'var(--bg-secondary)', transition: 'background-color 0.2s' }}>
-                                  <td style={{ padding: '0.6rem 0.75rem', maxWidth: '300px' }}>
-                                    <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
+                                <tr>
+                                  <td>
+                                    <div className="library-row-title">
                                       {series.metadata?.coverImagePath && (
                                         <img
                                           src={`/api/saved-assets/${series.metadata.coverImagePath}`}
@@ -1945,19 +1986,19 @@ function App() {
                                           style={{ width: '36px', height: '50px', objectFit: 'cover', borderRadius: '0.25rem', flexShrink: 0 }}
                                         />
                                       )}
-                                      <div>
-                                    <div style={{ fontWeight: '500', color: 'var(--color-text)', fontSize: '0.95rem', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }} title={series.name}>
-                                      {series.name}
-                                    </div>
-                                    <div style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '0.15rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={series.seriesUrl}>
-                                      <a href={series.seriesUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', textDecoration: 'none' }}>
-                                        🔗 {series.seriesUrl || 'No URL'}
-                                      </a>
-                                    </div>
+                                      <div style={{ minWidth: 0 }}>
+                                        <div className="library-row-title-text" title={series.name}>
+                                          {series.name}
+                                        </div>
+                                        <div className="library-row-url" title={series.seriesUrl}>
+                                          <a href={series.seriesUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', textDecoration: 'none' }}>
+                                            🔗 {series.seriesUrl || 'No URL'}
+                                          </a>
+                                        </div>
                                       </div>
                                     </div>
                                   </td>
-                                  <td style={{ padding: '0.6rem 0.75rem', width: '200px' }}>
+                                  <td>
                                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
                                       <span>ตอน: {total}</span>
                                       <span style={{ color: 'var(--color-green)' }}>เสร็จ: {done}</span>
@@ -1969,10 +2010,10 @@ function App() {
                                     )}
                                     {errors > 0 && <div style={{ color: 'var(--color-red)', fontSize: '0.75rem', marginTop: '0.2rem' }}>⚠️ มีปัญหา {errors} ตอน</div>}
                                   </td>
-                                  <td style={{ padding: '0.6rem 0.75rem', width: '120px', fontSize: '0.85rem' }}>
+                                  <td style={{ fontSize: '0.85rem' }}>
                                     {isComplete ? <span style={{ color: 'var(--color-green)' }}>✅ สมบูรณ์</span> : <span style={{ color: 'var(--color-yellow)' }}>⏳ รอโหลด</span>}
                                   </td>
-                                  <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right' }}>
+                                  <td style={{ textAlign: 'right' }}>
                                     <div style={{ display: 'flex', gap: '0.4rem', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                                       {series.metadata && (
                                         <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setExpandedLibrarySeoIds(prev => ({ ...prev, [series.id]: !prev[series.id] }))}>
@@ -1988,7 +2029,7 @@ function App() {
                                     </div>
                                   </td>
                                 </tr>
-                                
+
                                 {/* Expanded Chapters Viewer */}
                                 {expandedCrawlId === series.id && (
                                   <tr>
@@ -2152,7 +2193,7 @@ function App() {
                       const totalSeries = crawl.discoveredSeries.length;
                       const doneSeries = crawl.processedSeriesUrls.length;
                       return (
-                        <div key={crawl.id} style={{ border: '1px solid var(--border-color)', borderRadius: '0.5rem', padding: '0.6rem 0.8rem', fontSize: '0.8rem', display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                        <div key={crawl.id} className="crawl-card">
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
                             <span style={{ wordBreak: 'break-all' }}>{crawl.siteUrl}</span>
                             <span style={{ color: meta.color, flexShrink: 0 }}>{meta.icon} {meta.label}</span>
@@ -2284,17 +2325,7 @@ function App() {
                       <div
                         key={s.id}
                         onClick={() => handleSelectSeries(s)}
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
-                          gap: '0.5rem',
-                          padding: '0.5rem 0.65rem',
-                          borderRadius: '0.5rem',
-                          cursor: 'pointer',
-                          background: selectedSeriesId === s.id ? 'var(--gradient-cyan-blue)' : 'rgba(255,255,255,0.05)',
-                          fontSize: '0.85rem'
-                        }}
+                        className={`series-list-item ${selectedSeriesId === s.id ? 'active' : ''}`}
                       >
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                           📚 {s.name} <span style={{ opacity: 0.7, fontSize: '0.75rem' }}>({(s.chapters || []).length})</span>
@@ -2391,6 +2422,18 @@ function App() {
                               >
                                 {isFetchingMetadata ? '⏳ กำลังดึงข้อมูล...' : series.metadata ? '🏷️ รีเฟรชข้อมูล SEO' : '🏷️ ดึงข้อมูล SEO'}
                               </button>
+                              {(series.chapters || []).length > 1 && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                                  disabled={isCheckingGaps}
+                                  title="เช็คว่าตอนไหนหายไปจากลำดับบ้าง (ไม่ได้เช็คแค่โหลดเสร็จหรือยัง แต่เช็คว่ามีตอนนั้นอยู่ในระบบหรือเปล่า)"
+                                  onClick={() => handleCheckChapterGaps(series.id)}
+                                >
+                                  {isCheckingGaps ? '⏳ กำลังเช็ค...' : '🔎 เช็คตอนที่ขาดหาย'}
+                                </button>
+                              )}
                               {(series.chapters || []).some(c => c.status === 'done') && (
                                 <button
                                   type="button"
@@ -2527,7 +2570,7 @@ function App() {
                                   const statusMeta = CHAPTER_STATUS_META[chapter.status] || CHAPTER_STATUS_META.pending;
                                   const isScraping = chapter.status === 'scraping' || scrapingChapterIds[chapter.id];
                               return (
-                                <div key={chapter.id} style={{ border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
+                                <div key={chapter.id} className="chapter-row">
                                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap' }}>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', minWidth: 0 }}>
                                       <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{chapter.name}</span>
@@ -2666,25 +2709,11 @@ function App() {
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                   {/* Tab Bar for Saved Groups */}
-                  <div style={{ display: 'flex', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '0.5rem', marginBottom: '0.5rem', overflowX: 'auto', gap: '0.5rem' }}>
+                  <div className="tab-bar" style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '0.75rem' }}>
                     {Object.entries(getSavedImagesGroups()).map(([id, group]) => (
                       <button
                         key={id}
                         className={`tab-btn ${activeSavedTab === id ? 'active' : ''}`}
-                        style={{
-                          background: activeSavedTab === id ? 'var(--gradient-cyan-blue)' : 'rgba(255,255,255,0.05)',
-                          color: '#fff',
-                          border: 'none',
-                          padding: '0.5rem 1rem',
-                          borderRadius: '0.5rem',
-                          cursor: 'pointer',
-                          fontSize: '0.85rem',
-                          fontWeight: activeSavedTab === id ? '600' : 'normal',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          whiteSpace: 'nowrap'
-                        }}
                         onClick={() => { setActiveSavedTab(id); setSelectedImageIds({}); }}
                       >
                         🌐 {group.name} ({group.items.length})

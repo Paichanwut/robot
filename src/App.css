@@ -19,7 +19,9 @@
 
 .app-main {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: auto;
   padding: 2rem 2.5rem;
   background-color: var(--bg-primary);
 }
@@ -31,6 +33,13 @@
   display: flex;
   flex-direction: column;
   gap: 2rem;
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .app-main {
+    padding: 1.25rem;
+  }
 }
 
 /* Sidebar Section */
@@ -206,13 +215,18 @@
 /* Main Content Grid */
 .dashboard-grid {
   display: grid;
-  grid-template-columns: 1fr 350px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 350px);
   gap: 1.5rem;
+  min-width: 0;
 }
 
-@media (max-width: 1024px) {
+.dashboard-grid > div {
+  min-width: 0;
+}
+
+@media (max-width: 1150px) {
   .dashboard-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -240,7 +254,11 @@
   gap: 1rem;
 }
 
-/* Monitor Card styling (Glassmorphism) */
+/* Monitor Card styling (Glassmorphism) - a two-row layout (identity/status/
+   actions on top, uptime+response+history strip below) so it stays legible
+   at the app's typical left-column width (~550-600px, once the sidebar and
+   the Alert Logs panel take their share) instead of cramming 6 columns into
+   one row. */
 .monitor-card {
   background: var(--bg-card);
   backdrop-filter: blur(12px);
@@ -248,16 +266,69 @@
   border-radius: 1rem;
   padding: 1.25rem;
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+  grid-template-areas:
+    "info status actions"
+    "metrics metrics metrics";
   align-items: center;
-  gap: 1.5rem;
+  row-gap: 0.85rem;
+  column-gap: 1rem;
   transition: all 0.2s ease;
 }
 
-@media (max-width: 768px) {
+.monitor-card > * {
+  min-width: 0;
+}
+
+.monitor-info { grid-area: info; }
+.monitor-status-section { grid-area: status; }
+.monitor-actions { grid-area: actions; }
+
+.monitor-metrics {
+  grid-area: metrics;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.monitor-metrics .sparkline-container {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* Below this, "info | status | actions" in one row no longer has enough
+   room (sidebar + padding already claim a large share of the viewport) -
+   stack status and the action icons onto their own rows instead of letting
+   the identity column get crushed. */
+@media (max-width: 900px) {
+  .monitor-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "info status"
+      "actions actions"
+      "metrics metrics";
+  }
+
+  .monitor-card .monitor-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
   .monitor-card {
     grid-template-columns: 1fr;
-    gap: 0.75rem;
+    grid-template-areas:
+      "info"
+      "status"
+      "actions"
+      "metrics";
+  }
+
+  .monitor-card .monitor-status-section {
+    justify-content: flex-start;
   }
 }
 
@@ -441,8 +512,9 @@
 /* Card Actions */
 .monitor-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 0.5rem;
+  gap: 0.4rem;
 }
 
 /* Alerts Log Panel (Sidebar) */
@@ -770,4 +842,263 @@
 
 .gallery-card:hover .gallery-img-link {
   color: var(--color-cyan);
+}
+
+/* Small inline spinner (next to a heading/label, unlike the larger .spinner block) */
+.spinner-inline {
+  display: inline-block;
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 2px solid rgba(6, 182, 212, 0.15);
+  border-top-color: var(--color-cyan);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+}
+
+/* Tab bar (e.g. Saved Gallery per-site tabs) */
+.tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.tab-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-text-primary);
+}
+
+.tab-btn.active {
+  background: var(--gradient-cyan-blue);
+  color: #0b0f19;
+  font-weight: 600;
+}
+
+/* Manga Library table */
+.table-responsive {
+  flex: 1;
+  overflow: auto;
+  background-color: var(--bg-secondary);
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-color);
+}
+
+.library-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  table-layout: fixed;
+}
+
+.library-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background-color: var(--bg-tertiary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.library-table th {
+  padding: 0.75rem;
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.library-table col.col-title { width: auto; }
+.library-table col.col-progress { width: 200px; }
+.library-table col.col-status { width: 120px; }
+.library-table col.col-actions { width: 220px; }
+
+.library-table tbody tr {
+  background-color: var(--bg-secondary);
+  transition: background-color 0.15s;
+}
+
+.library-table tbody tr:hover {
+  background-color: var(--bg-card-hover);
+}
+
+.library-table td {
+  padding: 0.65rem 0.75rem;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.library-row-title {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.library-row-title-text {
+  font-weight: 500;
+  color: var(--color-text-primary);
+  font-size: 0.95rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.library-row-url {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-top: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Site-crawl queue card (Manga Downloader) */
+.crawl-card {
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  padding: 0.85rem 1rem;
+  font-size: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 0.15s;
+}
+
+.crawl-card:hover {
+  border-color: rgba(6, 182, 212, 0.2);
+}
+
+/* Chapter row (Manga Downloader chapter list) */
+.chapter-row {
+  border: 1px solid var(--border-color);
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.85rem;
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.chapter-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Series list item (Manga Downloader left pane) */
+.series-list-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 0.85rem;
+  transition: background-color 0.15s;
+}
+
+.series-list-item:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.series-list-item.active {
+  background: var(--gradient-cyan-blue);
+  color: #0b0f19;
+}
+
+.series-list-item.active .btn-danger {
+  background-color: rgba(11, 15, 25, 0.15);
+  color: #0b0f19;
+  border-color: rgba(11, 15, 25, 0.25);
+}
+
+/* Toasts */
+.toast-stack {
+  position: fixed;
+  top: 1.5rem;
+  right: 1.5rem;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-width: min(380px, calc(100vw - 3rem));
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.85rem 1rem;
+  border-radius: 0.75rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-lg);
+  animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.toast-icon {
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+
+.toast-body {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-line;
+  word-break: break-word;
+  color: var(--color-text-primary);
+}
+
+.toast-close {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+}
+
+.toast-close:hover {
+  color: var(--color-text-primary);
+}
+
+.toast-success {
+  border-left: 3px solid var(--color-green);
+}
+
+.toast-error {
+  border-left: 3px solid var(--color-red);
+}
+
+.toast-info {
+  border-left: 3px solid var(--color-cyan);
+}
+
+/* Confirm modal (reuses .modal-overlay / .modal-content shell) */
+.confirm-modal-message {
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+  white-space: pre-line;
+  line-height: 1.6;
 }
