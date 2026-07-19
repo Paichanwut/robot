@@ -53,6 +53,13 @@ function Sparkline({ checks }) {
 function App() {
   const { notify, confirmAction, toasts, dismissToast, confirmState, resolveConfirm } = useNotifications();
 
+  const [theme, setTheme] = useState(() => localStorage.getItem('robot-hub-theme') || 'light');
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('robot-hub-theme', theme);
+  }, [theme]);
+
   const [monitors, setMonitors] = useState([]);
   const [logs, setLogs] = useState([]);
   const [stats, setStats] = useState({ total: 0, up: 0, down: 0, unknown: 0, avgResponseTime: 0 });
@@ -102,6 +109,7 @@ function App() {
   const [currentView, setCurrentView] = useState('monitor'); // 'monitor', 'library', 'downloader', 'gallery'
   const [isAddingChapter, setIsAddingChapter] = useState(false);
   const [showManualChapterForm, setShowManualChapterForm] = useState(false);
+  const [showDownloaderInfo, setShowDownloaderInfo] = useState(false);
   const [scrapingChapterIds, setScrapingChapterIds] = useState({});
   const [expandedChapterId, setExpandedChapterId] = useState('');
   const [discoverUrl, setDiscoverUrl] = useState('');
@@ -1141,12 +1149,19 @@ function App() {
       <aside className="app-sidebar">
         <div className="brand-section">
           <div className="logo-icon">R</div>
-          <div>
+          <div style={{ flex: 1 }}>
             <h1>Robot Hub</h1>
             <p>Monitor &amp; Manga Manager</p>
           </div>
+          <button
+            className="theme-toggle"
+            onClick={() => setTheme(prev => (prev === 'dark' ? 'light' : 'dark'))}
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={16} />
+          </button>
         </div>
-        
+
         <nav className="sidebar-nav">
           <button
             className={`nav-item ${currentView === 'monitor' ? 'active' : ''}`}
@@ -1197,7 +1212,7 @@ function App() {
       {/* Network / Connection Error Warning Banner */}
       {error && (
         <div style={{
-          backgroundColor: 'rgba(214, 72, 63, 0.1)',
+          backgroundColor: 'rgba(var(--danger-tint-base), 0.1)',
           border: '1px solid var(--color-red)',
           color: 'var(--color-red)',
           padding: '1rem',
@@ -1298,7 +1313,7 @@ function App() {
                           <span style={{ 
                             fontSize: '0.7rem', 
                             color: 'var(--color-text-muted)', 
-                            backgroundColor: 'rgba(31, 41, 25, 0.05)',
+                            backgroundColor: 'rgba(var(--tint-base), 0.05)',
                             padding: '0.15rem 0.4rem',
                             borderRadius: '4px',
                             marginLeft: '0.5rem',
@@ -1610,7 +1625,7 @@ function App() {
       {/* Delete Monitor Confirmation Modal */}
       {isDeleteModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(214, 72, 63, 0.3)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(var(--danger-tint-base), 0.3)' }}>
             <div className="modal-header">
               <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Delete Monitor</h3>
               <button className="modal-close" onClick={() => setIsDeleteModalOpen(false)}>×</button>
@@ -1635,7 +1650,7 @@ function App() {
       {/* Clear Logs Confirmation Modal */}
       {isClearLogsModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(214, 72, 63, 0.3)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(var(--danger-tint-base), 0.3)' }}>
             <div className="modal-header">
               <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Clear Alert Logs</h3>
               <button className="modal-close" onClick={() => setIsClearLogsModalOpen(false)}>×</button>
@@ -2001,16 +2016,15 @@ function App() {
                                     </div>
                                   </td>
                                   <td>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
-                                      <span>ตอน: {total}</span>
-                                      <span style={{ color: 'var(--color-green)' }}>เสร็จ: {done}</span>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.3rem' }}>
+                                      <span>{done} / {total} ตอน</span>
+                                      {errors > 0 && <span style={{ color: 'var(--color-red)' }}>มีปัญหา {errors}</span>}
                                     </div>
                                     {total > 0 && (
                                       <div style={{ width: '100%', height: '5px', backgroundColor: 'var(--bg-tertiary)', borderRadius: '3px', overflow: 'hidden' }}>
                                         <div style={{ width: `${(done / total) * 100}%`, height: '100%', backgroundColor: 'var(--color-green)' }} />
                                       </div>
                                     )}
-                                    {errors > 0 && <div style={{ color: 'var(--color-red)', fontSize: '0.75rem', marginTop: '0.2rem' }}>มีปัญหา {errors} ตอน</div>}
                                   </td>
                                   <td style={{ fontSize: '0.85rem' }}>
                                     {isComplete ? <span style={{ color: 'var(--color-green)' }}>สมบูรณ์</span> : <span style={{ color: 'var(--color-yellow)' }}>รอโหลด</span>}
@@ -2151,9 +2165,19 @@ function App() {
           </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '78vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
-              <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', margin: 0 }}>
-                หน้านี้คือ <b>"คิวดาวน์โหลด"</b> คุณสามารถเพิ่มหน้าเว็บไซต์หรือเพิ่มเรื่องทิ้งไว้ได้หลายๆ เว็บพร้อมกัน บอทจะทำการโหลดรูปแยกกันตามโดเมนแบบคู่ขนาน (Concurrent) ทันที เมื่อโหลดครบ 100% เรื่องนั้นจะถูกย้ายไปที่ <b>"คลังการ์ตูน"</b> อัตโนมัติ
-              </p>
+              <button
+                type="button"
+                onClick={() => setShowDownloaderInfo(prev => !prev)}
+                style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: 'var(--color-text-muted)', fontSize: '0.8rem', alignSelf: 'flex-start' }}
+              >
+                <Icon name={showDownloaderInfo ? 'chevron-up' : 'chevron-down'} size={13} />
+                วิธีใช้งานหน้านี้
+              </button>
+              {showDownloaderInfo && (
+                <p style={{ fontSize: '0.85rem', color: 'var(--color-text-secondary)', margin: 0 }}>
+                  หน้านี้คือ <b>"คิวดาวน์โหลด"</b> คุณสามารถเพิ่มหน้าเว็บไซต์หรือเพิ่มเรื่องทิ้งไว้ได้หลายๆ เว็บพร้อมกัน บอทจะทำการโหลดรูปแยกกันตามโดเมนแบบคู่ขนาน (Concurrent) ทันที เมื่อโหลดครบ 100% เรื่องนั้นจะถูกย้ายไปที่ <b>"คลังการ์ตูน"</b> อัตโนมัติ
+                </p>
+              )}
 
               {/* Whole-site crawl: hand over just the site's root/listing URL and
                   the bot discovers every series + every chapter on its own,
@@ -2163,7 +2187,7 @@ function App() {
                 <div>
                   <h4 style={{ margin: '0 0 0.25rem 0', fontSize: '0.95rem' }}>ดึงทั้งเว็บอัตโนมัติ</h4>
                   <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
-                    วางลิงก์หน้าแรกของเว็บมังงะ (เช่น https://www.go-manga.com/) บอทจะไล่หาทุกเรื่องในเว็บ (ทุกหน้า) แล้วดึงทุกตอนของทุกเรื่องให้เอง ทำงานอยู่บนเซิร์ฟเวอร์ - ปิดแท็บ/เบราว์เซอร์นี้ได้ งานยังทำงานต่อจนกว่าจะเสร็จหรือสั่งหยุด (แต่ถ้าปิดเครื่องที่รันเซิร์ฟเวอร์เองจะหยุดตามไปด้วย)
+                    วางลิงก์หน้าแรกของเว็บ บอทจะไล่หาทุกเรื่องและทุกตอนให้เองในเบื้องหลัง ปิดแท็บนี้ได้เลย
                   </p>
                 </div>
 
@@ -2200,10 +2224,19 @@ function App() {
                             <span style={{ wordBreak: 'break-all' }}>{crawl.siteUrl}</span>
                             <span style={{ color: meta.color, flexShrink: 0 }}>{meta.icon} {meta.label}</span>
                           </div>
-                          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', color: 'var(--color-text-secondary)' }}>
-                            <span>เจอเรื่องแล้ว {totalSeries} เรื่อง{!crawl.discoveryDone && ' (กำลังหาเพิ่ม...)'}</span>
-                            <span>ทำเสร็จแล้ว {doneSeries} เรื่อง</span>
-                            <span>โหลดไปแล้ว {crawl.stats.chaptersDownloaded} ตอน</span>
+                          <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
+                            <div className="monitor-meta">
+                              <span className="meta-label">เจอเรื่อง</span>
+                              <span className="meta-value">{totalSeries}{!crawl.discoveryDone && ' ⋯'}</span>
+                            </div>
+                            <div className="monitor-meta">
+                              <span className="meta-label">เสร็จแล้ว</span>
+                              <span className="meta-value">{doneSeries}</span>
+                            </div>
+                            <div className="monitor-meta">
+                              <span className="meta-label">โหลดแล้ว</span>
+                              <span className="meta-value">{crawl.stats.chaptersDownloaded} ตอน</span>
+                            </div>
                           </div>
                           {crawl.currentSeriesName && crawl.status === 'running' && (
                             <div style={{ color: 'var(--color-blue)' }}>กำลังทำเรื่อง: {crawl.currentSeriesName}</div>

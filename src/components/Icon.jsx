@@ -40,6 +40,8 @@ const PATHS = {
   'file-text': 'M7 3.5h7l4 4v13H7Z M14 3.5v4h4 M9.5 12.5h5 M9.5 15.5h5',
   x: 'M6 6l12 12 M18 6L6 18',
   robot: 'M8 8.2h8a2 2 0 0 1 2 2v6.6a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10.2a2 2 0 0 1 2-2Z M12 8.2V5 M9.5 12.3v1.6 M14.5 12.3v1.6 M9.5 17.8h5',
+  sun: 'M12 16.5a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9ZM12 2.5v2M12 19.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M2.5 12h2M19.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
+  moon: 'M20 14.2A8.5 8.5 0 1 1 9.8 4 6.8 6.8 0 0 0 20 14.2Z',
 };
 
 export default function Icon({ name, size = 16, strokeWidth = 1.75, style, className, title }) {

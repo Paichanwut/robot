@@ -79,6 +79,26 @@
   letter-spacing: 0.02em;
 }
 
+.theme-toggle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.375rem;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.theme-toggle:hover {
+  background: rgba(var(--tint-base), 0.06);
+  color: var(--color-text-primary);
+}
+
 .sidebar-nav {
   display: flex;
   flex-direction: column;
@@ -104,12 +124,12 @@
 }
 
 .nav-item:hover {
-  background-color: rgba(31, 41, 25, 0.04);
+  background-color: rgba(var(--tint-base), 0.04);
   color: var(--color-text-primary);
 }
 
 .nav-item.active {
-  background-color: rgba(74, 124, 58, 0.1);
+  background-color: rgba(var(--accent-tint-base), 0.1);
   color: var(--color-cyan);
   border-left: 2px solid var(--color-cyan);
 }
@@ -140,24 +160,24 @@
 }
 
 .btn-secondary {
-  background-color: rgba(31, 41, 25, 0.045);
+  background-color: rgba(var(--tint-base), 0.045);
   color: var(--color-text-primary);
-  border-color: rgba(31, 41, 25, 0.14);
+  border-color: rgba(var(--tint-base), 0.14);
 }
 
 .btn-secondary:hover {
-  background-color: rgba(31, 41, 25, 0.08);
-  border-color: rgba(31, 41, 25, 0.18);
+  background-color: rgba(var(--tint-base), 0.08);
+  border-color: rgba(var(--tint-base), 0.18);
 }
 
 .btn-danger {
-  background-color: rgba(214, 72, 63, 0.1);
+  background-color: rgba(var(--danger-tint-base), 0.1);
   color: var(--color-red);
-  border-color: rgba(214, 72, 63, 0.25);
+  border-color: rgba(var(--danger-tint-base), 0.25);
 }
 
 .btn-danger:hover {
-  background-color: rgba(214, 72, 63, 0.18);
+  background-color: rgba(var(--danger-tint-base), 0.18);
   border-color: var(--color-red);
 }
 
@@ -186,7 +206,7 @@
 }
 
 .stat-card:hover {
-  border-color: rgba(31, 41, 25, 0.16);
+  border-color: rgba(var(--tint-base), 0.16);
 }
 
 .stat-title {
@@ -333,7 +353,7 @@
 
 .monitor-card:hover {
   background: var(--bg-card-hover);
-  border-color: rgba(31, 41, 25, 0.16);
+  border-color: rgba(var(--tint-base), 0.16);
 }
 
 .monitor-card.status-down {
@@ -393,21 +413,21 @@
 }
 
 .badge-up {
-  background-color: rgba(79, 156, 66, 0.1);
+  background-color: rgba(var(--success-tint-base), 0.1);
   color: var(--color-green);
-  border: 1px solid rgba(79, 156, 66, 0.25);
+  border: 1px solid rgba(var(--success-tint-base), 0.25);
 }
 
 .badge-down {
-  background-color: rgba(214, 72, 63, 0.1);
+  background-color: rgba(var(--danger-tint-base), 0.1);
   color: var(--color-red);
-  border: 1px solid rgba(214, 72, 63, 0.25);
+  border: 1px solid rgba(var(--danger-tint-base), 0.25);
 }
 
 .badge-unknown {
-  background-color: rgba(100, 110, 90, 0.08);
+  background-color: rgba(var(--neutral-tint-base), 0.08);
   color: var(--color-text-secondary);
-  border: 1px solid rgba(100, 110, 90, 0.2);
+  border: 1px solid rgba(var(--neutral-tint-base), 0.2);
 }
 
 .pulse-dot {
@@ -557,7 +577,7 @@
 .alert-item {
   padding: 0.75rem;
   border-radius: 0.375rem;
-  background-color: rgba(31, 41, 25, 0.015);
+  background-color: rgba(var(--tint-base), 0.015);
   border: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
@@ -639,7 +659,7 @@
 
 .modal-content {
   background: var(--bg-elevated);
-  border: 1px solid rgba(31, 41, 25, 0.12);
+  border: 1px solid rgba(var(--tint-base), 0.12);
   border-radius: 0.85rem;
   width: 100%;
   max-width: 500px;
@@ -696,7 +716,7 @@
 }
 
 .form-input, .form-select {
-  background-color: rgba(31, 41, 25, 0.03);
+  background-color: rgba(var(--tint-base), 0.03);
   border: 1px solid var(--border-color);
   border-radius: 0.375rem;
   padding: 0.7rem 0.85rem;
@@ -709,7 +729,7 @@
 
 .form-input:focus, .form-select:focus {
   border-color: var(--color-cyan);
-  box-shadow: 0 0 0 2px rgba(74, 124, 58, 0.15);
+  box-shadow: 0 0 0 2px rgba(var(--accent-tint-base), 0.15);
 }
 
 .form-row {
@@ -770,7 +790,7 @@
 .spinner {
   width: 2rem;
   height: 2rem;
-  border: 3px solid rgba(74, 124, 58, 0.15);
+  border: 3px solid rgba(var(--accent-tint-base), 0.15);
   border-top-color: var(--color-cyan);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
@@ -791,7 +811,7 @@
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  background-color: rgba(31, 41, 25, 0.012);
+  background-color: rgba(var(--tint-base), 0.012);
   border: 1px solid var(--border-color);
   padding: 0.5rem;
   border-radius: 0.625rem;
@@ -799,8 +819,8 @@
 }
 
 .gallery-card:hover {
-  background-color: rgba(31, 41, 25, 0.03);
-  border-color: rgba(74, 124, 58, 0.25);
+  background-color: rgba(var(--tint-base), 0.03);
+  border-color: rgba(var(--accent-tint-base), 0.25);
   box-shadow: var(--shadow-sm);
 }
 
@@ -848,7 +868,7 @@
   display: inline-block;
   width: 0.9rem;
   height: 0.9rem;
-  border: 2px solid rgba(74, 124, 58, 0.18);
+  border: 2px solid rgba(var(--accent-tint-base), 0.18);
   border-top-color: var(--color-cyan);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
@@ -871,7 +891,7 @@
   font-size: 0.85rem;
   font-weight: 500;
   color: var(--color-text-secondary);
-  background: rgba(31, 41, 25, 0.05);
+  background: rgba(var(--tint-base), 0.05);
   border: 1px solid transparent;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -879,7 +899,7 @@
 }
 
 .tab-btn:hover {
-  background: rgba(31, 41, 25, 0.08);
+  background: rgba(var(--tint-base), 0.08);
   color: var(--color-text-primary);
 }
 
@@ -985,7 +1005,7 @@
 }
 
 .crawl-card:hover {
-  border-color: rgba(74, 124, 58, 0.25);
+  border-color: rgba(var(--accent-tint-base), 0.25);
 }
 
 /* Chapter row (Manga Downloader chapter list) */
@@ -993,12 +1013,12 @@
   border: 1px solid var(--border-color);
   border-radius: 0.75rem;
   padding: 0.6rem 0.85rem;
-  background: rgba(31, 41, 25, 0.02);
+  background: rgba(var(--tint-base), 0.02);
   transition: border-color 0.15s, background-color 0.15s;
 }
 
 .chapter-row:hover {
-  background: rgba(31, 41, 25, 0.04);
+  background: rgba(var(--tint-base), 0.04);
 }
 
 /* Series list item (Manga Downloader left pane) */
@@ -1010,13 +1030,13 @@
   padding: 0.5rem 0.65rem;
   border-radius: 0.5rem;
   cursor: pointer;
-  background: rgba(31, 41, 25, 0.05);
+  background: rgba(var(--tint-base), 0.05);
   font-size: 0.85rem;
   transition: background-color 0.15s;
 }
 
 .series-list-item:hover {
-  background: rgba(31, 41, 25, 0.09);
+  background: rgba(var(--tint-base), 0.09);
 }
 
 .series-list-item.active {
