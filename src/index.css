@@ -1,36 +1,43 @@
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-  --bg-main: #0b0f19;
+  /* Warm ink palette - deliberately not navy/near-black-with-cyan-glow.
+     Everything below reads as a private archive/reading-room rather than
+     a generic ops-dashboard template. */
+  --bg-main: #14120d;
   --bg-primary: var(--bg-main);
-  --bg-secondary: #0e1420;
-  --bg-tertiary: #141b2b;
-  --bg-card: rgba(17, 24, 39, 0.7);
-  --bg-card-hover: rgba(23, 37, 84, 0.4);
-  --bg-elevated: #111827;
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-focus: rgba(6, 182, 212, 0.5);
+  --bg-secondary: #191610;
+  --bg-tertiary: #201c14;
+  --bg-card: #1c1811;
+  --bg-card-hover: #221d15;
+  --bg-elevated: #211d16;
+  --border-color: rgba(238, 227, 206, 0.09);
+  --border-focus: rgba(184, 141, 61, 0.55);
 
-  --color-text-primary: #f8fafc;
-  --color-text-secondary: #94a3b8;
-  --color-text-muted: #64748b;
+  --color-text-primary: #f2ece0;
+  --color-text-secondary: #a99e8b;
+  --color-text-muted: #6d6455;
   --color-text: var(--color-text-primary);
 
-  --color-cyan: #06b6d4;
-  --color-blue: #60a5fa;
-  --color-green: #10b981;
-  --color-red: #ef4444;
-  --color-yellow: #f59e0b;
-  --gradient-cyan-blue: linear-gradient(135deg, var(--color-cyan), var(--color-blue));
+  /* Named "cyan/green/red/yellow/blue" for backwards compatibility with
+     existing var() references throughout the app - values are the new
+     gold/moss/rust/amber/slate palette, not literal cyan etc. */
+  --color-cyan: #b9893c;
+  --color-blue: #8095a8;
+  --color-green: #7c9473;
+  --color-red: #b2543f;
+  --color-yellow: #c69a44;
+  --gradient-cyan-blue: linear-gradient(135deg, #c79a4d, #a97a34);
 
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -2px rgba(0, 0, 0, 0.15);
-  --shadow-glow-green: 0 0 15px rgba(16, 185, 129, 0.3);
-  --shadow-glow-red: 0 0 15px rgba(239, 68, 68, 0.3);
-  --shadow-glow-cyan: 0 0 15px rgba(6, 182, 212, 0.3);
-  
-  --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 6px 16px -4px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 16px 32px -8px rgba(0, 0, 0, 0.5);
+  --shadow-glow-green: 0 0 0 rgba(0, 0, 0, 0);
+  --shadow-glow-red: 0 0 0 rgba(0, 0, 0, 0);
+  --shadow-glow-cyan: 0 0 0 rgba(0, 0, 0, 0);
+
+  --font-display: 'Fraunces', 'Iowan Old Style', Georgia, serif;
+  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 }
 
@@ -49,11 +56,6 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-image: 
-    radial-gradient(at 0% 0%, rgba(6, 182, 212, 0.08) 0px, transparent 50%),
-    radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.05) 0px, transparent 50%),
-    radial-gradient(at 50% 50%, rgba(15, 23, 42, 0.5) 0px, var(--bg-main) 100%);
-  background-attachment: fixed;
 }
 
 /* Custom Scrollbar */
@@ -67,12 +69,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
+  background: #33291b;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+  background: #473a24;
 }
 
 #root {

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
 import { useNotifications } from './components/Notifications';
+import Icon from './components/Icon';
 
 // Sparkline component to display a neat visual grid of recent check results.
 function Sparkline({ checks }) {
@@ -141,9 +142,9 @@ function App() {
 
   // Metadata (label/icon) for the heuristic image type classification
   const SAVED_TYPE_META = {
-    ad: { label: 'โฆษณา', icon: '📢' },
-    content: { label: 'ข้อมูล', icon: '📄' },
-    manga: { label: 'อื่นๆ', icon: '📖' }
+    ad: { label: 'โฆษณา', icon: <Icon name="megaphone" size={13} /> },
+    content: { label: 'ข้อมูล', icon: <Icon name="file-text" size={13} /> },
+    manga: { label: 'อื่นๆ', icon: <Icon name="book-open" size={13} /> }
   };
 
   // Form states
@@ -407,7 +408,7 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to discover chapters');
 
-      notify.success(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''} — กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`);
+      notify.success(`พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''} — กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -427,7 +428,7 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to scrape all chapters');
 
-      notify.success(`✓ โหลดไปแล้ว ${data.scrapedCount} ตอน${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
+      notify.success(`โหลดไปแล้ว ${data.scrapedCount} ตอน${data.blockedEarly ? '\nเว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -451,7 +452,7 @@ function App() {
 
       notify.success(data.message
         ? data.message
-        : `✓ ลองโหลดตอนที่มีปัญหา ${data.retriedProblemCount ?? ''} ตอนใหม่ (โหลดไป ${data.scrapedCount} ครั้ง)${data.blockedEarly ? '\n⚠️ เว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
+        : `ลองโหลดตอนที่มีปัญหา ${data.retriedProblemCount ?? ''} ตอนใหม่ (โหลดไป ${data.scrapedCount} ครั้ง)${data.blockedEarly ? '\nเว็บเริ่มบล็อกระหว่างทาง ระบบเลยหยุดให้อัตโนมัติ' : ''}`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -491,9 +492,9 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to check chapter gaps');
       if (data.missing.length === 0) {
-        notify.success(`✓ ตอนที่ ${data.min}-${data.max} ครบทุกตอน ไม่มีตอนขาดหาย`);
+        notify.success(`ตอนที่ ${data.min}-${data.max} ครบทุกตอน ไม่มีตอนขาดหาย`);
       } else {
-        notify.info(`⚠️ ขาดตอนที่: ${data.missing.join(', ')} (จากช่วง ${data.min}-${data.max})`);
+        notify.info(`ขาดตอนที่: ${data.missing.join(', ')} (จากช่วง ${data.min}-${data.max})`);
       }
     } catch (err) {
       notify.error(err.message);
@@ -511,7 +512,7 @@ function App() {
       const res = await fetch(`/api/series/${seriesId}/export`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to export series');
-      notify.success(`✓ Export แล้ว ${data.exportedChapterCount} ตอน\nไปที่: server/data/${data.exportPath}`);
+      notify.success(`Export แล้ว ${data.exportedChapterCount} ตอน\nไปที่: server/data/${data.exportPath}`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -531,7 +532,7 @@ function App() {
       const res = await fetch(`/api/series/${seriesId}/clean-duplicate-images`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to clean duplicate images');
-      notify.success(`✓ ตรวจสอบ ${data.chaptersScanned} ตอน — ลบรูปซ้ำ ${data.imagesRemoved} รูป จาก ${data.chaptersAffected} ตอน\n(เหมือนเป๊ะ ${data.exactDuplicatesRemoved} รูป, หน้าตาคล้ายกันมาก ${data.nearDuplicatesRemoved} รูป)`);
+      notify.success(`ตรวจสอบ ${data.chaptersScanned} ตอน — ลบรูปซ้ำ ${data.imagesRemoved} รูป จาก ${data.chaptersAffected} ตอน\n(เหมือนเป๊ะ ${data.exactDuplicatesRemoved} รูป, หน้าตาคล้ายกันมาก ${data.nearDuplicatesRemoved} รูป)`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -590,8 +591,8 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to check updates');
       notify.success(data.newChapters > 0
-        ? `✓ พบตอนใหม่ ${data.newChapters} ตอน กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`
-        : '✓ ไม่มีตอนใหม่ — เป็นเวอร์ชันล่าสุดแล้ว');
+        ? `พบตอนใหม่ ${data.newChapters} ตอน กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`
+        : 'ไม่มีตอนใหม่ — เป็นเวอร์ชันล่าสุดแล้ว');
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -610,7 +611,7 @@ function App() {
       const res = await fetch('/api/series/download-covers', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to download covers');
-      notify.success(`✓ เช็คแล้ว ${data.checked} เรื่อง — ดาวน์โหลดปกใหม่ ${data.downloaded} เรื่อง`);
+      notify.success(`เช็คแล้ว ${data.checked} เรื่อง — ดาวน์โหลดปกใหม่ ${data.downloaded} เรื่อง`);
       fetchSeries();
     } catch (err) {
       notify.error(err.message);
@@ -703,10 +704,10 @@ function App() {
 
   // Metadata (label/color) for a crawl job's overall status
   const CRAWL_STATUS_META = {
-    running: { label: 'กำลังทำงาน', color: 'var(--color-cyan)', icon: '🔄' },
-    stopped: { label: 'หยุดแล้ว', color: 'var(--color-yellow)', icon: '⏸️' },
-    done: { label: 'เสร็จสมบูรณ์', color: 'var(--color-green)', icon: '✅' },
-    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: '⚠️' }
+    running: { label: 'กำลังทำงาน', color: 'var(--color-cyan)', icon: <Icon name="refresh" size={13} /> },
+    stopped: { label: 'หยุดแล้ว', color: 'var(--color-yellow)', icon: <Icon name="pause" size={13} /> },
+    done: { label: 'เสร็จสมบูรณ์', color: 'var(--color-green)', icon: <Icon name="check" size={13} /> },
+    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: <Icon name="alert-triangle" size={13} /> }
   };
 
   // Add a new manga series (a "เรื่อง")
@@ -728,7 +729,7 @@ function App() {
       setSelectedSeriesId(created.id);
       setDiscoverUrl('');
       if (created.possibleDuplicates?.length > 0) {
-        notify.info(`⚠️ เรื่องนี้อาจซ้ำกับที่มีอยู่แล้ว: ${created.possibleDuplicates.map(d => d.name).join(', ')} — เช็คก่อนโหลดตอน จะได้ไม่โหลดซ้ำ`);
+        notify.info(`เรื่องนี้อาจซ้ำกับที่มีอยู่แล้ว: ${created.possibleDuplicates.map(d => d.name).join(', ')} — เช็คก่อนโหลดตอน จะได้ไม่โหลดซ้ำ`);
       }
     } catch (err) {
       notify.error(err.message);
@@ -829,12 +830,12 @@ function App() {
 
   // Metadata (label/color) for a chapter's scrape status
   const CHAPTER_STATUS_META = {
-    pending: { label: 'ยังไม่โหลด', color: 'var(--color-text-muted)', icon: '⏳' },
-    scraping: { label: 'กำลังโหลด...', color: 'var(--color-cyan)', icon: '🔄' },
-    done: { label: 'โหลดสำเร็จ', color: 'var(--color-green)', icon: '✅' },
-    partial: { label: 'โหลดได้บางส่วน', color: 'var(--color-yellow)', icon: '⚠️' },
-    blocked: { label: 'ถูกบล็อก', color: 'var(--color-red)', icon: '🚫' },
-    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: '⚠️' }
+    pending: { label: 'ยังไม่โหลด', color: 'var(--color-text-muted)', icon: <Icon name="clock" size={12} /> },
+    scraping: { label: 'กำลังโหลด...', color: 'var(--color-cyan)', icon: <Icon name="refresh" size={12} /> },
+    done: { label: 'โหลดสำเร็จ', color: 'var(--color-green)', icon: <Icon name="check" size={12} /> },
+    partial: { label: 'โหลดได้บางส่วน', color: 'var(--color-yellow)', icon: <Icon name="alert-triangle" size={12} /> },
+    blocked: { label: 'ถูกบล็อก', color: 'var(--color-red)', icon: <Icon name="ban" size={12} /> },
+    error: { label: 'ผิดพลาด', color: 'var(--color-red)', icon: <Icon name="alert-triangle" size={12} /> }
   };
 
   // Fetch Saved Images List
@@ -889,7 +890,7 @@ function App() {
         throw new Error(errorData.error || 'Failed to save image to server');
       }
 
-      notify.success('✓ Image saved to server storage successfully!');
+      notify.success('Image saved to server storage successfully!');
       fetchSavedImages();
     } catch (err) {
       notify.error(err.message);
@@ -918,7 +919,7 @@ function App() {
       if (!res.ok) throw new Error('Failed to save all images');
       const data = await res.json();
       
-      notify.success(`✓ Batch download finished!\nSaved: ${data.savedCount} images successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+      notify.success(`Batch download finished!\nSaved: ${data.savedCount} images successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
       
       fetchSavedImages();
     } catch (err) {
@@ -954,7 +955,7 @@ function App() {
       if (!res.ok) throw new Error('Failed to save selected images');
       const data = await res.json();
 
-      notify.success(`✓ Saved ${data.savedCount} selected image(s) successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
+      notify.success(`Saved ${data.savedCount} selected image(s) successfully.${data.errorCount > 0 ? `\nFailed: ${data.errorCount} images.` : ''}`);
 
       setSelectedGalleryUrls({});
       fetchSavedImages();
@@ -1139,44 +1140,44 @@ function App() {
       {/* Sidebar Navigation */}
       <aside className="app-sidebar">
         <div className="brand-section">
-          <div className="logo-icon">🤖</div>
+          <div className="logo-icon">R</div>
           <div>
             <h1>Robot Hub</h1>
-            <p>Monitor & Manga Manager</p>
+            <p>Monitor &amp; Manga Manager</p>
           </div>
         </div>
         
         <nav className="sidebar-nav">
-          <button 
+          <button
             className={`nav-item ${currentView === 'monitor' ? 'active' : ''}`}
             onClick={() => setCurrentView('monitor')}
           >
-            📊 Uptime Monitor
+            <Icon name="bar-chart" /> Uptime Monitor
           </button>
-          <button 
+          <button
             className={`nav-item ${currentView === 'library' ? 'active' : ''}`}
             onClick={() => { setCurrentView('library'); fetchSeries(); }}
           >
-            📚 Manga Library
+            <Icon name="book-stack" /> Manga Library
           </button>
-          <button 
+          <button
             className={`nav-item ${currentView === 'downloader' ? 'active' : ''}`}
             onClick={handleOpenMangaModal}
           >
-            📖 Manga Downloader
+            <Icon name="book-open" /> Manga Downloader
           </button>
-          <button 
+          <button
             className={`nav-item ${currentView === 'gallery' ? 'active' : ''}`}
             onClick={handleOpenSavedGallery}
           >
-            📂 Saved Gallery
+            <Icon name="folder" /> Saved Gallery
           </button>
         </nav>
-        
+
         {currentView === 'monitor' && (
           <div style={{ marginTop: 'auto' }}>
             <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)} style={{ width: '100%', justifyContent: 'center' }}>
-              <span>+</span> Add Website
+              <Icon name="plus" size={15} /> Add Website
             </button>
           </div>
         )}
@@ -1196,17 +1197,17 @@ function App() {
       {/* Network / Connection Error Warning Banner */}
       {error && (
         <div style={{
-          backgroundColor: 'rgba(239, 68, 68, 0.15)',
+          backgroundColor: 'rgba(178, 84, 63, 0.12)',
           border: '1px solid var(--color-red)',
           color: 'var(--color-red)',
           padding: '1rem',
-          borderRadius: '0.75rem',
+          borderRadius: '0.5rem',
           fontSize: '0.9rem',
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center'
         }}>
-          <span>⚠️ {error}</span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={15} /> {error}</span>
           <button className="btn btn-danger" style={{ padding: '0.25rem 0.75rem', fontSize: '0.8rem' }} onClick={fetchData}>
             Retry Connection
           </button>
@@ -1273,7 +1274,7 @@ function App() {
 
             {monitors.length === 0 ? (
               <div className="empty-dashboard">
-                <div className="empty-icon">🌐</div>
+                <div className="empty-icon"><Icon name="globe" size={40} strokeWidth={1.25} /></div>
                 <h3>No Websites Monitored</h3>
                 <p>You aren't checking any websites yet. Click "+ Add Website" above to start tracking server uptime.</p>
                 <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)}>
@@ -1307,7 +1308,7 @@ function App() {
                             alignItems: 'center',
                             gap: '0.25rem'
                           }}>
-                            ⏱️ {monitor.interval >= 60 ? `${monitor.interval / 60}m` : `${monitor.interval}s`}
+                            <Icon name="clock" size={11} /> {monitor.interval >= 60 ? `${monitor.interval / 60}m` : `${monitor.interval}s`}
                           </span>
                         </span>
                         <a
@@ -1328,7 +1329,7 @@ function App() {
                             alignItems: 'flex-start',
                             gap: '0.25rem'
                           }}>
-                            <span style={{ flexShrink: 0 }}>⚠️</span>
+                            <span style={{ flexShrink: 0, display: 'flex' }}><Icon name="alert-triangle" size={12} /></span>
                             <span style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
                               {monitor.lastError || 'Connection failed'}
                             </span>
@@ -1373,7 +1374,7 @@ function App() {
                           title={monitor.active ? 'Pause polling' : 'Resume polling'}
                           onClick={() => handleToggleActive(monitor)}
                         >
-                          {monitor.active ? '⏸️' : '▶️'}
+                          <Icon name={monitor.active ? 'pause' : 'play'} />
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
@@ -1385,7 +1386,7 @@ function App() {
                             opacity: (!monitor.active || checkingIds[monitor.id]) ? 0.5 : 1
                           }}
                         >
-                          {checkingIds[monitor.id] ? '⏳' : '🔄'}
+                          <Icon name={checkingIds[monitor.id] ? 'clock' : 'refresh'} />
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
@@ -1397,7 +1398,7 @@ function App() {
                             opacity: (!monitor.active || monitor.status !== 'up') ? 0.5 : 1
                           }}
                         >
-                          📷
+                          <Icon name="camera" />
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
@@ -1409,21 +1410,21 @@ function App() {
                             opacity: (!monitor.active || monitor.status !== 'up') ? 0.5 : 1
                           }}
                         >
-                          🗺️
+                          <Icon name="map" />
                         </button>
                         <button
                           className="btn btn-secondary btn-icon-only"
                           title="Edit settings"
                           onClick={() => openEditModal(monitor)}
                         >
-                          ✏️
+                          <Icon name="edit" />
                         </button>
                         <button
                           className="btn btn-danger btn-icon-only"
                           title="Delete monitor"
                           onClick={() => openDeleteModal(monitor)}
                         >
-                          🗑️
+                          <Icon name="trash" />
                         </button>
                       </div>
                     </div>
@@ -1440,7 +1441,7 @@ function App() {
             </div>
             <div className="alerts-panel">
               <div className="alerts-header">
-                <h3>🔔 Activity History</h3>
+                <h3><Icon name="bell" size={17} /> Activity History</h3>
                 {logs.length > 0 && (
                   <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setIsClearLogsModalOpen(true)}>
                     Clear
@@ -1450,7 +1451,7 @@ function App() {
               <div className="alerts-list">
                 {logs.length === 0 ? (
                   <div className="alerts-empty">
-                    <div style={{ fontSize: '1.5rem', marginBottom: '0.5rem' }}>🔕</div>
+                    <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '0.5rem', color: 'var(--color-text-muted)' }}><Icon name="bell-off" size={22} strokeWidth={1.25} /></div>
                     No alerts logged yet. Web system is operating normally.
                   </div>
                 ) : (
@@ -1609,9 +1610,9 @@ function App() {
       {/* Delete Monitor Confirmation Modal */}
       {isDeleteModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(178, 84, 63, 0.3)' }}>
             <div className="modal-header">
-              <h3 style={{ color: 'var(--color-red)' }}>⚠️ Delete Monitor</h3>
+              <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Delete Monitor</h3>
               <button className="modal-close" onClick={() => setIsDeleteModalOpen(false)}>×</button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -1634,9 +1635,9 @@ function App() {
       {/* Clear Logs Confirmation Modal */}
       {isClearLogsModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(178, 84, 63, 0.3)' }}>
             <div className="modal-header">
-              <h3 style={{ color: 'var(--color-red)' }}>⚠️ Clear Alert Logs</h3>
+              <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Clear Alert Logs</h3>
               <button className="modal-close" onClick={() => setIsClearLogsModalOpen(false)}>×</button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -1661,7 +1662,7 @@ function App() {
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '700px', width: '90%' }}>
             <div className="modal-header">
-              <h3>🖼️ Image Gallery: {galleryMonitorName} {galleryImages.length > 0 && `(${galleryImages.length} images)`}</h3>
+              <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="image" size={18} /> Image Gallery: {galleryMonitorName} {galleryImages.length > 0 && `(${galleryImages.length} images)`}</h3>
               <button className="modal-close" onClick={() => setIsGalleryModalOpen(false)}>×</button>
             </div>
             
@@ -1673,11 +1674,11 @@ function App() {
                 </div>
               ) : galleryError ? (
                 <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
-                  ⚠️ {galleryError}
+                  {galleryError}
                 </div>
               ) : galleryImages.length === 0 ? (
                 <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '3rem 0', fontSize: '0.95rem' }}>
-                  📷 No image tags found on this website's home page (ignoring data URIs).
+                  No image tags found on this website's home page (ignoring data URIs).
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -1756,7 +1757,7 @@ function App() {
                                   disabled={savingImageUrls[item.url]}
                                   onClick={() => handleSaveImageToServer(galleryMonitorId, item.url)}
                                 >
-                                  {savingImageUrls[item.url] ? '⏳ Saving...' : '💾 Save to Server'}
+                                  {savingImageUrls[item.url] ? 'Saving...' : 'Save to Server'}
                                 </button>
                               </div>
                             ))}
@@ -1778,8 +1779,8 @@ function App() {
                     style={{ marginRight: 'auto' }}
                   >
                     {isSavingSelected
-                      ? '⏳ Saving selected...'
-                      : `💾 Save Selected (${Object.values(selectedGalleryUrls).filter(Boolean).length})`}
+                      ? 'Saving selected...'
+                      : `Save Selected (${Object.values(selectedGalleryUrls).filter(Boolean).length})`}
                   </button>
                 )}
                 {galleryImages.length > 0 && (
@@ -1790,7 +1791,7 @@ function App() {
                     onClick={handleSaveAllImagesToServer}
                     style={{ marginRight: Object.values(selectedGalleryUrls).some(Boolean) ? 0 : 'auto' }}
                   >
-                    {isSavingAll ? '⏳ Saving all...' : '💾 Save All to Server'}
+                    {isSavingAll ? 'Saving all...' : 'Save All to Server'}
                   </button>
                 )}
                 <button type="button" className="btn btn-secondary" onClick={() => setIsGalleryModalOpen(false)}>
@@ -1807,7 +1808,7 @@ function App() {
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '800px', width: '95%' }}>
             <div className="modal-header">
-              <h3>🗺️ Site Pages: {pagesMonitorName}</h3>
+              <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="map" size={18} /> Site Pages: {pagesMonitorName}</h3>
               <button className="modal-close" onClick={() => setIsPagesModalOpen(false)}>×</button>
             </div>
 
@@ -1821,7 +1822,7 @@ function App() {
                 </div>
               ) : pagesError ? (
                 <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
-                  ⚠️ {pagesError}
+                  {pagesError}
                 </div>
               ) : pagesResult && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -1831,8 +1832,9 @@ function App() {
                     {pagesResult.limited && ` — สแกนแค่ ${pagesResult.processedCount} หน้าแรก (จำกัดไว้กันโดนเว็บบล็อก)`}
                   </p>
                   {pagesResult.blockedEarly && (
-                    <p style={{ fontSize: '0.85rem', color: 'var(--color-red)' }}>
-                      ⚠️ เว็บเริ่มตอบกลับแบบจำกัด/บล็อก (HTTP 429/403) ระบบเลยหยุดสแกนหน้าที่เหลือให้อัตโนมัติเพื่อความปลอดภัย
+                    <p style={{ fontSize: '0.85rem', color: 'var(--color-red)', display: 'flex', alignItems: 'flex-start', gap: '0.4rem' }}>
+                      <Icon name="alert-triangle" size={14} style={{ marginTop: '0.15rem' }} />
+                      <span>เว็บเริ่มตอบกลับแบบจำกัด/บล็อก (HTTP 429/403) ระบบเลยหยุดสแกนหน้าที่เหลือให้อัตโนมัติเพื่อความปลอดภัย</span>
                     </p>
                   )}
 
@@ -1851,7 +1853,7 @@ function App() {
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
                             {downPages.map((p) => (
                               <div key={p.url} style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', wordBreak: 'break-all' }}>
-                                ⚠️ <span style={{ fontFamily: 'var(--font-mono)' }}>{p.statusCode || 'Down'}</span> — {p.url} — {p.error}
+                                <span style={{ fontFamily: 'var(--font-mono)' }}>{p.statusCode || 'Down'}</span> — {p.url} — {p.error}
                               </div>
                             ))}
                           </div>
@@ -1870,7 +1872,7 @@ function App() {
                             </a>
                             {page.status === 'down' && (
                               <span style={{ fontSize: '0.75rem', color: 'var(--color-red)', fontFamily: 'var(--font-mono)' }}>
-                                ⚠️ {page.error}
+                                {page.error}
                               </span>
                             )}
                           </div>
@@ -1911,13 +1913,13 @@ function App() {
           <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', width: '100%', flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                <h2>📚 คลังการ์ตูน (Manga Library)</h2>
+                <h2>คลังการ์ตูน (Manga Library)</h2>
                 {seriesLoading && <span className="spinner-inline" title="กำลังโหลด..." />}
               </div>
               <input
                 type="text"
                 className="form-input"
-                placeholder="🔍 ค้นหาชื่อเรื่อง..."
+                placeholder="ค้นหาชื่อเรื่อง..."
                 value={librarySearch}
                 onChange={(e) => {
                   setLibrarySearch(e.target.value);
@@ -1940,7 +1942,7 @@ function App() {
                 if (completeSeriesList.length === 0 && !seriesLoading) {
                   return (
                     <div style={{ textAlign: 'center', color: 'var(--color-text-muted)', marginTop: '3rem' }}>
-                      📚 {librarySearch ? 'ไม่พบเรื่องที่ค้นหา' : 'ยังไม่มีตอนที่โหลดเสร็จ (เรื่องไหนที่มีตอนโหลดเสร็จแล้วอย่างน้อย 1 ตอนจะมาแสดงที่นี่ให้กดอ่านได้เลย)'}
+                      {librarySearch ? 'ไม่พบเรื่องที่ค้นหา' : 'ยังไม่มีตอนที่โหลดเสร็จ (เรื่องไหนที่มีตอนโหลดเสร็จแล้วอย่างน้อย 1 ตอนจะมาแสดงที่นี่ให้กดอ่านได้เลย)'}
                     </div>
                   );
                 }
@@ -1992,7 +1994,7 @@ function App() {
                                         </div>
                                         <div className="library-row-url" title={series.seriesUrl}>
                                           <a href={series.seriesUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', textDecoration: 'none' }}>
-                                            🔗 {series.seriesUrl || 'No URL'}
+                                            {series.seriesUrl || 'No URL'}
                                           </a>
                                         </div>
                                       </div>
@@ -2008,10 +2010,10 @@ function App() {
                                         <div style={{ width: `${(done / total) * 100}%`, height: '100%', backgroundColor: 'var(--color-green)' }} />
                                       </div>
                                     )}
-                                    {errors > 0 && <div style={{ color: 'var(--color-red)', fontSize: '0.75rem', marginTop: '0.2rem' }}>⚠️ มีปัญหา {errors} ตอน</div>}
+                                    {errors > 0 && <div style={{ color: 'var(--color-red)', fontSize: '0.75rem', marginTop: '0.2rem' }}>มีปัญหา {errors} ตอน</div>}
                                   </td>
                                   <td style={{ fontSize: '0.85rem' }}>
-                                    {isComplete ? <span style={{ color: 'var(--color-green)' }}>✅ สมบูรณ์</span> : <span style={{ color: 'var(--color-yellow)' }}>⏳ รอโหลด</span>}
+                                    {isComplete ? <span style={{ color: 'var(--color-green)' }}>สมบูรณ์</span> : <span style={{ color: 'var(--color-yellow)' }}>รอโหลด</span>}
                                   </td>
                                   <td style={{ textAlign: 'right' }}>
                                     <div style={{ display: 'flex', gap: '0.4rem', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
@@ -2021,10 +2023,10 @@ function App() {
                                         </button>
                                       )}
                                       <button className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => setExpandedCrawlId(prev => prev === series.id ? '' : series.id)}>
-                                        {expandedCrawlId === series.id ? '▲ ซ่อนตอน' : `👁️ ตอน (${done})`}
+                                        {expandedCrawlId === series.id ? '▲ ซ่อนตอน' : `ตอน (${done})`}
                                       </button>
                                       <button className="btn btn-primary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }} onClick={() => handleExportSeries(series.id)} disabled={isExportingSeries}>
-                                        {isExportingSeries ? '⏳' : '💾 Export'}
+                                        {isExportingSeries ? '...' : 'Export'}
                                       </button>
                                     </div>
                                   </td>
@@ -2145,7 +2147,7 @@ function App() {
       {currentView === 'downloader' && (
         <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
-            <h3>📖 Manga Downloader</h3>
+            <h3>Manga Downloader</h3>
           </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxHeight: '78vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
@@ -2159,7 +2161,7 @@ function App() {
                   tab) until it finishes or is stopped. */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', border: '1px solid var(--border-color)', borderRadius: '0.75rem', padding: '0.75rem 1rem' }}>
                 <div>
-                  <h4 style={{ margin: '0 0 0.25rem 0', fontSize: '0.95rem' }}>🌐 ดึงทั้งเว็บอัตโนมัติ</h4>
+                  <h4 style={{ margin: '0 0 0.25rem 0', fontSize: '0.95rem' }}>ดึงทั้งเว็บอัตโนมัติ</h4>
                   <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
                     วางลิงก์หน้าแรกของเว็บมังงะ (เช่น https://www.go-manga.com/) บอทจะไล่หาทุกเรื่องในเว็บ (ทุกหน้า) แล้วดึงทุกตอนของทุกเรื่องให้เอง ทำงานอยู่บนเซิร์ฟเวอร์ - ปิดแท็บ/เบราว์เซอร์นี้ได้ งานยังทำงานต่อจนกว่าจะเสร็จหรือสั่งหยุด (แต่ถ้าปิดเครื่องที่รันเซิร์ฟเวอร์เองจะหยุดตามไปด้วย)
                   </p>
@@ -2177,7 +2179,7 @@ function App() {
                       required
                     />
                     <button type="submit" className="btn btn-primary" disabled={isStartingCrawl}>
-                      {isStartingCrawl ? '⏳ กำลังเริ่ม...' : '🚀 เริ่มดึงทั้งเว็บ'}
+                      {isStartingCrawl ? 'กำลังเริ่ม...' : 'เริ่มดึงทั้งเว็บ'}
                     </button>
                   </div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
@@ -2204,7 +2206,7 @@ function App() {
                             <span>โหลดไปแล้ว {crawl.stats.chaptersDownloaded} ตอน</span>
                           </div>
                           {crawl.currentSeriesName && crawl.status === 'running' && (
-                            <div style={{ color: 'var(--color-cyan)' }}>🔄 กำลังทำเรื่อง: {crawl.currentSeriesName}</div>
+                            <div style={{ color: 'var(--color-cyan)' }}>กำลังทำเรื่อง: {crawl.currentSeriesName}</div>
                           )}
                           {crawl.lastError && (
                             <div style={{ color: 'var(--color-yellow)', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>{crawl.lastError}</div>
@@ -2212,11 +2214,11 @@ function App() {
                           <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
                             {crawl.status === 'running' ? (
                               <button type="button" className="btn btn-secondary" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleStopCrawl(crawl.id)}>
-                                ⏸️ หยุด
+                                หยุด
                               </button>
                             ) : crawl.status !== 'done' && (
                               <button type="button" className="btn btn-secondary" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleResumeCrawl(crawl.id)}>
-                                ▶️ ทำต่อ
+                                ทำต่อ
                               </button>
                             )}
                             {totalSeries > 0 && (
@@ -2230,7 +2232,7 @@ function App() {
                               </button>
                             )}
                             <button type="button" className="btn btn-danger" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleDeleteCrawl(crawl.id)}>
-                              🗑️ ลบงานนี้
+                              ลบงานนี้
                             </button>
                           </div>
 
@@ -2242,11 +2244,13 @@ function App() {
                                 const matchedSeries = seriesList.find(s => s.seriesUrl === item.url);
                                 const chapters = matchedSeries?.chapters || [];
                                 const doneChapters = chapters.filter(c => c.status === 'done').length;
-                                const statusIcon = isCurrent ? '🔄' : isProcessed ? '✅' : '⏳';
+                                const statusIcon = isCurrent ? 'refresh' : isProcessed ? 'check' : 'clock';
                                 const statusColor = isCurrent ? 'var(--color-cyan)' : isProcessed ? 'var(--color-green)' : 'var(--color-text-muted)';
                                 return (
-                                  <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', color: statusColor }}>
-                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{statusIcon} {item.name}</span>
+                                  <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', color: statusColor }}>
+                                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      <Icon name={statusIcon} size={12} /> {item.name}
+                                    </span>
                                     <span style={{ flexShrink: 0 }}>{chapters.length > 0 ? `${doneChapters}/${chapters.length} ตอน` : (isProcessed ? '0 ตอน' : '')}</span>
                                   </div>
                                 );
@@ -2261,7 +2265,7 @@ function App() {
               </div>
 
               {seriesError && (
-                <div style={{ color: 'var(--color-red)', fontSize: '0.9rem' }}>⚠️ {seriesError}</div>
+                <div style={{ color: 'var(--color-red)', fontSize: '0.9rem' }}>{seriesError}</div>
               )}
 
               {/* Add Series Form */}
@@ -2277,7 +2281,7 @@ function App() {
                     required
                   />
                   <button type="submit" className="btn btn-primary" disabled={isAddingSeries}>
-                    {isAddingSeries ? '⏳ Adding...' : '+ Add Series'}
+                    {isAddingSeries ? 'Adding...' : '+ Add Series'}
                   </button>
                 </div>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }}>
@@ -2286,11 +2290,11 @@ function App() {
                 </label>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะวนกลับมาโหลดตอนที่มีปัญหา (error/โหลดไม่ครบ) ให้เองอัตโนมัติทุก ~10 นาที ไม่ต้องกดเอง">
                   <input type="checkbox" checked={autoRetryEnabled} onChange={(e) => handleToggleAutoRetry(e.target.checked)} />
-                  🤖 ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
+                  ให้บอทลองโหลดตอนที่มีปัญหาใหม่เองอัตโนมัติ
                 </label>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer', alignSelf: 'flex-start' }} title="บอทจะเช็คเรื่องที่โหลดไว้ทุก ~3 ชั่วโมงว่ามีตอนใหม่ออกไหม ถ้ามีก็โหลดมาเพิ่มให้เองอัตโนมัติ (ไม่โหลดตอนเดิมซ้ำ)">
                   <input type="checkbox" checked={autoUpdateEnabled} onChange={(e) => handleToggleAutoUpdate(e.target.checked)} />
-                  🔄 ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
+                  ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
                 </label>
                 <button
                   type="button"
@@ -2300,7 +2304,7 @@ function App() {
                   title="ดาวน์โหลดรูปปกของทุกเรื่อง แยกเก็บไว้ต่างหาก - เรื่องที่มีปกอยู่แล้วจะไม่โหลดซ้ำ"
                   onClick={handleDownloadAllCovers}
                 >
-                  {isDownloadingCovers ? '⏳ กำลังดาวน์โหลดปก...' : '🖼️ ดาวน์โหลดปกทั้งหมด'}
+                  {isDownloadingCovers ? 'กำลังดาวน์โหลดปก...' : 'ดาวน์โหลดปกทั้งหมด'}
                 </button>
               </form>
 
@@ -2319,7 +2323,7 @@ function App() {
                     {(() => {
                       const incompleteSeriesList = seriesList.filter(s => !s.chapters || s.chapters.length === 0 || s.chapters.some(c => c.status !== 'done'));
                       if (incompleteSeriesList.length === 0 && seriesList.length > 0) {
-                        return <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '1rem', fontSize: '0.85rem' }}>✅ ไม่มีคิวที่กำลังโหลด (โหลดเสร็จหมดแล้วจะอยู่ในคลัง)</div>;
+                        return <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '1rem', fontSize: '0.85rem' }}>ไม่มีคิวที่กำลังโหลด (โหลดเสร็จหมดแล้วจะอยู่ในคลัง)</div>;
                       }
                       return incompleteSeriesList.map(s => (
                       <div
@@ -2328,7 +2332,7 @@ function App() {
                         className={`series-list-item ${selectedSeriesId === s.id ? 'active' : ''}`}
                       >
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          📚 {s.name} <span style={{ opacity: 0.7, fontSize: '0.75rem' }}>({(s.chapters || []).length})</span>
+                          {s.name} <span style={{ opacity: 0.7, fontSize: '0.75rem' }}>({(s.chapters || []).length})</span>
                         </span>
                         <button
                           className="btn btn-danger btn-icon-only"
@@ -2336,7 +2340,7 @@ function App() {
                           title="Delete series"
                           onClick={(e) => { e.stopPropagation(); handleDeleteSeries(s.id, s.name); }}
                         >
-                          🗑️
+                          <Icon name="trash" size={12} />
                         </button>
                       </div>
                       ));
@@ -2365,7 +2369,7 @@ function App() {
                               required
                             />
                             <button type="submit" className="btn btn-primary" disabled={isDiscovering}>
-                              {isDiscovering ? '⏳ กำลังค้นหา...' : '🔍 ค้นหาตอนทั้งหมดอัตโนมัติ'}
+                              {isDiscovering ? 'กำลังค้นหา...' : 'ค้นหาตอนทั้งหมดอัตโนมัติ'}
                             </button>
                           </form>
 
@@ -2387,7 +2391,7 @@ function App() {
                                   disabled={isScrapingAll}
                                   onClick={() => handleScrapeAllChapters(series.id)}
                                 >
-                                  {isScrapingAll ? '⏳ กำลังโหลดทุกตอน...' : '⬇️ Scrape ทุกตอนที่ยังไม่เสร็จ'}
+                                  {isScrapingAll ? 'กำลังโหลดทุกตอน...' : 'Scrape ทุกตอนที่ยังไม่เสร็จ'}
                                 </button>
                               )}
                               {(series.chapters || []).some(c => ['error', 'partial', 'blocked'].includes(c.status)) && (
@@ -2398,7 +2402,7 @@ function App() {
                                   disabled={isRetryingProblems || isScrapingAll}
                                   onClick={() => handleRetryProblemChapters(series.id)}
                                 >
-                                  {isRetryingProblems ? '⏳ กำลังลองตอนที่มีปัญหา...' : '🔁 ลองตอนที่มีปัญหาใหม่'}
+                                  {isRetryingProblems ? 'กำลังลองตอนที่มีปัญหา...' : 'ลองตอนที่มีปัญหาใหม่'}
                                 </button>
                               )}
                               {series.seriesUrl && (
@@ -2410,7 +2414,7 @@ function App() {
                                   title="เช็คว่ามีตอนใหม่ออกไหม แล้วโหลดเฉพาะตอนใหม่ (ไม่โหลดตอนเดิมซ้ำ)"
                                   onClick={() => handleCheckUpdates(series.id)}
                                 >
-                                  {isCheckingUpdates ? '⏳ กำลังเช็คตอนใหม่...' : '🔄 เช็คตอนใหม่'}
+                                  {isCheckingUpdates ? 'กำลังเช็คตอนใหม่...' : 'เช็คตอนใหม่'}
                                 </button>
                               )}
                               <button
@@ -2420,7 +2424,7 @@ function App() {
                                 disabled={isFetchingMetadata}
                                 onClick={() => handleFetchSeriesMetadata(series.id)}
                               >
-                                {isFetchingMetadata ? '⏳ กำลังดึงข้อมูล...' : series.metadata ? '🏷️ รีเฟรชข้อมูล SEO' : '🏷️ ดึงข้อมูล SEO'}
+                                {isFetchingMetadata ? 'กำลังดึงข้อมูล...' : series.metadata ? 'รีเฟรชข้อมูล SEO' : 'ดึงข้อมูล SEO'}
                               </button>
                               {(series.chapters || []).length > 1 && (
                                 <button
@@ -2431,7 +2435,7 @@ function App() {
                                   title="เช็คว่าตอนไหนหายไปจากลำดับบ้าง (ไม่ได้เช็คแค่โหลดเสร็จหรือยัง แต่เช็คว่ามีตอนนั้นอยู่ในระบบหรือเปล่า)"
                                   onClick={() => handleCheckChapterGaps(series.id)}
                                 >
-                                  {isCheckingGaps ? '⏳ กำลังเช็ค...' : '🔎 เช็คตอนที่ขาดหาย'}
+                                  {isCheckingGaps ? 'กำลังเช็ค...' : 'เช็คตอนที่ขาดหาย'}
                                 </button>
                               )}
                               {(series.chapters || []).some(c => c.status === 'done') && (
@@ -2442,7 +2446,7 @@ function App() {
                                   disabled={isCleaningDuplicates}
                                   onClick={() => handleCleanDuplicateImages(series.id)}
                                 >
-                                  {isCleaningDuplicates ? '⏳ กำลังตรวจสอบ...' : '🧹 ลบรูปโฆษณา/เครดิตซ้ำ'}
+                                  {isCleaningDuplicates ? 'กำลังตรวจสอบ...' : 'ลบรูปโฆษณา/เครดิตซ้ำ'}
                                 </button>
                               )}
                               {(series.chapters || []).some(c => c.status === 'done') && (
@@ -2453,7 +2457,7 @@ function App() {
                                   disabled={isExportingSeries}
                                   onClick={() => handleExportSeries(series.id)}
                                 >
-                                  {isExportingSeries ? '⏳ กำลัง Export...' : '📤 Export ตอนที่เสร็จแล้ว'}
+                                  {isExportingSeries ? 'กำลัง Export...' : 'Export ตอนที่เสร็จแล้ว'}
                                 </button>
                               )}
                             </div>
@@ -2511,7 +2515,7 @@ function App() {
                                 required
                               />
                               <button type="submit" className="btn btn-secondary" disabled={isAddingChapter}>
-                                {isAddingChapter ? '⏳' : '+ Add Chapter'}
+                                {isAddingChapter ? '...' : '+ Add Chapter'}
                               </button>
                             </form>
                           )}
@@ -2530,7 +2534,7 @@ function App() {
                                   {issueCount > 0 && <span style={{ color: 'var(--color-yellow)' }}>มีปัญหา {issueCount} ตอน</span>}
                                 </div>
                                 <div style={{ color: 'var(--color-cyan)', minHeight: '1.1rem' }}>
-                                  {scrapingChapter && `🔄 กำลังโหลดตอน: ${scrapingChapter.name}`}
+                                  {scrapingChapter && `กำลังโหลดตอน: ${scrapingChapter.name}`}
                                 </div>
                               </div>
                             );
@@ -2596,7 +2600,7 @@ function App() {
                                         disabled={isScraping}
                                         onClick={() => handleScrapeChapter(series.id, chapter.id)}
                                       >
-                                        {isScraping ? '⏳ Downloading...' : chapter.images.length > 0 ? '🔄 Re-scrape' : '⬇️ Scrape & Download'}
+                                        {isScraping ? 'Downloading...' : chapter.images.length > 0 ? 'Re-scrape' : 'Scrape & Download'}
                                       </button>
                                       {chapter.images && chapter.images.length > 0 && (
                                         <button
@@ -2612,7 +2616,7 @@ function App() {
                                         style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
                                         onClick={() => handleDeleteChapter(series.id, chapter.id, chapter.name)}
                                       >
-                                        🗑️
+                                        <Icon name="trash" size={13} />
                                       </button>
                                     </div>
                                   </div>
@@ -2647,7 +2651,7 @@ function App() {
                                               style={{ padding: '0.1rem 0.35rem', fontSize: '0.65rem', flexShrink: 0 }}
                                               onClick={() => handleDeleteChapterImage(series.id, chapter.id, img.filename)}
                                             >
-                                              🗑️
+                                              <Icon name="trash" size={11} />
                                             </button>
                                           </div>
                                         </div>
@@ -2689,7 +2693,7 @@ function App() {
       {currentView === 'gallery' && (
         <div style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div className="modal-header" style={{ padding: '0 0 1.25rem 0', borderBottom: 'none' }}>
-            <h3>📂 Saved Images Gallery</h3>
+            <h3>Saved Images Gallery</h3>
           </div>
           
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', maxHeight: '75vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
@@ -2700,11 +2704,11 @@ function App() {
                 </div>
               ) : savedError ? (
                 <div style={{ color: 'var(--color-red)', textAlign: 'center', padding: '2rem 0', fontSize: '0.95rem' }}>
-                  ⚠️ {savedError}
+                  {savedError}
                 </div>
               ) : savedImages.length === 0 ? (
                 <div style={{ color: 'var(--color-text-muted)', textAlign: 'center', padding: '4rem 0', fontSize: '0.95rem' }}>
-                  📂 No images saved yet. Open a website's image gallery and click "Save to Server" to add photos.
+                  No images saved yet. Open a website's image gallery and click "Save to Server" to add photos.
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -2716,7 +2720,7 @@ function App() {
                         className={`tab-btn ${activeSavedTab === id ? 'active' : ''}`}
                         onClick={() => { setActiveSavedTab(id); setSelectedImageIds({}); }}
                       >
-                        🌐 {group.name} ({group.items.length})
+                        {group.name} ({group.items.length})
                       </button>
                     ))}
                   </div>
@@ -2749,7 +2753,7 @@ function App() {
                       <div key={id} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
                           <h4 style={{ fontSize: '1.1rem', color: 'var(--color-cyan)', margin: 0 }}>
-                            🌐 {group.name} <span style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({group.items.length} images)</span>
+                            {group.name} <span style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>({group.items.length} images)</span>
                           </h4>
                           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                             {selectedCount > 0 && (
@@ -2759,7 +2763,7 @@ function App() {
                                 disabled={isBulkDeleting}
                                 onClick={handleDeleteSelectedImages}
                               >
-                                {isBulkDeleting ? '⏳ Deleting...' : `🗑️ Delete Selected (${selectedCount})`}
+                                {isBulkDeleting ? 'Deleting...' : `Delete Selected (${selectedCount})`}
                               </button>
                             )}
                             <button
@@ -2767,7 +2771,7 @@ function App() {
                               style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
                               onClick={() => handleDeleteSavedGroup(id, group.name)}
                             >
-                              🗑️ Delete All ({group.items.length} images)
+                              Delete All ({group.items.length} images)
                             </button>
                           </div>
                         </div>
@@ -2813,7 +2817,7 @@ function App() {
                                           style={{ flex: 1, padding: '0.2rem 0', fontSize: '0.65rem' }}
                                           title="View full size image"
                                         >
-                                          🔗 View
+                                          View
                                         </a>
                                         <button
                                           className="btn btn-danger"
@@ -2821,7 +2825,7 @@ function App() {
                                           onClick={() => handleDeleteSavedImage(item.id)}
                                           title="Delete from server"
                                         >
-                                          🗑️ Delete
+                                          Delete
                                         </button>
                                       </div>
                                     </div>
