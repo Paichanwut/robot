@@ -36,6 +36,12 @@ const MANGA_DIR = path.join(SAVED_DIR, 'manga');
 if (!fs.existsSync(MANGA_DIR)) {
   fs.mkdirSync(MANGA_DIR, { recursive: true });
 }
+// Series cover art, kept separate from chapter pages under MANGA_DIR - one
+// file per series, named by series id so it survives a title/name change.
+const COVERS_DIR = path.join(SAVED_DIR, 'covers');
+if (!fs.existsSync(COVERS_DIR)) {
+  fs.mkdirSync(COVERS_DIR, { recursive: true });
+}
 // Human-readable export target: <series title>/<chapter name>/, separate
 // from the opaque id-keyed folders under MANGA_DIR that the scraper itself
 // uses for storage/dedup bookkeeping.
@@ -1638,6 +1644,34 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
   return meta;
 }
 
+// Downloads a series' cover art exactly once. Guarded by whether a cover file
+// already sits on disk for this series id - not by whether metadata was just
+// (re-)fetched - so calling this after every SEO metadata refresh (which can
+// happen many times over a series' life) never re-downloads the same cover.
+async function downloadCoverImageIfMissing(series) {
+  const coverUrl = series.metadata?.coverImageUrl;
+  if (!coverUrl) return;
+
+  const existingPath = series.metadata.coverImagePath;
+  if (existingPath && fs.existsSync(path.join(SAVED_DIR, existingPath))) return;
+
+  try {
+    const download = await fetchImageWithRetry(coverUrl, clearanceHeaders(coverUrl, {
+      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+    }));
+    if (download.blocked) return;
+
+    const contentType = download.response.headers.get('content-type');
+    const ext = getExtension(coverUrl, contentType);
+    const buffer = Buffer.from(await download.response.arrayBuffer());
+    const fileName = `${series.id}.${ext}`;
+    fs.writeFileSync(path.join(COVERS_DIR, fileName), buffer);
+    series.metadata.coverImagePath = `covers/${fileName}`;
+  } catch (err) {
+    console.error(`Failed to download cover image for series ${series.id}:`, err.message);
+  }
+}
+
 // Turns a series/chapter name into a filesystem-safe folder name for export
 // - strips characters that are invalid (or awkward) across macOS/Linux/
 // Windows rather than just the strict minimum, since exported folders are
@@ -2626,11 +2660,26 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
 
     writeDb(db);
 
+    // Same as check-updates: don't just list what was found, actually download
+    // it too - otherwise a freshly-discovered series just sits there pending
+    // until someone remembers to click "Scrape ทุกตอนที่ยังไม่เสร็จ".
+    let scrape = { scrapedCount: 0, blockedEarly: false };
+    if (!scrapingSeries[id]) {
+      scrapingSeries[id] = true;
+      try {
+        scrape = await runScrapeAllForSeries(db, series);
+        writeDb(db);
+      } finally {
+        scrapingSeries[id] = false;
+      }
+    }
+
     res.json({
       discoveredCount: result.discoveredCount,
       addedCount: result.addedCount,
       skippedCount: result.discoveredCount - result.addedCount,
-      addedChapters: []
+      addedChapters: [],
+      ...scrape
     });
   } catch (error) {
     console.error(`Error discovering chapters from ${formattedUrl}:`, error);
@@ -2668,6 +2717,7 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
   if (!series.metadata) {
     series.metadata = extractSeriesMetadataFromHtml(html, listingUrl);
     series.metadataFetchedAt = new Date().toISOString();
+    await downloadCoverImageIfMissing(series);
   }
 
   const discovered = discoverChapterLinksFromHtml(html, listingUrl);
@@ -2739,12 +2789,48 @@ app.post('/api/series/:id/fetch-metadata', async (req, res) => {
 
     series.metadata = extractSeriesMetadataFromHtml(html, targetUrl);
     series.metadataFetchedAt = new Date().toISOString();
+    await downloadCoverImageIfMissing(series);
     writeDb(db);
 
     res.json({ metadata: series.metadata, metadataFetchedAt: series.metadataFetchedAt });
   } catch (error) {
     console.error(`Error fetching SEO metadata from ${targetUrl}:`, error);
     res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างดึงข้อมูลเรื่อง' });
+  }
+});
+
+let downloadingCovers = false; // guards against two bulk backfills running at once
+
+// Backfills cover art for every series that already has a known
+// coverImageUrl (from a previous SEO metadata fetch) but no downloaded file
+// yet - downloadCoverImageIfMissing() is itself a no-op per series once its
+// cover exists on disk, so re-running this is always safe and cheap.
+app.post('/api/series/download-covers', async (req, res) => {
+  const db = readDb();
+  if (downloadingCovers) {
+    return res.status(429).json({ error: 'กำลังดาวน์โหลดปกอยู่แล้ว รอสักครู่' });
+  }
+
+  downloadingCovers = true;
+  try {
+    const candidates = (db.series || []).filter(s => s.metadata?.coverImageUrl);
+    let downloaded = 0;
+    for (const series of candidates) {
+      const hadPath = series.metadata.coverImagePath;
+      await downloadCoverImageIfMissing(series);
+      if (!hadPath && series.metadata.coverImagePath) downloaded++;
+    }
+    writeDb(db);
+    res.json({
+      checked: candidates.length,
+      downloaded,
+      skippedNoMetadata: (db.series || []).length - candidates.length
+    });
+  } catch (error) {
+    console.error('Error backfilling cover images:', error);
+    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างดาวน์โหลดปก' });
+  } finally {
+    downloadingCovers = false;
   }
 });
 
@@ -2930,6 +3016,7 @@ app.post('/api/series/:id/export', async (req, res) => {
         if (!disallowed && html) {
           series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
           series.metadataFetchedAt = new Date().toISOString();
+          await downloadCoverImageIfMissing(series);
         }
       } catch (err) {
         console.error(`Export: failed to fetch SEO metadata for series ${id}:`, err);
@@ -3165,11 +3252,12 @@ app.post('/api/series/:id/check-updates', async (req, res) => {
     if (result.disallowed) return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
     if (result.fetchFailed) return res.status(502).json({ error: 'เปิดหน้ารวมตอนไม่ได้' });
 
-    let scrape = { scrapedCount: 0, blockedEarly: false };
-    if (result.addedCount > 0) {
-      scrape = await runScrapeAllForSeries(db, series);
-      writeDb(db);
-    }
+    // Not gated on result.addedCount: a chapter added on a previous check that
+    // never finished downloading (still 'pending'/errored) won't show up as
+    // "new" here since it's already tracked by URL, but it still needs to be
+    // downloaded - runScrapeAllForSeries is a no-op if nothing is eligible.
+    const scrape = await runScrapeAllForSeries(db, series);
+    writeDb(db);
     res.json({ newChapters: result.addedCount, ...scrape });
   } catch (error) {
     res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างเช็คตอนใหม่' });
@@ -3443,6 +3531,7 @@ async function runSiteCrawl(crawlId) {
           if (!series.metadata) {
             series.metadata = extractSeriesMetadataFromHtml(html, nextLink.url);
             series.metadataFetchedAt = new Date().toISOString();
+            await downloadCoverImageIfMissing(series);
           }
 
           const discoveredChapters = discoverChapterLinksFromHtml(html, nextLink.url);

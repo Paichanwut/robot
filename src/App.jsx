@@ -110,6 +110,7 @@ function App() {
   const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
   const [isExportingSeries, setIsExportingSeries] = useState(false);
   const [isCleaningDuplicates, setIsCleaningDuplicates] = useState(false);
+  const [isDownloadingCovers, setIsDownloadingCovers] = useState(false);
   const [showSeriesMetadata, setShowSeriesMetadata] = useState(false);
   const [expandedLibrarySeoIds, setExpandedLibrarySeoIds] = useState({});
   // A series can have hundreds of chapters - rendering every single one as a
@@ -403,7 +404,7 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to discover chapters');
 
-      alert(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''}`);
+      alert(`✓ พบ ${data.discoveredCount} ตอน — เพิ่มใหม่ ${data.addedCount} ตอน${data.skippedCount > 0 ? ` (ข้าม ${data.skippedCount} ตอนที่มีอยู่แล้ว)` : ''} — กำลังโหลดให้แล้ว (โหลดไป ${data.scrapedCount} ครั้ง)`);
       fetchSeries();
     } catch (err) {
       alert(err.message);
@@ -569,6 +570,25 @@ function App() {
       alert(err.message);
     } finally {
       setIsCheckingUpdates(false);
+    }
+  };
+
+  // Backfills cover art for every series that has a known cover URL but no
+  // downloaded file yet - safe to click repeatedly, each series only ever
+  // downloads its cover once.
+  const handleDownloadAllCovers = async () => {
+    if (isDownloadingCovers) return;
+    setIsDownloadingCovers(true);
+    try {
+      const res = await fetch('/api/series/download-covers', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to download covers');
+      alert(`✓ เช็คแล้ว ${data.checked} เรื่อง — ดาวน์โหลดปกใหม่ ${data.downloaded} เรื่อง`);
+      fetchSeries();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setIsDownloadingCovers(false);
     }
   };
 
@@ -1917,6 +1937,15 @@ function App() {
                               <React.Fragment key={series.id}>
                                 <tr style={{ borderBottom: '1px solid var(--border-color)', backgroundColor: 'var(--bg-secondary)', transition: 'background-color 0.2s' }}>
                                   <td style={{ padding: '0.6rem 0.75rem', maxWidth: '300px' }}>
+                                    <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
+                                      {series.metadata?.coverImagePath && (
+                                        <img
+                                          src={`/api/saved-assets/${series.metadata.coverImagePath}`}
+                                          alt=""
+                                          style={{ width: '36px', height: '50px', objectFit: 'cover', borderRadius: '0.25rem', flexShrink: 0 }}
+                                        />
+                                      )}
+                                      <div>
                                     <div style={{ fontWeight: '500', color: 'var(--color-text)', fontSize: '0.95rem', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }} title={series.name}>
                                       {series.name}
                                     </div>
@@ -1924,6 +1953,8 @@ function App() {
                                       <a href={series.seriesUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-blue)', textDecoration: 'none' }}>
                                         🔗 {series.seriesUrl || 'No URL'}
                                       </a>
+                                    </div>
+                                      </div>
                                     </div>
                                   </td>
                                   <td style={{ padding: '0.6rem 0.75rem', width: '200px' }}>
@@ -2220,6 +2251,16 @@ function App() {
                   <input type="checkbox" checked={autoUpdateEnabled} onChange={(e) => handleToggleAutoUpdate(e.target.checked)} />
                   🔄 ให้บอทเช็คตอนใหม่ของเรื่องเก่าแล้วโหลดเพิ่มเองอัตโนมัติ
                 </label>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', alignSelf: 'flex-start' }}
+                  disabled={isDownloadingCovers}
+                  title="ดาวน์โหลดรูปปกของทุกเรื่อง แยกเก็บไว้ต่างหาก - เรื่องที่มีปกอยู่แล้วจะไม่โหลดซ้ำ"
+                  onClick={handleDownloadAllCovers}
+                >
+                  {isDownloadingCovers ? '⏳ กำลังดาวน์โหลดปก...' : '🖼️ ดาวน์โหลดปกทั้งหมด'}
+                </button>
               </form>
 
               {seriesLoading ? (
