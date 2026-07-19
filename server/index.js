@@ -89,33 +89,79 @@ const defaultDb = {
 };
 
 // ---------------------------------------------------------------------------
-// Persistence: the whole app's state (monitors, logs, saved images, manga
-// series/chapters, site crawls) is one JSON-shaped object, same as before -
-// every route handler still just calls readDb()/writeDb(db) exactly like it
-// always has. What changed is what's *underneath* those two functions:
+// Persistence, two tiers:
 //
-//   - readDb() used to re-read and JSON.parse the entire db.json file on
-//     every single call (even plain GETs) - it now just returns an
-//     in-memory object, so reads are free.
-//   - writeDb() used to fs.writeFileSync() the whole file as plain text,
-//     which is not atomic - a crash mid-write left a truncated/corrupt file,
-//     and the old readDb() reacted to that by silently resetting to an
-//     empty default DB (losing everything). It now commits inside a SQLite
-//     transaction (WAL mode), so a write either fully lands or doesn't
-//     happen at all - no more partial/corrupt state possible.
+//  1. "store" - one JSON blob row, exactly as before, for monitors/logs/saved
+//     gallery images/site-crawls/settings. Small, never grows past a few MB,
+//     never showed a size or write-contention problem - left alone.
 //
-// On first run after this change, any existing server/data/db.json is
-// migrated in once and left on disk untouched (not deleted) as a safety net.
+//  2. Manga data (series/chapters/images) - real relational tables, not part
+//     of the blob. This is the part that actually grows without bound (tens
+//     of thousands of image rows) and the part where a write used to mean
+//     "re-serialize and overwrite EVERYTHING, for every series, on every
+//     single chapter/image saved" - the exact mechanism behind a real
+//     incident where one process's write clobbered another's unrelated
+//     change moments earlier just because both held a full-collection
+//     snapshot. saveSeries(series) below writes only that one series' rows;
+//     it can never touch another series' data no matter what else is
+//     concurrently mutating it.
+//
+// Business logic is unchanged: findSeries()/discoverAndAddNewChapters()/
+// scrapeChapterCore()/etc. still work on plain nested JS objects
+// (`series.chapters.push(...)`, `chapter.status = 'done'`) exactly like
+// before. readDb().series is just that same in-memory array, kept in sync
+// with the tables through saveSeries()/deleteSeriesRow() instead of one
+// blob-wide writeDb().
 // ---------------------------------------------------------------------------
 
 const SQLITE_FILE = path.join(DATA_DIR, 'app.db');
 const sqliteDb = new Database(SQLITE_FILE);
 sqliteDb.pragma('journal_mode = WAL');
+sqliteDb.pragma('foreign_keys = ON');
 sqliteDb.exec(`
   CREATE TABLE IF NOT EXISTS store (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     data TEXT NOT NULL
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS series (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    seriesUrl TEXT,
+    useStealth INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL,
+    metadataFetchedAt TEXT,
+    lastUpdateCheckAt TEXT,
+    lastAutoRetryAt TEXT,
+    autoRetryStreak INTEGER NOT NULL DEFAULT 0,
+    metadataJson TEXT,
+    sourceUrlsJson TEXT,
+    dedupStateJson TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS chapters (
+    id TEXT PRIMARY KEY,
+    seriesId TEXT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    orderIndex INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    scrapedAt TEXT,
+    retryCount INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_chapters_series ON chapters(seriesId);
+
+  CREATE TABLE IF NOT EXISTS images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chapterId TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    orderIndex INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    relativePath TEXT NOT NULL,
+    originalUrl TEXT,
+    contentHash TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_images_chapter ON images(chapterId);
 `);
 const selectStoreStmt = sqliteDb.prepare('SELECT data FROM store WHERE id = 1');
 const upsertStoreStmt = sqliteDb.prepare(`
@@ -123,15 +169,18 @@ const upsertStoreStmt = sqliteDb.prepare(`
   ON CONFLICT(id) DO UPDATE SET data = excluded.data
 `);
 
-// In-memory copy of the whole app state - readDb() just returns this
-// reference; writeDb() replaces it and persists to SQLite.
+// In-memory copy of the non-series app state - readDb() just returns this
+// reference (with a fresh `series` array attached); writeDb() replaces it
+// and persists to SQLite. Series data itself lives in seriesCache below.
 let dbCache = null;
 
 function loadDbFromDisk() {
   const row = selectStoreStmt.get();
   if (row) {
     try {
-      return JSON.parse(row.data);
+      const data = JSON.parse(row.data);
+      delete data.series; // now lives in the series/chapters/images tables
+      return data;
     } catch (error) {
       // The DB itself is corrupt, not just a stale snapshot of it - this
       // should be effectively impossible with SQLite's atomic writes, so
@@ -141,35 +190,276 @@ function loadDbFromDisk() {
   }
 
   // First run against this SQLite file - migrate the legacy db.json in if
-  // it's there, otherwise start fresh.
+  // it's there, otherwise start fresh. Legacy `series` (if any) is
+  // intentionally NOT migrated into the new tables - manga data starts
+  // clean under the new schema; re-run discover/check-updates per series
+  // to repopulate it.
   if (fs.existsSync(DB_FILE)) {
-    console.log('Migrating existing db.json into SQLite storage...');
+    console.log('Migrating existing db.json into SQLite storage (series left out - starts fresh under the new schema)...');
     const legacyData = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    delete legacyData.series;
     upsertStoreStmt.run(JSON.stringify(legacyData));
     return legacyData;
   }
 
   const initial = JSON.parse(JSON.stringify(defaultDb));
+  delete initial.series;
   upsertStoreStmt.run(JSON.stringify(initial));
   return initial;
 }
 
-// Read Database
+// --- Series/chapters/images repository -------------------------------------
+
+const selectSeriesRowsStmt = sqliteDb.prepare('SELECT * FROM series ORDER BY createdAt');
+const selectAllChaptersStmt = sqliteDb.prepare('SELECT * FROM chapters ORDER BY seriesId, orderIndex');
+const selectAllImagesStmt = sqliteDb.prepare('SELECT * FROM images ORDER BY chapterId, orderIndex');
+const deleteSeriesStmt = sqliteDb.prepare('DELETE FROM series WHERE id = ?');
+const deleteChaptersForSeriesStmt = sqliteDb.prepare('DELETE FROM chapters WHERE seriesId = ?');
+const upsertSeriesStmt = sqliteDb.prepare(`
+  INSERT INTO series (id, name, seriesUrl, useStealth, createdAt, metadataFetchedAt, lastUpdateCheckAt, lastAutoRetryAt, autoRetryStreak, metadataJson, sourceUrlsJson, dedupStateJson)
+  VALUES (@id, @name, @seriesUrl, @useStealth, @createdAt, @metadataFetchedAt, @lastUpdateCheckAt, @lastAutoRetryAt, @autoRetryStreak, @metadataJson, @sourceUrlsJson, @dedupStateJson)
+  ON CONFLICT(id) DO UPDATE SET
+    name = excluded.name, seriesUrl = excluded.seriesUrl, useStealth = excluded.useStealth,
+    metadataFetchedAt = excluded.metadataFetchedAt, lastUpdateCheckAt = excluded.lastUpdateCheckAt,
+    lastAutoRetryAt = excluded.lastAutoRetryAt, autoRetryStreak = excluded.autoRetryStreak,
+    metadataJson = excluded.metadataJson, sourceUrlsJson = excluded.sourceUrlsJson, dedupStateJson = excluded.dedupStateJson
+`);
+const insertChapterStmt = sqliteDb.prepare(`
+  INSERT INTO chapters (id, seriesId, orderIndex, name, url, status, error, scrapedAt, retryCount)
+  VALUES (@id, @seriesId, @orderIndex, @name, @url, @status, @error, @scrapedAt, @retryCount)
+`);
+const insertImageStmt = sqliteDb.prepare(`
+  INSERT INTO images (chapterId, orderIndex, filename, relativePath, originalUrl, contentHash)
+  VALUES (@chapterId, @orderIndex, @filename, @relativePath, @originalUrl, @contentHash)
+`);
+
+// Dedup-bookkeeping maps the scraper keeps per series (seenAssetUrls,
+// seenAssetHashes, sharedAssetUrls, sharedAssetHashes, assetPHashLog) are
+// scraper-internal indexes, never queried relationally - kept as one JSON
+// blob column on the series row rather than their own tables.
+const DEDUP_STATE_FIELDS = ['seenAssetUrls', 'seenAssetHashes', 'sharedAssetUrls', 'sharedAssetHashes', 'assetPHashLog'];
+
+// Loads every series, chapter, and image with exactly 3 queries total
+// (not N+1 per series/chapter) and assembles the same nested shape the rest
+// of the codebase already expects: series.chapters[i].images[j].
+function buildSeriesTree() {
+  const seriesRows = selectSeriesRowsStmt.all();
+  const chapterRows = selectAllChaptersStmt.all();
+  const imageRows = selectAllImagesStmt.all();
+
+  const imagesByChapter = new Map();
+  imageRows.forEach(img => {
+    if (!imagesByChapter.has(img.chapterId)) imagesByChapter.set(img.chapterId, []);
+    imagesByChapter.get(img.chapterId).push({
+      order: img.orderIndex,
+      filename: img.filename,
+      relativePath: img.relativePath,
+      originalUrl: img.originalUrl,
+      contentHash: img.contentHash
+    });
+  });
+
+  const chaptersBySeries = new Map();
+  chapterRows.forEach(ch => {
+    if (!chaptersBySeries.has(ch.seriesId)) chaptersBySeries.set(ch.seriesId, []);
+    chaptersBySeries.get(ch.seriesId).push({
+      id: ch.id,
+      name: ch.name,
+      url: ch.url,
+      status: ch.status,
+      error: ch.error,
+      scrapedAt: ch.scrapedAt,
+      retryCount: ch.retryCount || 0,
+      images: imagesByChapter.get(ch.id) || []
+    });
+  });
+
+  return seriesRows.map(row => {
+    const metadata = row.metadataJson ? JSON.parse(row.metadataJson) : null;
+    const sourceUrls = row.sourceUrlsJson ? JSON.parse(row.sourceUrlsJson) : [];
+    const dedupState = row.dedupStateJson ? JSON.parse(row.dedupStateJson) : {};
+
+    const series = {
+      id: row.id,
+      name: row.name,
+      seriesUrl: row.seriesUrl,
+      useStealth: !!row.useStealth,
+      createdAt: row.createdAt,
+      metadataFetchedAt: row.metadataFetchedAt,
+      lastUpdateCheckAt: row.lastUpdateCheckAt,
+      lastAutoRetryAt: row.lastAutoRetryAt,
+      autoRetryStreak: row.autoRetryStreak || 0,
+      metadata,
+      sourceUrls,
+      chapters: chaptersBySeries.get(row.id) || []
+    };
+    DEDUP_STATE_FIELDS.forEach(field => {
+      series[field] = dedupState[field] ?? (field === 'seenAssetUrls' || field === 'seenAssetHashes' ? {} : []);
+    });
+    return series;
+  });
+}
+
+// In-memory copy of series/chapters/images, same role dbCache plays for the
+// rest of the app state: business logic reads/mutates this array directly;
+// saveSeries()/deleteSeriesRow() below are the only things that touch SQL.
+let seriesCache = [];
+
+// Persists exactly one series (and only that one) - upserts its row, then
+// fully replaces its chapters+images (delete-then-reinsert is simplest and
+// correct; even a 900-chapter series is a sub-millisecond transaction, and
+// it never touches any OTHER series' rows no matter what else wrote
+// concurrently). Call this instead of writeDb() after mutating a series.
+const saveSeriesTxn = sqliteDb.transaction((series) => {
+  const dedupState = {};
+  DEDUP_STATE_FIELDS.forEach(field => { dedupState[field] = series[field]; });
+
+  upsertSeriesStmt.run({
+    id: series.id,
+    name: series.name,
+    seriesUrl: series.seriesUrl || null,
+    useStealth: series.useStealth ? 1 : 0,
+    createdAt: series.createdAt,
+    metadataFetchedAt: series.metadataFetchedAt || null,
+    lastUpdateCheckAt: series.lastUpdateCheckAt || null,
+    lastAutoRetryAt: series.lastAutoRetryAt || null,
+    autoRetryStreak: series.autoRetryStreak || 0,
+    metadataJson: series.metadata ? JSON.stringify(series.metadata) : null,
+    sourceUrlsJson: JSON.stringify(series.sourceUrls || []),
+    dedupStateJson: JSON.stringify(dedupState)
+  });
+
+  deleteChaptersForSeriesStmt.run(series.id); // cascades to this series' images via FK
+
+  (series.chapters || []).forEach((chapter, index) => {
+    insertChapterStmt.run({
+      id: chapter.id,
+      seriesId: series.id,
+      orderIndex: index,
+      name: chapter.name,
+      url: chapter.url,
+      status: chapter.status || 'pending',
+      error: chapter.error || null,
+      scrapedAt: chapter.scrapedAt || null,
+      retryCount: chapter.retryCount || 0
+    });
+    (chapter.images || []).forEach((img, imgIndex) => {
+      insertImageStmt.run({
+        chapterId: chapter.id,
+        orderIndex: img.order ?? imgIndex,
+        filename: img.filename,
+        relativePath: img.relativePath,
+        originalUrl: img.originalUrl || null,
+        contentHash: img.contentHash || null
+      });
+    });
+  });
+});
+
+function saveSeries(series) {
+  saveSeriesTxn(series);
+  const idx = seriesCache.findIndex(s => s.id === series.id);
+  if (idx >= 0) seriesCache[idx] = series;
+  else seriesCache.push(series);
+}
+
+function deleteSeriesRow(id) {
+  deleteSeriesStmt.run(id); // cascades to this series' chapters + images
+  seriesCache = seriesCache.filter(s => s.id !== id);
+}
+
+// Updates only the series row itself (metadata, dedup-state bookkeeping,
+// timestamps, retry streak) - never touches its chapters/images. Use this
+// instead of saveSeries() whenever chapters weren't structurally added,
+// removed, or reordered, so a large series' scrape doesn't pay to
+// delete-and-reinsert everything just to persist one small field.
+const updateSeriesRowStmt = sqliteDb.prepare(`
+  UPDATE series SET
+    name=@name, seriesUrl=@seriesUrl, useStealth=@useStealth,
+    metadataFetchedAt=@metadataFetchedAt, lastUpdateCheckAt=@lastUpdateCheckAt,
+    lastAutoRetryAt=@lastAutoRetryAt, autoRetryStreak=@autoRetryStreak,
+    metadataJson=@metadataJson, sourceUrlsJson=@sourceUrlsJson, dedupStateJson=@dedupStateJson
+  WHERE id=@id
+`);
+
+function saveSeriesMetadata(series) {
+  const dedupState = {};
+  DEDUP_STATE_FIELDS.forEach(field => { dedupState[field] = series[field]; });
+
+  updateSeriesRowStmt.run({
+    id: series.id,
+    name: series.name,
+    seriesUrl: series.seriesUrl || null,
+    useStealth: series.useStealth ? 1 : 0,
+    metadataFetchedAt: series.metadataFetchedAt || null,
+    lastUpdateCheckAt: series.lastUpdateCheckAt || null,
+    lastAutoRetryAt: series.lastAutoRetryAt || null,
+    autoRetryStreak: series.autoRetryStreak || 0,
+    metadataJson: series.metadata ? JSON.stringify(series.metadata) : null,
+    sourceUrlsJson: JSON.stringify(series.sourceUrls || []),
+    dedupStateJson: JSON.stringify(dedupState)
+  });
+}
+
+// Updates one chapter's own fields plus its images - never touches sibling
+// chapters. This is what a per-chapter scrape status transition should call:
+// re-syncing the WHOLE series (all its other chapters/images) just because
+// one chapter went pending -> scraping -> done would make a large series
+// (hundreds of chapters, thousands of images) expensive to scrape one
+// chapter at a time.
+const updateChapterRowStmt = sqliteDb.prepare(`
+  UPDATE chapters SET status=@status, error=@error, scrapedAt=@scrapedAt, retryCount=@retryCount
+  WHERE id=@id
+`);
+const deleteImagesForChapterStmt = sqliteDb.prepare('DELETE FROM images WHERE chapterId = ?');
+
+const updateChapterTxn = sqliteDb.transaction((chapter) => {
+  updateChapterRowStmt.run({
+    id: chapter.id,
+    status: chapter.status || 'pending',
+    error: chapter.error || null,
+    scrapedAt: chapter.scrapedAt || null,
+    retryCount: chapter.retryCount || 0
+  });
+  deleteImagesForChapterStmt.run(chapter.id);
+  (chapter.images || []).forEach((img, imgIndex) => {
+    insertImageStmt.run({
+      chapterId: chapter.id,
+      orderIndex: img.order ?? imgIndex,
+      filename: img.filename,
+      relativePath: img.relativePath,
+      originalUrl: img.originalUrl || null,
+      contentHash: img.contentHash || null
+    });
+  });
+});
+
+function updateChapter(chapter) {
+  updateChapterTxn(chapter);
+}
+
+// Read Database - series is always the live in-memory array (seriesCache);
+// everything else comes from the blob-backed dbCache.
 function readDb() {
+  dbCache.series = seriesCache;
   return dbCache;
 }
 
-// Write Database
+// Write Database - persists the non-series app state (monitors/logs/saved/
+// siteCrawls/settings) to the blob. Series changes must go through
+// saveSeries()/deleteSeriesRow() instead - see the migration note above.
 function writeDb(data) {
   dbCache = data;
   try {
-    upsertStoreStmt.run(JSON.stringify(data));
+    const { series, ...withoutSeries } = data;
+    upsertStoreStmt.run(JSON.stringify(withoutSeries));
   } catch (error) {
     console.error('Error writing database:', error);
   }
 }
 
 dbCache = loadDbFromDisk();
+seriesCache = buildSeriesTree();
 
 // Polling Checking Logic
 const isChecking = {};
@@ -2040,7 +2330,7 @@ app.post('/api/series', (req, res) => {
   const possibleDuplicates = findPossibleDuplicateSeries(db, newSeries);
 
   db.series.push(newSeries);
-  writeDb(db);
+  saveSeries(newSeries);
 
   res.status(201).json({ ...newSeries, possibleDuplicates });
 });
@@ -2075,8 +2365,7 @@ app.delete('/api/series/:id', (req, res) => {
     if (err) console.error(`Failed to remove series folder ${seriesDir}:`, err);
   });
 
-  db.series = db.series.filter(s => s.id !== id);
-  writeDb(db);
+  deleteSeriesRow(id);
 
   res.json({ message: 'Series deleted successfully' });
 });
@@ -2113,7 +2402,7 @@ app.post('/api/series/:id/chapters', (req, res) => {
 
   if (!series.chapters) series.chapters = [];
   series.chapters.push(newChapter);
-  writeDb(db);
+  saveSeries(series);
 
   res.status(201).json(newChapter);
 });
@@ -2138,7 +2427,7 @@ app.delete('/api/series/:id/chapters/:chapterId', (req, res) => {
   });
 
   series.chapters = series.chapters.filter(c => c.id !== chapterId);
-  writeDb(db);
+  saveSeries(series);
 
   res.json({ message: 'Chapter deleted successfully' });
 });
@@ -2167,7 +2456,7 @@ app.delete('/api/series/:id/chapters/:chapterId/images/:filename', (req, res) =>
     if (err) console.error(`Failed to remove image file ${filename}:`, err);
   });
   chapter.images = chapter.images.filter(img => img.filename !== filename);
-  writeDb(db);
+  updateChapter(chapter);
 
   res.json({ message: 'Image deleted successfully', remainingCount: chapter.images.length });
 });
@@ -2195,7 +2484,11 @@ async function scrapeChapterCore(db, series, chapter) {
   // retry passes know when to stop hammering a chapter that just won't go
   // through, instead of retrying it forever.
   chapter.retryCount = chapter.status === 'done' ? 0 : (chapter.retryCount || 0) + 1;
-  writeDb(db);
+  updateChapter(chapter);
+  // The dedup bookkeeping (seenAssetUrls/Hashes etc.) on `series` may have
+  // picked up new entries during this chapter's scrape - persist just the
+  // series row, not its (possibly huge) chapter/image collection.
+  saveSeriesMetadata(series);
   return result;
 }
 
@@ -2203,7 +2496,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
   const seriesId = series.id;
   chapter.status = 'scraping';
   chapter.error = null;
-  writeDb(db);
+  updateChapter(chapter);
 
   try {
     // Respect robots.txt for the chapter's page before touching the site at all.
@@ -2214,7 +2507,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     if (isPathDisallowed(chapter.url, robotsRules.disallowPaths)) {
       chapter.status = 'blocked';
       chapter.error = 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้';
-      writeDb(db);
+      updateChapter(chapter);
       return { httpStatus: 403, error: chapter.error };
     }
 
@@ -2222,7 +2515,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     if (pageDetail.status !== 'up') {
       chapter.status = 'error';
       chapter.error = pageDetail.error || 'ไม่สามารถเปิดหน้าตอนนี้ได้';
-      writeDb(db);
+      updateChapter(chapter);
       return { httpStatus: 502, error: chapter.error };
     }
 
@@ -2277,7 +2570,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     if (mangaImages.length === 0) {
       chapter.status = 'error';
       chapter.error = 'ไม่พบรูปในหน้านี้ (รูปทั้งหมดถูกกรองว่าเป็นโฆษณาหรือรูปที่ใช้ซ้ำทั้งเว็บ)';
-      writeDb(db);
+      updateChapter(chapter);
       return { httpStatus: 404, error: chapter.error };
     }
 
@@ -2427,13 +2720,13 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       : (expectedCount === 0 ? 'ทุกรูปในหน้านี้ถูกกรองว่าเป็นรูปโฆษณา/เครดิตที่ใช้ซ้ำ' : null);
     chapter.scrapedAt = new Date().toISOString();
 
-    writeDb(db);
+    updateChapter(chapter);
     return { httpStatus: 200, error: null, blockedEarly, retryAfterMs };
   } catch (error) {
     console.error(`Error scraping chapter ${chapter.id}:`, error);
     chapter.status = 'error';
     chapter.error = error.message || 'เกิดข้อผิดพลาดระหว่างดึงข้อมูล';
-    writeDb(db);
+    updateChapter(chapter);
     return { httpStatus: 500, error: chapter.error };
   }
 }
@@ -2789,7 +3082,7 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
       return res.status(404).json({ error: 'ไม่พบลิงก์ตอนในหน้านี้ ลองตรวจสอบว่านี่เป็นหน้ารวมตอนจริงหรือไม่' });
     }
 
-    writeDb(db);
+    saveSeries(series);
 
     // Same as check-updates: don't just list what was found, actually download
     // it too - otherwise a freshly-discovered series just sits there pending
@@ -2799,7 +3092,7 @@ app.post('/api/series/:id/discover-chapters', async (req, res) => {
       scrapingSeries[id] = true;
       try {
         scrape = await runScrapeAllForSeries(db, series);
-        writeDb(db);
+        saveSeriesMetadata(series);
       } finally {
         scrapingSeries[id] = false;
       }
@@ -2921,7 +3214,7 @@ app.post('/api/series/:id/fetch-metadata', async (req, res) => {
     series.metadata = extractSeriesMetadataFromHtml(html, targetUrl);
     series.metadataFetchedAt = new Date().toISOString();
     await downloadCoverImageIfMissing(series);
-    writeDb(db);
+    saveSeriesMetadata(series);
 
     res.json({ metadata: series.metadata, metadataFetchedAt: series.metadataFetchedAt });
   } catch (error) {
@@ -2958,12 +3251,14 @@ async function backfillCoverImages(db) {
 
     if (!series.metadata?.coverImageUrl) {
       skipped++;
+      saveSeriesMetadata(series); // still persist any metadata just fetched above
       continue;
     }
 
     const hadPath = series.metadata.coverImagePath;
     await downloadCoverImageIfMissing(series);
     if (!hadPath && series.metadata.coverImagePath) downloaded++;
+    saveSeriesMetadata(series);
   }
 
   return { checked: (db.series || []).length, downloaded, skipped };
@@ -2978,7 +3273,6 @@ app.post('/api/series/download-covers', async (req, res) => {
   downloadingCovers = true;
   try {
     const result = await backfillCoverImages(db);
-    writeDb(db);
     res.json(result);
   } catch (error) {
     console.error('Error backfilling cover images:', error);
@@ -3117,7 +3411,7 @@ app.post('/api/series/:id/clean-duplicate-images', async (req, res) => {
       }
     }
 
-    writeDb(db);
+    saveSeries(series);
     res.json({
       chaptersScanned: chapters.length,
       chaptersAffected: affectedChapterIds.size,
@@ -3223,7 +3517,7 @@ app.post('/api/series/:id/export', async (req, res) => {
     };
     await fs.promises.writeFile(path.join(seriesExportDir, 'metadata.json'), JSON.stringify(metadataJson, null, 2), 'utf-8');
 
-    writeDb(db);
+    saveSeriesMetadata(series);
 
     res.json({
       seriesFolderName,
@@ -3368,8 +3662,7 @@ app.post('/api/series/:id/retry-problem-chapters', async (req, res) => {
     return res.json({ scrapedCount: 0, blockedEarly: false, message: 'ไม่มีตอนที่มีปัญหาให้ลองใหม่' });
   }
   // Clear the retry budget so chapters stuck at the cap become eligible again.
-  problemChapters.forEach(c => { c.retryCount = 0; });
-  writeDb(db);
+  problemChapters.forEach(c => { c.retryCount = 0; updateChapter(c); });
 
   scrapingSeries[id] = true;
   try {
@@ -3401,7 +3694,7 @@ app.post('/api/series/:id/check-updates', async (req, res) => {
   try {
     const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
     series.lastUpdateCheckAt = new Date().toISOString();
-    writeDb(db);
+    saveSeries(series);
 
     if (result.disallowed) return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
     if (result.fetchFailed) return res.status(502).json({ error: 'เปิดหน้ารวมตอนไม่ได้' });
@@ -3411,7 +3704,7 @@ app.post('/api/series/:id/check-updates', async (req, res) => {
     // "new" here since it's already tracked by URL, but it still needs to be
     // downloaded - runScrapeAllForSeries is a no-op if nothing is eligible.
     const scrape = await runScrapeAllForSeries(db, series);
-    writeDb(db);
+    saveSeriesMetadata(series);
     res.json({ newChapters: result.addedCount, ...scrape });
   } catch (error) {
     res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างเช็คตอนใหม่' });
@@ -3588,7 +3881,7 @@ async function runSiteCrawl(crawlId) {
 
         crawl.recheckRound = (crawl.recheckRound || 0) + 1;
         crawl.lastError = `รอบตรวจซ้ำ ${crawl.recheckRound}/${MAX_RECHECK_ROUNDS}: ยังมี ${incompleteChapters.length} ตอนที่ไม่ครบ กำลังพัก cooldown แล้วลองใหม่`;
-        incompleteChapters.forEach(c => { c.retryCount = 0; }); // give them a fresh retry budget
+        incompleteChapters.forEach(c => { c.retryCount = 0; updateChapter(c); }); // give them a fresh retry budget
         crawl.consecutiveBlockedSeries = 0; // fresh block budget after the cooldown
         crawl.currentSeriesUrl = null;
         crawl.currentSeriesName = null;
@@ -3721,7 +4014,8 @@ async function runSiteCrawl(crawlId) {
     } catch (e) {
       crawl.lastError = `หาตอนของเรื่อง "${nextLink.name}" ไม่สำเร็จ: ${e.message}`;
     }
-    writeDb(db);
+    saveSeries(series); // new series and/or newly-discovered chapters
+    writeDb(db); // crawl bookkeeping (siteCrawls stays in the blob)
     await sleep(computeNextDelayMs(seriesRobotsRules.crawlDelaySeconds));
 
     // Scrape every not-yet-done chapter of this series, then keep sweeping the
@@ -4055,7 +4349,7 @@ async function autoRetryProblemChaptersSweep() {
       if (problems.length === 0) {
         // Nothing wrong anymore - clear the back-off streak so a future problem
         // gets retried promptly again rather than starting at a long cooldown.
-        if (series.autoRetryStreak) { series.autoRetryStreak = 0; writeDb(db); }
+        if (series.autoRetryStreak) { series.autoRetryStreak = 0; saveSeriesMetadata(series); }
         continue;
       }
 
@@ -4068,16 +4362,16 @@ async function autoRetryProblemChaptersSweep() {
 
       scrapingSeries[seriesId] = true;
       try {
-        problems.forEach(c => { c.retryCount = 0; }); // fresh retry budget
+        problems.forEach(c => { c.retryCount = 0; updateChapter(c); }); // fresh retry budget
         series.lastAutoRetryAt = new Date().toISOString();
-        writeDb(db);
+        saveSeriesMetadata(series);
         console.log(`[AutoRetry] retrying ${problems.length} problem chapter(s) in "${series.name}" (streak ${streak}, next in ~${Math.round(Math.min(AUTO_RETRY_BASE_COOLDOWN_MS * Math.pow(2, streak + 1), AUTO_RETRY_MAX_COOLDOWN_MS) / 60000)}m if still stuck)`);
         await runScrapeAllForSeries(db, series);
         // Bump the streak if it's still not fully done (keeps backing off toward
         // the 2h ceiling); reset to 0 the moment everything downloaded.
         const stillStuck = (series.chapters || []).some(c => c.status !== 'done');
         series.autoRetryStreak = stillStuck ? streak + 1 : 0;
-        writeDb(db);
+        saveSeriesMetadata(series);
       } catch (err) {
         console.error(`[AutoRetry] series ${seriesId} failed:`, err);
       } finally {
@@ -4128,7 +4422,7 @@ async function autoUpdateCheckSweep() {
         const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
         added = result.addedCount || 0;
         series.lastUpdateCheckAt = new Date().toISOString();
-        writeDb(db);
+        saveSeries(series);
       } catch (err) {
         console.error(`[AutoUpdate] discover failed for "${series.name}":`, err);
         continue;
@@ -4139,7 +4433,7 @@ async function autoUpdateCheckSweep() {
         scrapingSeries[seriesId] = true;
         try {
           await runScrapeAllForSeries(db, series);
-          writeDb(db);
+          saveSeriesMetadata(series);
         } catch (err) {
           console.error(`[AutoUpdate] download failed for "${series.name}":`, err);
         } finally {
@@ -4172,9 +4466,8 @@ function startCoverBackfillWatchdog() {
     downloadingCovers = true;
     try {
       const db = readDb();
-      const result = await backfillCoverImages(db);
+      const result = await backfillCoverImages(db); // persists each touched series itself
       if (result.downloaded > 0) {
-        writeDb(db);
         console.log(`[CoverBackfill] downloaded ${result.downloaded} new cover(s)`);
       }
     } catch (err) {
