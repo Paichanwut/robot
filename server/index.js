@@ -2801,10 +2801,43 @@ app.post('/api/series/:id/fetch-metadata', async (req, res) => {
 
 let downloadingCovers = false; // guards against two bulk backfills running at once
 
-// Backfills cover art for every series that already has a known
-// coverImageUrl (from a previous SEO metadata fetch) but no downloaded file
-// yet - downloadCoverImageIfMissing() is itself a no-op per series once its
-// cover exists on disk, so re-running this is always safe and cheap.
+// Backfills cover art for every series that's missing one: series that
+// already have a coverImageUrl cached just get the file downloaded, and
+// series with no metadata yet (but a known seriesUrl) get a best-effort
+// metadata fetch first to discover their cover URL. downloadCoverImageIfMissing()
+// is itself a no-op per series once its cover exists on disk, so calling this
+// repeatedly (from the watchdog on a timer, or the manual button) is always
+// safe and cheap.
+async function backfillCoverImages(db) {
+  let downloaded = 0;
+  let skipped = 0;
+
+  for (const series of db.series || []) {
+    if (!series.metadata && series.seriesUrl) {
+      try {
+        const { disallowed, html } = await fetchSeriesPageRespectingRobots(series.seriesUrl, series.useStealth);
+        if (!disallowed && html) {
+          series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
+          series.metadataFetchedAt = new Date().toISOString();
+        }
+      } catch (err) {
+        console.error(`Cover backfill: failed to fetch metadata for series ${series.id}:`, err.message);
+      }
+    }
+
+    if (!series.metadata?.coverImageUrl) {
+      skipped++;
+      continue;
+    }
+
+    const hadPath = series.metadata.coverImagePath;
+    await downloadCoverImageIfMissing(series);
+    if (!hadPath && series.metadata.coverImagePath) downloaded++;
+  }
+
+  return { checked: (db.series || []).length, downloaded, skipped };
+}
+
 app.post('/api/series/download-covers', async (req, res) => {
   const db = readDb();
   if (downloadingCovers) {
@@ -2813,19 +2846,9 @@ app.post('/api/series/download-covers', async (req, res) => {
 
   downloadingCovers = true;
   try {
-    const candidates = (db.series || []).filter(s => s.metadata?.coverImageUrl);
-    let downloaded = 0;
-    for (const series of candidates) {
-      const hadPath = series.metadata.coverImagePath;
-      await downloadCoverImageIfMissing(series);
-      if (!hadPath && series.metadata.coverImagePath) downloaded++;
-    }
+    const result = await backfillCoverImages(db);
     writeDb(db);
-    res.json({
-      checked: candidates.length,
-      downloaded,
-      skippedNoMetadata: (db.series || []).length - candidates.length
-    });
+    res.json(result);
   } catch (error) {
     console.error('Error backfilling cover images:', error);
     res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างดาวน์โหลดปก' });
@@ -4005,6 +4028,34 @@ function startAutoUpdateWatchdog() {
   setInterval(() => { autoUpdateCheckSweep().catch(console.error); }, AUTO_UPDATE_TICK_MS);
 }
 
+// Cover-art watchdog: same idea as the auto-retry/auto-update watchdogs above -
+// periodically backfills cover art for any series still missing one, so a
+// freshly-added series (or one whose cover download failed transiently) gets
+// its cover without anyone having to remember to click "ดาวน์โหลดปกทั้งหมด".
+const COVER_BACKFILL_TICK_MS = 30 * 60 * 1000; // sweep every 30 minutes
+
+function startCoverBackfillWatchdog() {
+  console.log('Cover backfill watchdog started...');
+  const runSweep = async () => {
+    if (downloadingCovers) return; // manual button already running one
+    downloadingCovers = true;
+    try {
+      const db = readDb();
+      const result = await backfillCoverImages(db);
+      if (result.downloaded > 0) {
+        writeDb(db);
+        console.log(`[CoverBackfill] downloaded ${result.downloaded} new cover(s)`);
+      }
+    } catch (err) {
+      console.error('[CoverBackfill] sweep failed:', err);
+    } finally {
+      downloadingCovers = false;
+    }
+  };
+  setTimeout(runSweep, 60 * 1000); // first sweep 1 minute after boot
+  setInterval(runSweep, COVER_BACKFILL_TICK_MS);
+}
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
@@ -4012,4 +4063,5 @@ app.listen(PORT, () => {
   resumeRunningSiteCrawls();
   startAutoRetryWatchdog();
   startAutoUpdateWatchdog();
+  startCoverBackfillWatchdog();
 });
