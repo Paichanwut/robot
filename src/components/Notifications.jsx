@@ -1,11 +1,18 @@
 import { useState } from 'react';
 
 // In-theme replacement for the browser's native alert()/confirm() - those
-// break the dark UI with an unstyled OS dialog and block the whole tab.
-// Usage: const { notify, confirmAction, ToastStack, ConfirmModal } = useNotifications();
+// break the UI with an unstyled OS dialog and block the whole tab.
+// Usage: const { notify, confirmAction, ... } = useNotifications();
 // notify.success/error/info(message) fires a toast; confirmAction(message, opts)
 // returns a Promise<boolean> so call sites can `if (!(await confirmAction(...))) return;`
 // just like the old `if (!confirm(...)) return;`.
+//
+// ToastStack/ConfirmModal are exported as stable, module-level components
+// (not created inside the hook) and take their data via props - if they were
+// recreated as closures on every render of the hook's caller, React would see
+// a new component "type" each time and force-remount them, which restarts
+// their CSS entrance animation mid-flight (observed as the confirm modal
+// getting stuck invisible while a background poll kept re-rendering App).
 
 let toastIdCounter = 0;
 
@@ -16,6 +23,49 @@ const TOAST_META = {
 };
 
 const TOAST_LIFETIME_MS = 5000;
+
+export function ToastStack({ toasts, onDismiss }) {
+  return (
+    <div className="toast-stack">
+      {toasts.map(t => {
+        const meta = TOAST_META[t.type] || TOAST_META.info;
+        return (
+          <div key={t.id} className={`toast ${meta.className}`}>
+            <span className="toast-icon">{meta.icon}</span>
+            <span className="toast-body">{t.message}</span>
+            <button className="toast-close" onClick={() => onDismiss(t.id)} aria-label="Dismiss">×</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function ConfirmModal({ confirmState, onResolve }) {
+  if (!confirmState) return null;
+  return (
+    <div className="modal-overlay" onClick={() => onResolve(false)}>
+      <div className="modal-content" style={{ maxWidth: '420px' }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>{confirmState.danger ? '⚠️ ยืนยันการลบ' : 'ยืนยันการทำงาน'}</h3>
+          <button className="modal-close" onClick={() => onResolve(false)}>×</button>
+        </div>
+        <p className="confirm-modal-message">{confirmState.message}</p>
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={() => onResolve(false)}>
+            {confirmState.cancelLabel}
+          </button>
+          <button
+            className={confirmState.danger ? 'btn btn-danger' : 'btn btn-primary'}
+            onClick={() => onResolve(true)}
+          >
+            {confirmState.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export function useNotifications() {
   const [toasts, setToasts] = useState([]);
@@ -55,46 +105,5 @@ export function useNotifications() {
     setConfirmState(null);
   };
 
-  const ToastStack = () => (
-    <div className="toast-stack">
-      {toasts.map(t => {
-        const meta = TOAST_META[t.type] || TOAST_META.info;
-        return (
-          <div key={t.id} className={`toast ${meta.className}`}>
-            <span className="toast-icon">{meta.icon}</span>
-            <span className="toast-body">{t.message}</span>
-            <button className="toast-close" onClick={() => dismissToast(t.id)} aria-label="Dismiss">×</button>
-          </div>
-        );
-      })}
-    </div>
-  );
-
-  const ConfirmModal = () => {
-    if (!confirmState) return null;
-    return (
-      <div className="modal-overlay" onClick={() => resolveConfirm(false)}>
-        <div className="modal-content" style={{ maxWidth: '420px' }} onClick={(e) => e.stopPropagation()}>
-          <div className="modal-header">
-            <h3>{confirmState.danger ? '⚠️ ยืนยันการลบ' : 'ยืนยันการทำงาน'}</h3>
-            <button className="modal-close" onClick={() => resolveConfirm(false)}>×</button>
-          </div>
-          <p className="confirm-modal-message">{confirmState.message}</p>
-          <div className="modal-footer">
-            <button className="btn btn-secondary" onClick={() => resolveConfirm(false)}>
-              {confirmState.cancelLabel}
-            </button>
-            <button
-              className={confirmState.danger ? 'btn btn-danger' : 'btn btn-primary'}
-              onClick={() => resolveConfirm(true)}
-            >
-              {confirmState.confirmLabel}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  return { notify, confirmAction, ToastStack, ConfirmModal };
+  return { notify, confirmAction, toasts, dismissToast, confirmState, resolveConfirm };
 }

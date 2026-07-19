@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
-import { useNotifications } from './components/Notifications';
+import { useNotifications, ToastStack, ConfirmModal } from './components/Notifications';
 import Icon from './components/Icon';
 
 // Sparkline component to display a neat visual grid of recent check results.
@@ -51,7 +51,7 @@ function Sparkline({ checks }) {
 }
 
 function App() {
-  const { notify, confirmAction, ToastStack, ConfirmModal } = useNotifications();
+  const { notify, confirmAction, toasts, dismissToast, confirmState, resolveConfirm } = useNotifications();
 
   const [monitors, setMonitors] = useState([]);
   const [logs, setLogs] = useState([]);
@@ -1134,8 +1134,8 @@ function App() {
 
   return (
     <div className="app-wrapper">
-      <ToastStack />
-      <ConfirmModal />
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      <ConfirmModal confirmState={confirmState} onResolve={resolveConfirm} />
 
       {/* Sidebar Navigation */}
       <aside className="app-sidebar">
@@ -1197,7 +1197,7 @@ function App() {
       {/* Network / Connection Error Warning Banner */}
       {error && (
         <div style={{
-          backgroundColor: 'rgba(178, 84, 63, 0.12)',
+          backgroundColor: 'rgba(214, 72, 63, 0.1)',
           border: '1px solid var(--color-red)',
           color: 'var(--color-red)',
           padding: '1rem',
@@ -1298,7 +1298,7 @@ function App() {
                           <span style={{ 
                             fontSize: '0.7rem', 
                             color: 'var(--color-text-muted)', 
-                            backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                            backgroundColor: 'rgba(31, 41, 25, 0.05)',
                             padding: '0.15rem 0.4rem',
                             borderRadius: '4px',
                             marginLeft: '0.5rem',
@@ -1610,7 +1610,7 @@ function App() {
       {/* Delete Monitor Confirmation Modal */}
       {isDeleteModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(178, 84, 63, 0.3)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(214, 72, 63, 0.3)' }}>
             <div className="modal-header">
               <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Delete Monitor</h3>
               <button className="modal-close" onClick={() => setIsDeleteModalOpen(false)}>×</button>
@@ -1635,7 +1635,7 @@ function App() {
       {/* Clear Logs Confirmation Modal */}
       {isClearLogsModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ borderColor: 'rgba(178, 84, 63, 0.3)' }}>
+          <div className="modal-content" style={{ borderColor: 'rgba(214, 72, 63, 0.3)' }}>
             <div className="modal-header">
               <h3 style={{ color: 'var(--color-red)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Icon name="alert-triangle" size={18} /> Clear Alert Logs</h3>
               <button className="modal-close" onClick={() => setIsClearLogsModalOpen(false)}>×</button>
