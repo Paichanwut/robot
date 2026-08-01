@@ -1954,7 +1954,11 @@ async function downloadCoverImageIfMissing(series) {
     const contentType = download.response.headers.get('content-type');
     const ext = getExtension(coverUrl, contentType);
     const buffer = Buffer.from(await download.response.arrayBuffer());
-    const fileName = `${series.id}.${ext}`;
+    // Human-readable prefix for browsing the shared covers folder by eye,
+    // with the series id kept as a suffix so two series that happen to
+    // share a title never overwrite each other's cover on disk.
+    const seriesTitle = sanitizeForFilename(series.metadata?.title || series.name, series.id);
+    const fileName = `${seriesTitle}_cover_${series.id}.${ext}`;
     fs.writeFileSync(path.join(COVERS_DIR, fileName), buffer);
     series.metadata.coverImagePath = `covers/${fileName}`;
   } catch (err) {
@@ -2581,6 +2585,13 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     fs.rmSync(chapterDir, { recursive: true, force: true });
     fs.mkdirSync(chapterDir, { recursive: true });
 
+    // Human-readable page filenames - <series title>_ep<chapter number>_<page
+    // number>.<ext> - instead of bare "001.jpg", so a page is identifiable by
+    // its filename alone once copied out of the opaque id-keyed folder tree.
+    const seriesTitleForFile = sanitizeForFilename(series.metadata?.title || series.name, seriesId);
+    const chapterNumber = extractLeadingNumber(chapter.name);
+    const chapterLabel = chapterNumber !== null ? String(chapterNumber) : String(chapter.orderIndex + 1);
+
     const downloaded = [];
     const chapterHashes = new Set(); // content hashes already kept in THIS scrape - catches in-chapter duplicate pages
     let blockedEarly = false;
@@ -2685,7 +2696,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
           }
         }
 
-        const filename = `${String(i + 1).padStart(3, '0')}.${ext}`;
+        const filename = `${seriesTitleForFile}_ep${chapterLabel}_${String(i + 1).padStart(3, '0')}.${ext}`;
         const filePath = path.join(chapterDir, filename);
         await fs.promises.writeFile(filePath, buffer);
 
