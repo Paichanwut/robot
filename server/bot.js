@@ -3086,6 +3086,55 @@ async function syncAllSeries(db) {
   if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
 }
 
+// Catches up any chapter that finished downloading (status 'done', so R2
+// already has its pages) but never made it into MySQL - e.g. the sync in
+// scrapeChapterCore ran while the website DB was briefly unreachable (VPN,
+// network blip, ...). syncChapterToWebsiteDbSafe() only runs once, right
+// when a chapter finishes, and nothing revisits a 'done' chapter afterward
+// - without this pass, a chapter that failed to sync that one time would
+// stay missing from the website forever even though its images are safely
+// in R2. Cheap to run every cycle: 1-2 queries per series, not per chapter.
+async function repairMysqlSync(db) {
+  let repairedCount = 0;
+  for (const series of db.series || []) {
+    const doneChapters = (series.chapters || []).filter(c => c.status === 'done');
+    if (doneChapters.length === 0) continue;
+
+    const title = series.metadata?.title || series.name;
+    const slug = slugify(title, series.id);
+
+    let existingNumbers;
+    try {
+      const conn = await mysqlPool.getConnection();
+      try {
+        const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
+        existingNumbers = new Set();
+        if (seriesRow) {
+          const [rows] = await conn.execute('SELECT number FROM chapters WHERE series_id = ?', [seriesRow.id]);
+          rows.forEach(r => existingNumbers.add(Number(r.number)));
+        }
+      } finally {
+        conn.release();
+      }
+    } catch (err) {
+      // MySQL still unreachable (e.g. VPN blocking it) - skip this series
+      // for now, next repair pass (next bot run) will try again.
+      console.error(`[repair-sync] could not check MySQL state for "${series.name}":`, err.message);
+      continue;
+    }
+
+    for (const chapter of doneChapters) {
+      const num = extractLeadingNumber(chapter.name);
+      if (num === null || existingNumbers.has(num)) continue;
+      console.log(`[repair-sync] "${series.name}" ep${num}: missing in MySQL, re-syncing`);
+      await syncChapterToWebsiteDbSafe(series, chapter);
+      repairedCount++;
+    }
+  }
+  if (repairedCount > 0) console.log(`[repair-sync] re-synced ${repairedCount} chapter(s) that were missing from MySQL`);
+  return repairedCount;
+}
+
 // Finishes any site crawl left in 'running' state from an interrupted
 // previous run - a CLI invocation is a fresh process every time, so nothing
 // else will ever come back to resume it otherwise.
@@ -3279,12 +3328,18 @@ async function main() {
   } else if (cmd === 'crawl') {
     if (!arg) throw new Error('Usage: node server/bot.js crawl <siteUrl> [--stealth]');
     await crawlCommand(arg, { stealth });
+  } else if (cmd === 'repair-sync') {
+    await repairMysqlSync(readDb());
   } else if (!cmd) {
     const db = readDb();
     await resumeRunningCrawls(db);
     await syncAllSeries(readDb());
+    // Cheap catch-up pass every regular run too, not just on-demand - covers
+    // chapters that finished downloading while MySQL was briefly unreachable
+    // during THIS run (or a previous one) without needing a separate command.
+    await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url>]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync]`);
   }
 }
 
