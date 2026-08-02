@@ -2704,8 +2704,13 @@ async function runScrapeAllForSeries(db, series) {
 // seriesUrl-dedup checks below and in scrapeChapterCore).
 // ---------------------------------------------------------------------------
 
-const MAX_LISTING_PAGES = 60;
-const MAX_DISCOVERED_SERIES_PER_CRAWL = 500;
+// Raised from 60/500 after real sites turned out to have well over 500
+// titles - hitting either cap silently sets discoveryDone=true (see below)
+// and the crawl never goes looking for the rest, even once it otherwise
+// finishes. Still bounded (not Infinity) as a guard against a pathological
+// site/redirect loop burning through requests forever.
+const MAX_LISTING_PAGES = 400;
+const MAX_DISCOVERED_SERIES_PER_CRAWL = 8000;
 const MAX_CONSECUTIVE_BLOCKED_SERIES = 3;
 // After the normal per-chapter retries are spent, the crawl keeps doing full
 // "recheck" sweeps over any chapters that are STILL incomplete - lifting the
@@ -2725,12 +2730,22 @@ function findCrawl(db, crawlId) {
 // crawl record is for display/durability, this is what actually stops it.
 const crawlControl = {};
 
-async function runSiteCrawl(crawlId) {
+// maxUnitsThisTurn lets a caller round-robin between several crawls instead
+// of draining one to completion before ever touching the next (see
+// resumeRunningCrawls) - "one unit" is one listing page fetched (discovery
+// phase), one retry-chapter scraped (recheck phase), or one series fully
+// scraped (main phase). The crawl's own persisted state (discoveredSeries/
+// processedSeriesUrls/nextListingPageUrl/...) is exactly what makes this
+// safe to pause and resume arbitrarily - a return here is not a stop, just
+// "come back and call this again to continue where it left off".
+async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
   if (!crawlControl[crawlId]) crawlControl[crawlId] = { stopRequested: false };
+  let unitsDone = 0;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (crawlControl[crawlId].stopRequested) return;
+    if (unitsDone >= maxUnitsThisTurn) return; // yield back to the round-robin scheduler
 
     const db = readDb();
     const crawl = findCrawl(db, crawlId);
@@ -2804,6 +2819,7 @@ async function runSiteCrawl(crawlId) {
       writeDb(db);
 
       await sleep(computeNextDelayMs(robotsRules.crawlDelaySeconds));
+      unitsDone++;
       continue;
     }
 
@@ -2854,29 +2870,28 @@ async function runSiteCrawl(crawlId) {
           return;
         }
 
+        // Still cooling down from a previously-started recheck round - don't
+        // block waiting it out (that would stall every other crawl's turn
+        // too, see maxUnitsThisTurn above), just yield. A later call, once
+        // the deadline has passed, falls through and starts the sweep.
+        if (crawl.recheckCooldownUntil && Date.now() < crawl.recheckCooldownUntil) {
+          return;
+        }
+
         crawl.recheckRound = (crawl.recheckRound || 0) + 1;
         crawl.lastError = `รอบตรวจซ้ำ ${crawl.recheckRound}/${MAX_RECHECK_ROUNDS}: ยังมี ${incompleteChapters.length} ตอนที่ไม่ครบ กำลังพัก cooldown แล้วลองใหม่`;
         incompleteChapters.forEach(c => { c.retryCount = 0; updateChapter(c); }); // give them a fresh retry budget
         crawl.consecutiveBlockedSeries = 0; // fresh block budget after the cooldown
         crawl.currentSeriesUrl = null;
         crawl.currentSeriesName = null;
+        // Escalating cooldown between recheck rounds (3, 6, 9, ... minutes) so a
+        // rate-limiting site gets progressively more time to recover -
+        // tracked as a deadline, not a blocking sleep, so it costs nothing
+        // while other crawls take their turns in the meantime.
+        crawl.recheckCooldownUntil = Date.now() + RECHECK_COOLDOWN_BASE_MS * crawl.recheckRound;
         crawl.updatedAt = new Date().toISOString();
         writeDb(db);
-
-        // Escalating cooldown between recheck rounds (3, 6, 9, ... minutes) so a
-        // rate-limiting site gets progressively more time to recover. Sleep in
-        // short steps so a stop request still lands promptly.
-        const cooldownMs = RECHECK_COOLDOWN_BASE_MS * crawl.recheckRound;
-        for (let waited = 0; waited < cooldownMs; waited += 3000) {
-          if (crawlControl[crawlId].stopRequested) {
-            crawl.status = 'stopped';
-            crawl.updatedAt = new Date().toISOString();
-            writeDb(db);
-            return;
-          }
-          await sleep(Math.min(3000, cooldownMs - waited));
-        }
-        continue;
+        return;
       }
 
       crawl.currentSeriesUrl = retrySeries.seriesUrl;
@@ -2910,6 +2925,7 @@ async function runSiteCrawl(crawlId) {
       // delay, matching /scrape-all's retry pacing above - or however long
       // the site's own Retry-After said, if it was longer.
       await sleep(Math.max(computeNextDelayMs(null) * 3, retryDelayFloorMs));
+      unitsDone++;
       continue;
     }
 
@@ -3054,6 +3070,7 @@ async function runSiteCrawl(crawlId) {
     writeDb(db);
 
     await sleep(Math.max(computeNextDelayMs(null) * 2, seriesRetryAfterMs || 0));
+    unitsDone++;
   }
 }
 
@@ -3135,14 +3152,31 @@ async function repairMysqlSync(db) {
   return repairedCount;
 }
 
-// Finishes any site crawl left in 'running' state from an interrupted
+// Finishes every site crawl left in 'running' state from an interrupted
 // previous run - a CLI invocation is a fresh process every time, so nothing
 // else will ever come back to resume it otherwise.
+//
+// Round-robins between them (one series/page/retry-chapter at a time, see
+// maxUnitsThisTurn on runSiteCrawl) instead of draining one crawl fully
+// before ever touching the next - a site with hundreds of series to work
+// through would otherwise starve every other tracked site of any progress
+// at all for as long as it takes to finish (could be days).
 async function resumeRunningCrawls(db) {
-  for (const crawl of (db.siteCrawls || []).filter(c => c.status === 'running')) {
-    console.log(`[sync] resuming site crawl for ${crawl.siteUrl}`);
-    crawlControl[crawl.id] = { stopRequested: false };
-    await runSiteCrawl(crawl.id);
+  let activeIds = (db.siteCrawls || []).filter(c => c.status === 'running').map(c => c.id);
+  if (activeIds.length === 0) return;
+
+  console.log(`[sync] resuming ${activeIds.length} site crawl(s) round-robin: ${activeIds.map(id => findCrawl(db, id)?.siteUrl).join(', ')}`);
+  activeIds.forEach(id => { crawlControl[id] = { stopRequested: false }; });
+
+  while (activeIds.length > 0) {
+    for (const id of [...activeIds]) {
+      await runSiteCrawl(id, { maxUnitsThisTurn: 1 });
+      const latest = findCrawl(readDb(), id);
+      if (!latest || latest.status !== 'running') {
+        activeIds = activeIds.filter(x => x !== id);
+        console.log(`[sync] site crawl for ${latest?.siteUrl || id} finished with status: ${latest?.status || 'gone'}`);
+      }
+    }
   }
 }
 
