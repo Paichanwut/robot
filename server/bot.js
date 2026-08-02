@@ -7,6 +7,7 @@ import { Jimp, compareHashes } from 'jimp';
 import { connect } from 'puppeteer-real-browser';
 import { spawnSync } from 'child_process';
 import { S3Client, PutObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import mysql from 'mysql2/promise';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -96,6 +97,178 @@ async function deleteR2Prefix(prefix) {
     }
     continuationToken = list.IsTruncated ? list.NextContinuationToken : undefined;
   } while (continuationToken);
+}
+
+// ---------------------------------------------------------------------------
+// Website DB sync (MySQL) - a *separate* database from the bot's own SQLite
+// tracking DB (server/data/app.db). Only "clean" public-facing fields are
+// written here (title, cover, page images, ...) - never the bot's internal
+// scrape-state (retryCount, dedup hashes, robots.txt state, chapter status
+// pending/error/blocked, ...), which stays in SQLite only. See db/schema.mysql.sql.
+// ---------------------------------------------------------------------------
+
+const MYSQL_HOST = process.env.MYSQL_HOST;
+const MYSQL_PORT = process.env.MYSQL_PORT || 3306;
+const MYSQL_USER = process.env.MYSQL_USER;
+const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD;
+const MYSQL_DATABASE = process.env.MYSQL_DATABASE;
+
+if (!MYSQL_HOST || !MYSQL_USER || !MYSQL_PASSWORD || !MYSQL_DATABASE) {
+  throw new Error(
+    'Missing MySQL credentials. Copy .env.example to .env and fill in MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE, ' +
+    'or export them in the shell before running.'
+  );
+}
+
+const mysqlPool = mysql.createPool({
+  host: MYSQL_HOST,
+  port: Number(MYSQL_PORT),
+  user: MYSQL_USER,
+  password: MYSQL_PASSWORD,
+  database: MYSQL_DATABASE,
+  connectionLimit: 5
+});
+
+// Turns a title into a URL-safe slug. Falls back to the bot's own series id
+// when the title has no ASCII-alphanumeric content at all (an all-Thai
+// title) - an empty/non-unique slug would otherwise violate the UNIQUE
+// constraint on series.slug the moment a second such series showed up.
+function slugify(text, fallback) {
+  const slug = (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || fallback;
+}
+
+function normalizeSeriesStatus(rawStatus) {
+  const s = (rawStatus || '').toLowerCase();
+  if (/completed|จบ/i.test(s)) return 'completed';
+  if (/hiatus|พัก/i.test(s)) return 'hiatus';
+  return 'ongoing';
+}
+
+const MYSQL_SYNC_RETRIES = 3;
+
+// Runs `fn(conn)` with a few retries (mirrors uploadToR2's posture) - a sync
+// failure is logged and swallowed by the caller, not fatal to the scrape
+// itself, since the image is already safely in R2 and the bot's own SQLite
+// already has the chapter marked 'done' by the time this runs.
+async function withMysqlRetry(fn) {
+  let lastError;
+  for (let attempt = 1; attempt <= MYSQL_SYNC_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt < MYSQL_SYNC_RETRIES) await sleep(500 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+// Upserts the series row + its genre links. Returns the MySQL row id (not
+// the bot's own source_series_id) for use by syncChapterToWebsiteDb below.
+async function syncSeriesToWebsiteDb(conn, series) {
+  const meta = series.metadata || {};
+  const title = meta.title || series.name;
+  const slug = slugify(title, series.id);
+
+  // Upserts by slug, not source_series_id - two different bot-tracked series
+  // (from two different sites) that turn out to be the same manga end up
+  // with the same slug (same title), and are meant to converge onto ONE
+  // website series row (see backfillMissingChaptersFromSiblings). Matching
+  // by source_series_id instead would create a second row per site and
+  // then throw on the slug UNIQUE constraint the moment their titles
+  // matched, since MySQL still enforces uniqueness on the OTHER column
+  // even when the conflict is detected via a different one.
+  await conn.execute(
+    `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, cover_image_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       source_series_id = VALUES(source_series_id), title = VALUES(title), alt_titles = VALUES(alt_titles),
+       description = VALUES(description), author = VALUES(author), status = VALUES(status),
+       cover_image_key = COALESCE(VALUES(cover_image_key), cover_image_key)`,
+    [
+      series.id,
+      slug,
+      title,
+      JSON.stringify(meta.altTitles || []),
+      meta.synopsis || null,
+      meta.author || meta.artist || null,
+      normalizeSeriesStatus(meta.status),
+      meta.coverImagePath || null
+    ]
+  );
+
+  const [[row]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
+  const seriesRowId = row.id;
+
+  const genreNames = meta.genres || [];
+  await conn.execute('DELETE FROM series_genres WHERE series_id = ?', [seriesRowId]);
+  for (const name of genreNames) {
+    const genreSlug = slugify(name, null);
+    if (!genreSlug) continue;
+    await conn.execute('INSERT INTO genres (slug, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name)', [genreSlug, name]);
+    const [[genreRow]] = await conn.execute('SELECT id FROM genres WHERE slug = ?', [genreSlug]);
+    await conn.execute('INSERT IGNORE INTO series_genres (series_id, genre_id) VALUES (?, ?)', [seriesRowId, genreRow.id]);
+  }
+
+  return seriesRowId;
+}
+
+// Upserts one chapter (by series_id+number, see UNIQUE KEY uniq_series_number
+// in db/schema.mysql.sql) and fully replaces its page list - same
+// wipe-then-reinsert posture as the R2 chapter folder above, so a re-scrape
+// that drops a page (ad-filtering caught something new) doesn't leave a
+// stale row behind.
+async function syncChapterToWebsiteDb(seriesRowId, chapterNumber, chapterTitle, images) {
+  await withMysqlRetry(async () => {
+    const conn = await mysqlPool.getConnection();
+    try {
+      await conn.execute(
+        `INSERT INTO chapters (series_id, source_chapter_id, number, title)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE source_chapter_id = VALUES(source_chapter_id), title = VALUES(title)`,
+        [seriesRowId, null, chapterNumber, chapterTitle]
+      );
+      const [[chapterRow]] = await conn.execute(
+        'SELECT id FROM chapters WHERE series_id = ? AND number = ?',
+        [seriesRowId, chapterNumber]
+      );
+      const chapterRowId = chapterRow.id;
+
+      await conn.execute('DELETE FROM chapter_pages WHERE chapter_id = ?', [chapterRowId]);
+      if (images.length > 0) {
+        const values = images.map(img => [chapterRowId, img.order, img.relativePath]);
+        await conn.query('INSERT INTO chapter_pages (chapter_id, page_number, image_key) VALUES ?', [values]);
+      }
+    } finally {
+      conn.release();
+    }
+  });
+}
+
+// Single entry point called once a chapter finishes downloading (status
+// 'done') - upserts the series (with fresh metadata/cover/genres) and this
+// chapter's pages. Best-effort: logs and returns on failure rather than
+// throwing, so a MySQL hiccup never undoes work already safely in R2/SQLite.
+async function syncChapterToWebsiteDbSafe(series, chapter) {
+  try {
+    await withMysqlRetry(async () => {
+      const conn = await mysqlPool.getConnection();
+      try {
+        return await syncSeriesToWebsiteDb(conn, series);
+      } finally {
+        conn.release();
+      }
+    }).then(seriesRowId => {
+      const chapterNumber = extractLeadingNumber(chapter.name) ?? (chapter.orderIndex ?? 0) + 1;
+      return syncChapterToWebsiteDb(seriesRowId, chapterNumber, chapter.name, chapter.images || []);
+    });
+  } catch (err) {
+    console.error(`[sync-db] failed to sync chapter "${chapter.name}" of "${series.name}" to MySQL after retries:`, err.message);
+  }
 }
 
 // Initial Database Structure
@@ -1380,11 +1553,12 @@ async function downloadCoverImageIfMissing(series) {
     const contentType = download.response.headers.get('content-type');
     const ext = getExtension(coverUrl, contentType);
     const buffer = Buffer.from(await download.response.arrayBuffer());
-    // Human-readable prefix for browsing the bucket by eye, with the series
-    // id kept as a suffix so two series that happen to share a title never
-    // overwrite each other's cover.
+    // Plain <title>_cover.<ext> - no id suffix. Trade-off: two series that
+    // happen to share the exact same title would overwrite each other's
+    // cover in the shared cover/ folder, but that's rare enough for this
+    // use case that dropping the suffix for readability wins.
     const seriesTitle = sanitizeForFilename(series.metadata?.title || series.name, series.id);
-    const fileName = `${seriesTitle}_cover_${series.id}.${ext}`;
+    const fileName = `${seriesTitle}_cover.${ext}`;
     const key = `cover/${fileName}`;
     await uploadToR2(key, buffer, ext);
     series.metadata.coverImagePath = key;
@@ -1697,6 +1871,56 @@ function findPossibleDuplicateSeries(db, candidateSeries) {
     .map(s => ({ id: s.id, name: s.name }));
 }
 
+// Cross-site gap-filling: when another tracked series is identified (same
+// heuristic as findPossibleDuplicateSeries above) as the same manga on a
+// different site, and it has a finished chapter this series doesn't have,
+// clone that chapter's URL in here as a new pending chapter - the normal
+// scrape pipeline then downloads it from the sibling's own site. Since R2
+// folder paths are title-based (see scrapeChapterCoreAttempt), a chapter
+// filled in this way lands in the exact same manga/<title>/ep<N>/ folder
+// either series would have used on its own - the two sources converge into
+// one complete set instead of two separate, each-partial copies.
+async function backfillMissingChaptersFromSiblings(db, series) {
+  const siblingRefs = findPossibleDuplicateSeries(db, series);
+  if (siblingRefs.length === 0) return 0;
+
+  const haveNumbers = new Set(
+    (series.chapters || []).map(c => extractLeadingNumber(c.name)).filter(n => n !== null)
+  );
+
+  let addedCount = 0;
+  for (const ref of siblingRefs) {
+    const sibling = findSeries(db, ref.id);
+    if (!sibling) continue;
+
+    for (const siblingChapter of sibling.chapters || []) {
+      if (siblingChapter.status !== 'done') continue; // only borrow chapters the sibling actually finished
+      const num = extractLeadingNumber(siblingChapter.name);
+      if (num === null || haveNumbers.has(num)) continue;
+
+      if (!series.chapters) series.chapters = [];
+      series.chapters.push({
+        id: `${Date.now()}_${addedCount}_gapfill`,
+        name: siblingChapter.name,
+        url: siblingChapter.url,
+        status: 'pending',
+        images: [],
+        error: null,
+        scrapedAt: null,
+        retryCount: 0
+      });
+      haveNumbers.add(num);
+      addedCount++;
+    }
+  }
+
+  if (addedCount > 0) {
+    console.log(`[gap-fill] "${series.name}": queued ${addedCount} chapter(s) found on a sibling site but missing here`);
+    saveSeries(series);
+  }
+  return addedCount;
+}
+
 
 
 // Core of chapter scraping, shared by the single-chapter route and the
@@ -1727,6 +1951,12 @@ async function scrapeChapterCore(db, series, chapter) {
   // picked up new entries during this chapter's scrape - persist just the
   // series row, not its (possibly huge) chapter/image collection.
   saveSeriesMetadata(series);
+  // Publish to the website DB only once a chapter is actually complete -
+  // partial/error/blocked chapters stay bot-internal until a later retry
+  // round finishes them.
+  if (chapter.status === 'done') {
+    await syncChapterToWebsiteDbSafe(series, chapter);
+  }
   return result;
 }
 
@@ -1812,18 +2042,21 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       return { httpStatus: 404, error: chapter.error };
     }
 
-    // Wipe any previous upload for this chapter first, so a re-scrape after
-    // the filters above catch something new doesn't leave stale pages (e.g.
-    // yesterday's ad banner) orphaned in R2 under the old key prefix.
-    const chapterKeyPrefix = `manga/${seriesId}/${chapter.id}/`;
-    await deleteR2Prefix(chapterKeyPrefix);
-
-    // Human-readable page filenames - <series title>_ep<chapter number>_<page
-    // number>.<ext> - instead of bare "001.jpg", so a page is identifiable by
-    // its filename alone once copied out of the opaque id-keyed folder tree.
+    // Human-readable page filenames AND folder path - <series title>_ep
+    // <chapter number>_<page number>.<ext> under manga/<series title>/
+    // ep<chapter number>/ - no id suffixes anywhere. Trade-off (consistent
+    // with the cover filename above): two series that happen to share the
+    // exact same title would collide into the same manga/<title>/ folder.
+    // Accepted as rare enough for this use case in exchange for clean names.
     const seriesTitleForFile = sanitizeForFilename(series.metadata?.title || series.name, seriesId);
     const chapterNumber = extractLeadingNumber(chapter.name);
     const chapterLabel = chapterNumber !== null ? String(chapterNumber) : String(chapter.orderIndex + 1);
+
+    // Wipe any previous upload for this chapter first, so a re-scrape after
+    // the filters above catch something new doesn't leave stale pages (e.g.
+    // yesterday's ad banner) orphaned in R2 under the old key prefix.
+    const chapterKeyPrefix = `manga/${seriesTitleForFile}/ep${chapterLabel}/`;
+    await deleteR2Prefix(chapterKeyPrefix);
 
     const downloaded = [];
     const chapterHashes = new Set(); // content hashes already kept in THIS scrape - catches in-chapter duplicate pages
@@ -2844,6 +3077,7 @@ async function syncAllSeries(db) {
       }
       saveSeriesMetadata(series);
     }
+    await backfillMissingChaptersFromSiblings(db, series);
     const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
     if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
   }
@@ -3057,10 +3291,12 @@ async function main() {
 acquireLock()
   .then(() => main())
   .then(() => shutdownBrowser())
+  .then(() => mysqlPool.end())
   .then(() => { releaseLock(); process.exit(0); })
   .catch(async (err) => {
     console.error(err);
     await shutdownBrowser();
+    await mysqlPool.end().catch(() => {});
     releaseLock();
     process.exit(1);
   });
