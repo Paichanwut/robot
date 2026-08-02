@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    image: solo-manga-bot
+    env_file:
+      - .env
+    volumes:
+      - ./server/data:/app/server/data
+    # No restart policy on purpose - this is a one-shot CLI (discover+scrape,
+    # then exit), not a daemon. Run it on demand or from host cron:
+    #   docker compose run --rm bot                  # sync everything
+    #   docker compose run --rm bot add <seriesUrl>   # add + scrape one series
+    #   docker compose run --rm bot crawl <siteUrl>   # whole-site crawl
