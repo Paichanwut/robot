@@ -1,5 +1,3 @@
-import express from 'express';
-import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -8,92 +6,110 @@ import crypto from 'crypto';
 import { Jimp, compareHashes } from 'jimp';
 import { connect } from 'puppeteer-real-browser';
 import { spawnSync } from 'child_process';
+import { S3Client, PutObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Middlewares
-app.use(cors());
-app.use(express.json());
-
-// Paths
+// Paths - only the SQLite DB, Chrome profile, and lock file live on local
+// disk now; page/cover images go straight to R2 (see below), never touching
+// disk here at all.
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
-const DIST_DIR = path.join(__dirname, '../dist');
-const SAVED_DIR = path.join(DATA_DIR, 'saved');
 
-// Ensure directories exist
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-if (!fs.existsSync(SAVED_DIR)) {
-  fs.mkdirSync(SAVED_DIR, { recursive: true });
-}
-const MANGA_DIR = path.join(SAVED_DIR, 'manga');
-if (!fs.existsSync(MANGA_DIR)) {
-  fs.mkdirSync(MANGA_DIR, { recursive: true });
-}
-// Series cover art, kept separate from chapter pages under MANGA_DIR - one
-// file per series, named by series id so it survives a title/name change.
-const COVERS_DIR = path.join(SAVED_DIR, 'covers');
-if (!fs.existsSync(COVERS_DIR)) {
-  fs.mkdirSync(COVERS_DIR, { recursive: true });
-}
-// Human-readable export target: <series title>/<chapter name>/, separate
-// from the opaque id-keyed folders under MANGA_DIR that the scraper itself
-// uses for storage/dedup bookkeeping.
-const EXPORT_DIR = path.join(DATA_DIR, 'export');
-if (!fs.existsSync(EXPORT_DIR)) {
-  fs.mkdirSync(EXPORT_DIR, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// R2 (Cloudflare's S3-compatible object storage) - where every page/cover
+// image is uploaded. Credentials come from the environment (see .env.example)
+// rather than being hardcoded; run with `npm start` (loads .env if present)
+// or export them in the shell yourself.
+// ---------------------------------------------------------------------------
+
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || 'solo';
+
+if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
+  throw new Error(
+    'Missing R2 credentials. Copy .env.example to .env and fill in R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY, ' +
+    'or export them in the shell before running.'
+  );
 }
 
-// Serve saved images statically
-app.use('/api/saved-assets', express.static(SAVED_DIR));
+const r2 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
+});
+
+const R2_CONTENT_TYPE_BY_EXT = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', avif: 'image/avif'
+};
+
+const R2_UPLOAD_RETRIES = 3;
+
+// Uploads one object with a few retries (short backoff) so a single flaky
+// request doesn't cost a full chapter re-scrape - see scrapeChapterCoreAttempt,
+// which still falls back to re-downloading from the source and retrying the
+// whole chapter (up to MAX_CHAPTER_RETRIES) if every attempt here fails.
+async function uploadToR2(key, buffer, ext) {
+  const contentType = R2_CONTENT_TYPE_BY_EXT[ext] || 'application/octet-stream';
+  let lastError;
+  for (let attempt = 1; attempt <= R2_UPLOAD_RETRIES; attempt++) {
+    try {
+      await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: buffer, ContentType: contentType }));
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < R2_UPLOAD_RETRIES) await sleep(500 * attempt);
+    }
+  }
+  throw new Error(`R2 upload failed for ${key} after ${R2_UPLOAD_RETRIES} attempts: ${lastError.message}`);
+}
+
+async function r2ObjectExists(key) {
+  try {
+    await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Deletes every object under a prefix (R2 has no real directories - a
+// chapter "folder" is just a shared key prefix) so a re-scrape that wipes
+// and re-downloads a chapter doesn't leave yesterday's now-unwanted pages
+// (e.g. a page count that shrank after ad-filtering changed) orphaned in
+// the bucket.
+async function deleteR2Prefix(prefix) {
+  let continuationToken;
+  do {
+    const list = await r2.send(new ListObjectsV2Command({ Bucket: R2_BUCKET, Prefix: prefix, ContinuationToken: continuationToken }));
+    const objects = (list.Contents || []).map(o => ({ Key: o.Key }));
+    if (objects.length > 0) {
+      await r2.send(new DeleteObjectsCommand({ Bucket: R2_BUCKET, Delete: { Objects: objects } }));
+    }
+    continuationToken = list.IsTruncated ? list.NextContinuationToken : undefined;
+  } while (continuationToken);
+}
 
 // Initial Database Structure
 const defaultDb = {
-  monitors: [
-    {
-      id: "1",
-      name: "Google Homepage",
-      url: "https://www.google.com",
-      interval: 30, // 30 seconds
-      active: true,
-      status: "unknown",
-      lastCheck: null,
-      lastResponseTime: null,
-      lastError: null,
-      checks: []
-    },
-    {
-      id: "2",
-      name: "GitHub Website",
-      url: "https://github.com",
-      interval: 60, // 60 seconds
-      active: true,
-      status: "unknown",
-      lastCheck: null,
-      lastResponseTime: null,
-      lastError: null,
-      checks: []
-    }
-  ],
-  logs: [],
-  saved: [],
   series: [],
-  siteCrawls: [],
-  settings: { puppeteerDomains: [] }
+  siteCrawls: []
 };
 
 // ---------------------------------------------------------------------------
 // Persistence, two tiers:
 //
-//  1. "store" - one JSON blob row, exactly as before, for monitors/logs/saved
-//     gallery images/site-crawls/settings. Small, never grows past a few MB,
-//     never showed a size or write-contention problem - left alone.
+//  1. "store" - one JSON blob row, exactly as before, for site-crawls state.
+//     Small, never grows past a few MB, never showed a size or
+//     write-contention problem - left alone.
 //
 //  2. Manga data (series/chapters/images) - real relational tables, not part
 //     of the blob. This is the part that actually grows without bound (tens
@@ -445,9 +461,9 @@ function readDb() {
   return dbCache;
 }
 
-// Write Database - persists the non-series app state (monitors/logs/saved/
-// siteCrawls/settings) to the blob. Series changes must go through
-// saveSeries()/deleteSeriesRow() instead - see the migration note above.
+// Write Database - persists the non-series app state (siteCrawls) to the
+// blob. Series changes must go through saveSeries()/deleteSeriesRow()
+// instead - see the migration note above.
 function writeDb(data) {
   dbCache = data;
   try {
@@ -460,9 +476,6 @@ function writeDb(data) {
 
 dbCache = loadDbFromDisk();
 seriesCache = buildSeriesTree();
-
-// Polling Checking Logic
-const isChecking = {};
 
 // Node's global fetch (undici) wraps the real network failure in err.cause with a
 // libuv/OpenSSL error code (ENOTFOUND, ECONNREFUSED, CERT_HAS_EXPIRED, ...).
@@ -498,251 +511,7 @@ function describeCheckError(err) {
   return err.message || 'Connection failed';
 }
 
-async function checkSite(monitor) {
-  const startTime = performance.now();
-  const timestamp = new Date().toISOString();
-  let status = 'down';
-  let responseTime = 0;
-  let statusCode = null;
-  let errorMsg = null;
 
-  try {
-    // 10 second timeout using AbortController
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    const response = await fetch(monitor.url, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'UptimeRobot/1.0 (Status Checker Bot)'
-      },
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-    responseTime = Math.round(performance.now() - startTime);
-    statusCode = response.status;
-    
-    // Status is UP if HTTP code is in the 2xx or 3xx range
-    if (response.status >= 200 && response.status < 400) {
-      status = 'up';
-    } else {
-      status = 'down';
-      errorMsg = `HTTP Error Code: ${response.status}`;
-    }
-  } catch (err) {
-    responseTime = Math.round(performance.now() - startTime);
-    status = 'down';
-    errorMsg = describeCheckError(err);
-  }
-
-  // Update DB state
-  const db = readDb();
-  const dbMonitor = db.monitors.find(m => m.id === monitor.id);
-
-  if (dbMonitor) {
-    const oldStatus = dbMonitor.status;
-    dbMonitor.status = status;
-    dbMonitor.lastCheck = timestamp;
-    dbMonitor.lastResponseTime = status === 'up' ? responseTime : null;
-    dbMonitor.lastError = status === 'down' ? errorMsg : null;
-
-    // Record check history
-    if (!dbMonitor.checks) dbMonitor.checks = [];
-    dbMonitor.checks.push({
-      timestamp,
-      status,
-      responseTime,
-      statusCode,
-      error: errorMsg
-    });
-
-    // Limit check history to last 50 entries
-    if (dbMonitor.checks.length > 50) {
-      dbMonitor.checks = dbMonitor.checks.slice(-50);
-    }
-
-    // Detect status transitions & log alert
-    if (oldStatus !== 'unknown' && oldStatus !== status) {
-      const logEvent = {
-        id: Math.random().toString(36).substr(2, 9),
-        monitorId: monitor.id,
-        monitorName: monitor.name,
-        url: monitor.url,
-        from: oldStatus,
-        to: status,
-        timestamp,
-        responseTime: status === 'up' ? responseTime : null,
-        error: errorMsg
-      };
-
-      if (!db.logs) db.logs = [];
-      db.logs.unshift(logEvent); // Prepend so latest is first
-
-      // Limit logs to last 100 entries
-      if (db.logs.length > 100) {
-        db.logs = db.logs.slice(0, 100);
-      }
-    }
-
-    writeDb(db);
-  }
-}
-
-// Background scheduler tick (runs every 5 seconds)
-async function startScheduler() {
-  console.log('Uptime Monitor Scheduler Started...');
-  setInterval(async () => {
-    const db = readDb();
-    const now = Date.now();
-
-    for (const monitor of db.monitors) {
-      if (!monitor.active) continue;
-
-      const intervalMs = (monitor.interval || 60) * 1000;
-      const lastCheckTime = monitor.lastCheck ? new Date(monitor.lastCheck).getTime() : 0;
-
-      if ((now - lastCheckTime >= intervalMs || !monitor.lastCheck) && !isChecking[monitor.id]) {
-        isChecking[monitor.id] = true;
-        checkSite(monitor).finally(() => {
-          isChecking[monitor.id] = false;
-        });
-      }
-    }
-  }, 5000);
-}
-
-// API Routes
-
-// Get all monitors
-app.get('/api/monitors', (req, res) => {
-  const db = readDb();
-  res.json(db.monitors);
-});
-
-// Add a monitor
-app.post('/api/monitors', (req, res) => {
-  const { name, url, interval } = req.body;
-  if (!name || !url) {
-    return res.status(400).json({ error: 'Name and URL are required' });
-  }
-
-  // Format and validate URL
-  let formattedUrl = url.trim();
-  if (!/^https?:\/\//i.test(formattedUrl)) {
-    formattedUrl = 'http://' + formattedUrl;
-  }
-
-  const db = readDb();
-  const newMonitor = {
-    id: Date.now().toString(),
-    name: name ? name.trim() : formattedUrl,
-    useStealth: !!useStealth,
-    metadata: null,
-    metadataFetchedAt: null,
-    interval: parseInt(interval, 10) || 60,
-    active: true,
-    status: 'unknown',
-    lastCheck: null,
-    lastResponseTime: null,
-    lastError: null,
-    checks: []
-  };
-
-  db.monitors.push(newMonitor);
-  writeDb(db);
-
-  // Trigger check immediately in background
-  isChecking[newMonitor.id] = true;
-  checkSite(newMonitor).finally(() => {
-    isChecking[newMonitor.id] = false;
-  });
-
-  res.status(201).json(newMonitor);
-});
-
-// Update a monitor
-app.put('/api/monitors/:id', (req, res) => {
-  const { id } = req.params;
-  const { name, url, interval, active } = req.body;
-
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === id);
-
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  if (name !== undefined) monitor.name = name.trim();
-  if (url !== undefined) {
-    let formattedUrl = url.trim();
-    if (!/^https?:\/\//i.test(formattedUrl)) {
-      formattedUrl = 'http://' + formattedUrl;
-    }
-    monitor.url = formattedUrl;
-  }
-  if (interval !== undefined) monitor.interval = parseInt(interval, 10) || 60;
-  if (active !== undefined) monitor.active = !!active;
-
-  // If reactivating, clear status to unknown and trigger immediate check
-  if (active === true && !monitor.active) {
-    monitor.status = 'unknown';
-    isChecking[monitor.id] = true;
-    checkSite(monitor).finally(() => {
-      isChecking[monitor.id] = false;
-    });
-  }
-
-  writeDb(db);
-  res.json(monitor);
-});
-
-// Delete a monitor
-app.delete('/api/monitors/:id', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const initialLength = db.monitors.length;
-  
-  db.monitors = db.monitors.filter(m => m.id !== id);
-  
-  if (db.monitors.length === initialLength) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  // Clear any logs related to this monitor
-  db.logs = db.logs.filter(l => l.monitorId !== id);
-
-  writeDb(db);
-  res.json({ message: 'Monitor deleted successfully' });
-});
-
-// Trigger check manually
-app.post('/api/monitors/:id/check', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === id);
-
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  if (isChecking[id]) {
-    return res.status(429).json({ error: 'Check already in progress' });
-  }
-
-  isChecking[id] = true;
-  try {
-    await checkSite(monitor);
-    // Fetch fresh state to return
-    const updatedDb = readDb();
-    const updatedMonitor = updatedDb.monitors.find(m => m.id === id);
-    res.json(updatedMonitor);
-  } catch (error) {
-    res.status(500).json({ error: 'Manual check failed' });
-  } finally {
-    isChecking[id] = false;
-  }
-});
 
 // Matches a bare UI-chrome icon filename (a lightbox close button, nav
 // arrows, a loading spinner, ...) with no other keyword to flag it by.
@@ -838,42 +607,6 @@ function extractImagesFromHtml(html, pageUrl) {
 
   return filtered.map(([url, alt]) => ({ url, type: classifyImageType(url, alt) }));
 }
-
-// Get website images (scrapes both HTML img tags and JS string arrays)
-app.get('/api/monitors/:id/images', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === id);
-
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
-
-    const response = await fetch(monitor.url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-      },
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`HTTP Error: ${response.status}`);
-    }
-
-    const html = await response.text();
-    res.json({ images: extractImagesFromHtml(html, monitor.url) });
-  } catch (error) {
-    console.error(`Error scraping images from ${monitor.url}:`, error);
-    res.status(500).json({ error: `Failed to scrape images: ${error.message}` });
-  }
-});
 
 // Fetches a URL as plain text with a timeout, returning null on any failure
 // (missing file, network error, non-2xx status) instead of throwing - callers
@@ -1378,57 +1111,6 @@ async function fetchPageDetails(pageUrl, useStealth = false) {
   }
 }
 
-// Scan every page a site's sitemap.xml declares (bounded), reporting each
-// page's up/down status and the images found on it.
-app.get('/api/monitors/:id/pages', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === id);
-
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  try {
-    const discovery = await discoverSitemapPages(monitor.url);
-    if (!discovery.sitemapFound) {
-      return res.status(404).json({ error: 'ไม่พบ sitemap.xml สำหรับเว็บนี้ (เช็คทั้ง robots.txt และ /sitemap.xml แล้ว)' });
-    }
-
-    // Scan pages one at a time with a randomized delay between them (never
-    // concurrently) - a burst of parallel requests is what got a real site
-    // blocked during testing. Stop immediately if the site starts responding
-    // with 429/403, rather than continuing to hammer a site that's blocking us.
-    const pages = [];
-    let blockedEarly = false;
-    for (let i = 0; i < discovery.pages.length; i++) {
-      if (i > 0) {
-        await sleep(computeNextDelayMs(discovery.crawlDelaySeconds));
-      }
-
-      const detail = await fetchPageDetails(discovery.pages[i], monitor.useStealth);
-      pages.push(detail);
-
-      if (detail.statusCode === 429 || detail.statusCode === 403) {
-        blockedEarly = true;
-        break;
-      }
-    }
-
-    res.json({
-      totalDiscovered: discovery.totalDiscovered,
-      totalAllowed: discovery.totalAllowed,
-      processedCount: pages.length,
-      limited: discovery.totalAllowed > pages.length,
-      blockedEarly,
-      pages
-    });
-  } catch (error) {
-    console.error(`Error scanning pages for ${monitor.url}:`, error);
-    res.status(500).json({ error: `Failed to scan site pages: ${error.message}` });
-  }
-});
-
 // Helper to extract file extension
 function getExtension(url, contentType) {
   if (contentType) {
@@ -1501,263 +1183,6 @@ function isNavigationHref(hrefRaw, pageUrl) {
     return false;
   }
 }
-
-// Save selected website image
-app.post('/api/images/save', async (req, res) => {
-  const { monitorId, imageUrl } = req.body;
-  if (!monitorId || !imageUrl) {
-    return res.status(400).json({ error: 'monitorId and imageUrl are required' });
-  }
-
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === monitorId);
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s download timeout
-
-    let referer = '';
-    try {
-      referer = new URL(imageUrl).origin;
-    } catch (e) {}
-
-    const response = await fetch(imageUrl, {
-      headers: clearanceHeaders(imageUrl, {
-        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'Referer': referer
-      }),
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: HTTP ${response.status}`);
-    }
-
-    const contentType = response.headers.get('content-type');
-    const ext = getExtension(imageUrl, contentType);
-    
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
-    const randomSuffix = Math.random().toString(36).substr(2, 9);
-    const filename = `${monitorId}_${randomSuffix}.${ext}`;
-    const filePath = path.join(SAVED_DIR, filename);
-
-    // Save physical file
-    await fs.promises.writeFile(filePath, buffer);
-
-    // Save DB Metadata
-    const savedRecord = {
-      id: Date.now().toString(),
-      monitorId,
-      monitorName: monitor.name,
-      originalUrl: imageUrl,
-      filename,
-      type: classifyImageType(imageUrl),
-      timestamp: new Date().toISOString()
-    };
-
-    if (!db.saved) db.saved = [];
-    db.saved.push(savedRecord);
-    writeDb(db);
-
-    res.status(201).json(savedRecord);
-  } catch (error) {
-    console.error(`Error saving image from ${imageUrl}:`, error);
-    res.status(500).json({ error: `Failed to save image: ${error.message}` });
-  }
-});
-
-// Save multiple website images at once (Batch Save)
-app.post('/api/images/save-all', async (req, res) => {
-  const { monitorId, imageUrls } = req.body;
-  if (!monitorId || !imageUrls || !Array.isArray(imageUrls)) {
-    return res.status(400).json({ error: 'monitorId and imageUrls array are required' });
-  }
-
-  const db = readDb();
-  const monitor = db.monitors.find(m => m.id === monitorId);
-  if (!monitor) {
-    return res.status(404).json({ error: 'Monitor not found' });
-  }
-
-  const savedRecords = [];
-  const errors = [];
-  const batchSize = 5; // Batch download 5 files at a time to prevent server spikes
-
-  for (let i = 0; i < imageUrls.length; i += batchSize) {
-    const batch = imageUrls.slice(i, i + batchSize);
-    await Promise.all(batch.map(async (imageUrl) => {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
-
-        let referer = '';
-        try {
-          referer = new URL(imageUrl).origin;
-        } catch (e) {}
-
-        const headers = clearanceHeaders(imageUrl, {
-          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-          'Referer': referer
-        });
-
-        const response = await fetch(imageUrl, {
-          headers,
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-          throw new Error(`HTTP Error ${response.status}`);
-        }
-
-        const contentType = response.headers.get('content-type');
-        const ext = getExtension(imageUrl, contentType);
-        
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        
-        const randomSuffix = Math.random().toString(36).substr(2, 9);
-        const filename = `${monitorId}_${randomSuffix}.${ext}`;
-        const filePath = path.join(SAVED_DIR, filename);
-
-        await fs.promises.writeFile(filePath, buffer);
-
-        const savedRecord = {
-          id: (Date.now() + Math.floor(Math.random() * 1000)).toString(),
-          monitorId,
-          monitorName: monitor.name,
-          originalUrl: imageUrl,
-          filename,
-          type: classifyImageType(imageUrl),
-          timestamp: new Date().toISOString()
-        };
-        
-        savedRecords.push(savedRecord);
-      } catch (err) {
-        errors.push({ url: imageUrl, error: err.message });
-      }
-    }));
-  }
-
-  // Update DB once
-  if (savedRecords.length > 0) {
-    if (!db.saved) db.saved = [];
-    db.saved.push(...savedRecords);
-    writeDb(db);
-  }
-
-  res.status(200).json({
-    savedCount: savedRecords.length,
-    savedRecords,
-    errorCount: errors.length,
-    errors
-  });
-});
-
-// Get all saved images
-app.get('/api/images/saved', (req, res) => {
-  const db = readDb();
-  res.json(db.saved || []);
-});
-
-// Delete a specific set of saved images by id (multi-select bulk delete).
-// Registered before the '/:id' route below, otherwise Express would match
-// this path's "bulk" segment as an :id and shadow this handler.
-app.delete('/api/images/saved/bulk', (req, res) => {
-  const { ids } = req.body;
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'ids array is required' });
-  }
-
-  const db = readDb();
-  if (!db.saved) db.saved = [];
-  const idsSet = new Set(ids);
-  const toDelete = db.saved.filter(item => idsSet.has(item.id));
-
-  if (toDelete.length === 0) {
-    return res.status(404).json({ error: 'No matching saved images found' });
-  }
-
-  toDelete.forEach(record => {
-    const filePath = path.join(SAVED_DIR, record.filename);
-    fs.unlink(filePath, (err) => {
-      if (err && err.code !== 'ENOENT') {
-        console.error(`Failed to delete file ${filePath}:`, err);
-      }
-    });
-  });
-
-  db.saved = db.saved.filter(item => !idsSet.has(item.id));
-  writeDb(db);
-
-  res.json({ message: `Successfully deleted ${toDelete.length} saved images` });
-});
-
-// Delete saved image from server
-app.delete('/api/images/saved/:id', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  
-  if (!db.saved) db.saved = [];
-  const index = db.saved.findIndex(item => item.id === id);
-  
-  if (index === -1) {
-    return res.status(404).json({ error: 'Saved image not found' });
-  }
-
-  const record = db.saved[index];
-  const filePath = path.join(SAVED_DIR, record.filename);
-
-  // Delete physical file in background
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== 'ENOENT') {
-      console.error(`Failed to delete file ${filePath}:`, err);
-    }
-  });
-
-  // Remove metadata
-  db.saved.splice(index, 1);
-  writeDb(db);
-
-  res.json({ message: 'Saved image deleted successfully' });
-});
-
-// Delete a group of saved images by monitor ID
-app.delete('/api/images/saved/group/:monitorId', (req, res) => {
-  const { monitorId } = req.params;
-  const db = readDb();
-  
-  if (!db.saved) db.saved = [];
-  const toDelete = db.saved.filter(item => item.monitorId === monitorId);
-  
-  if (toDelete.length === 0) {
-    return res.status(404).json({ error: 'No saved images found for this monitor' });
-  }
-
-  // Delete physical files
-  toDelete.forEach(record => {
-    const filePath = path.join(SAVED_DIR, record.filename);
-    fs.unlink(filePath, (err) => {
-      if (err && err.code !== 'ENOENT') {
-        console.error(`Failed to delete file ${filePath}:`, err);
-      }
-    });
-  });
-
-  // Filter out metadata from DB
-  db.saved = db.saved.filter(item => item.monitorId !== monitorId);
-  writeDb(db);
-
-  res.json({ message: `Successfully deleted ${toDelete.length} saved images for this group` });
-});
 
 // ---------------------------------------------------------------------------
 // Manga Downloader: lets a user register a manga "series", split it into
@@ -1934,16 +1359,17 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
   return meta;
 }
 
-// Downloads a series' cover art exactly once. Guarded by whether a cover file
-// already sits on disk for this series id - not by whether metadata was just
-// (re-)fetched - so calling this after every SEO metadata refresh (which can
-// happen many times over a series' life) never re-downloads the same cover.
+// Downloads a series' cover art exactly once. Guarded by whether a cover
+// object already exists in R2 for this series id - not by whether metadata
+// was just (re-)fetched - so calling this after every SEO metadata refresh
+// (which can happen many times over a series' life) never re-uploads the
+// same cover.
 async function downloadCoverImageIfMissing(series) {
   const coverUrl = series.metadata?.coverImageUrl;
   if (!coverUrl) return;
 
   const existingPath = series.metadata.coverImagePath;
-  if (existingPath && fs.existsSync(path.join(SAVED_DIR, existingPath))) return;
+  if (existingPath && await r2ObjectExists(existingPath)) return;
 
   try {
     const download = await fetchImageWithRetry(coverUrl, clearanceHeaders(coverUrl, {
@@ -1954,15 +1380,16 @@ async function downloadCoverImageIfMissing(series) {
     const contentType = download.response.headers.get('content-type');
     const ext = getExtension(coverUrl, contentType);
     const buffer = Buffer.from(await download.response.arrayBuffer());
-    // Human-readable prefix for browsing the shared covers folder by eye,
-    // with the series id kept as a suffix so two series that happen to
-    // share a title never overwrite each other's cover on disk.
+    // Human-readable prefix for browsing the bucket by eye, with the series
+    // id kept as a suffix so two series that happen to share a title never
+    // overwrite each other's cover.
     const seriesTitle = sanitizeForFilename(series.metadata?.title || series.name, series.id);
     const fileName = `${seriesTitle}_cover_${series.id}.${ext}`;
-    fs.writeFileSync(path.join(COVERS_DIR, fileName), buffer);
-    series.metadata.coverImagePath = `covers/${fileName}`;
+    const key = `cover/${fileName}`;
+    await uploadToR2(key, buffer, ext);
+    series.metadata.coverImagePath = key;
   } catch (err) {
-    console.error(`Failed to download cover image for series ${series.id}:`, err.message);
+    console.error(`Failed to upload cover image for series ${series.id}:`, err.message);
   }
 }
 
@@ -2222,41 +1649,7 @@ function findChapterGaps(chapters) {
   return { min, max, missing };
 }
 
-// Get global settings
-app.get('/api/settings', (req, res) => {
-  const db = readDb();
-  if (!db.settings) db.settings = { puppeteerDomains: [] };
-  // Auto-retry / auto-update both default ON when never set.
-  if (db.settings.autoRetryEnabled === undefined) db.settings.autoRetryEnabled = true;
-  if (db.settings.autoUpdateEnabled === undefined) db.settings.autoUpdateEnabled = true;
-  res.json(db.settings);
-});
 
-// Update global settings
-app.post('/api/settings', (req, res) => {
-  const db = readDb();
-  if (!db.settings) db.settings = { puppeteerDomains: [] };
-
-  const { puppeteerDomains, autoRetryEnabled, autoUpdateEnabled } = req.body;
-  if (Array.isArray(puppeteerDomains)) {
-    db.settings.puppeteerDomains = puppeteerDomains;
-  }
-  if (typeof autoRetryEnabled === 'boolean') {
-    db.settings.autoRetryEnabled = autoRetryEnabled;
-  }
-  if (typeof autoUpdateEnabled === 'boolean') {
-    db.settings.autoUpdateEnabled = autoUpdateEnabled;
-  }
-
-  writeDb(db);
-  res.json(db.settings);
-});
-
-// Get all manga series (with their chapters)
-app.get('/api/series', (req, res) => {
-  const db = readDb();
-  res.json(db.series || []);
-});
 
 // Comparable "identity" tokens for a series: its display name plus, when it's
 // a URL-shaped name (added by pasting a listing URL with no title typed in
@@ -2304,166 +1697,7 @@ function findPossibleDuplicateSeries(db, candidateSeries) {
     .map(s => ({ id: s.id, name: s.name }));
 }
 
-app.post('/api/series', (req, res) => {
-  const { seriesUrl, name, useStealth } = req.body;
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'Series name is required' });
-  }
 
-  const db = readDb();
-  if (!db.series) db.series = [];
-
-  const normalizedName = normalizeForComparison(name);
-  const existingSeries = db.series.find(s => normalizeForComparison(s.name) === normalizedName);
-  if (existingSeries) {
-    return res.status(200).json(existingSeries);
-  }
-
-  const newSeries = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    useStealth: !!useStealth,
-    metadata: null,
-    metadataFetchedAt: null,
-    createdAt: new Date().toISOString(),
-    seriesUrl: seriesUrl ? seriesUrl.trim() : null,
-    sourceUrls: [],
-    chapters: []
-  };
-
-  const possibleDuplicates = findPossibleDuplicateSeries(db, newSeries);
-
-  db.series.push(newSeries);
-  saveSeries(newSeries);
-
-  res.status(201).json({ ...newSeries, possibleDuplicates });
-});
-
-// Reports holes in a series' chapter numbering (e.g. has 1-255, 257-880 but
-// no 256) so a stuck/incomplete source doesn't go unnoticed just because the
-// chapters it does have all show "done".
-app.get('/api/series/:id/chapter-gaps', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  res.json(findChapterGaps(series.chapters));
-});
-
-// Delete a manga series (and every chapter/image saved under it)
-app.delete('/api/series/:id', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  if (!db.series) db.series = [];
-
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  const seriesDir = path.join(MANGA_DIR, id);
-  fs.rm(seriesDir, { recursive: true, force: true }, (err) => {
-    if (err) console.error(`Failed to remove series folder ${seriesDir}:`, err);
-  });
-
-  deleteSeriesRow(id);
-
-  res.json({ message: 'Series deleted successfully' });
-});
-
-// Add a chapter (name + page URL) to a series
-app.post('/api/series/:id/chapters', (req, res) => {
-  const { id } = req.params;
-  const { name, url } = req.body;
-  if (!name || !name.trim() || !url || !url.trim()) {
-    return res.status(400).json({ error: 'Chapter name and URL are required' });
-  }
-
-  let formattedUrl = url.trim();
-  if (!/^https?:\/\//i.test(formattedUrl)) {
-    formattedUrl = 'http://' + formattedUrl;
-  }
-
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  const newChapter = {
-    id: Date.now().toString(),
-    name: name.trim(),
-    url: formattedUrl,
-    status: 'pending', // pending -> scraping -> done | blocked | error
-    images: [],
-    error: null,
-    scrapedAt: null,
-    retryCount: 0
-  };
-
-  if (!series.chapters) series.chapters = [];
-  series.chapters.push(newChapter);
-  saveSeries(series);
-
-  res.status(201).json(newChapter);
-});
-
-// Delete a chapter (and its downloaded images) from a series
-app.delete('/api/series/:id/chapters/:chapterId', (req, res) => {
-  const { id, chapterId } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  const chapter = findChapter(series, chapterId);
-  if (!chapter) {
-    return res.status(404).json({ error: 'Chapter not found' });
-  }
-
-  const chapterDir = path.join(MANGA_DIR, id, chapterId);
-  fs.rm(chapterDir, { recursive: true, force: true }, (err) => {
-    if (err) console.error(`Failed to remove chapter folder ${chapterDir}:`, err);
-  });
-
-  series.chapters = series.chapters.filter(c => c.id !== chapterId);
-  saveSeries(series);
-
-  res.json({ message: 'Chapter deleted successfully' });
-});
-
-// Remove a single image from a chapter - for when the automatic ad/credit
-// filters (URL-keyword and cross-chapter content-hash dedup) miss a one-off
-// translator note or promo slide and a human has to review and strip it out
-// by hand instead.
-app.delete('/api/series/:id/chapters/:chapterId/images/:filename', (req, res) => {
-  const { id, chapterId, filename } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  const chapter = findChapter(series, chapterId);
-  if (!chapter) {
-    return res.status(404).json({ error: 'Chapter not found' });
-  }
-  const image = (chapter.images || []).find(img => img.filename === filename);
-  if (!image) {
-    return res.status(404).json({ error: 'Image not found in this chapter' });
-  }
-
-  fs.rm(path.join(MANGA_DIR, id, chapterId, filename), { force: true }, (err) => {
-    if (err) console.error(`Failed to remove image file ${filename}:`, err);
-  });
-  chapter.images = chapter.images.filter(img => img.filename !== filename);
-  updateChapter(chapter);
-
-  res.json({ message: 'Image deleted successfully', remainingCount: chapter.images.length });
-});
 
 // Core of chapter scraping, shared by the single-chapter route and the
 // scrape-all-chapters route below. Mutates `chapter` in place and persists
@@ -2578,12 +1812,11 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       return { httpStatus: 404, error: chapter.error };
     }
 
-    // Wipe any previous download for this chapter first, so a re-scrape
-    // after the filters above catch something new doesn't leave stale
-    // pages (e.g. yesterday's ad banner) sitting alongside the fresh set.
-    const chapterDir = path.join(MANGA_DIR, seriesId, chapter.id);
-    fs.rmSync(chapterDir, { recursive: true, force: true });
-    fs.mkdirSync(chapterDir, { recursive: true });
+    // Wipe any previous upload for this chapter first, so a re-scrape after
+    // the filters above catch something new doesn't leave stale pages (e.g.
+    // yesterday's ad banner) orphaned in R2 under the old key prefix.
+    const chapterKeyPrefix = `manga/${seriesId}/${chapter.id}/`;
+    await deleteR2Prefix(chapterKeyPrefix);
 
     // Human-readable page filenames - <series title>_ep<chapter number>_<page
     // number>.<ext> - instead of bare "001.jpg", so a page is identifiable by
@@ -2697,13 +1930,13 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         }
 
         const filename = `${seriesTitleForFile}_ep${chapterLabel}_${String(i + 1).padStart(3, '0')}.${ext}`;
-        const filePath = path.join(chapterDir, filename);
-        await fs.promises.writeFile(filePath, buffer);
+        const key = `${chapterKeyPrefix}${filename}`;
+        await uploadToR2(key, buffer, ext);
 
         downloaded.push({
           order: i + 1,
           filename,
-          relativePath: `manga/${seriesId}/${chapter.id}/${filename}`,
+          relativePath: key,
           originalUrl: imageUrl,
           contentHash,
           ...(pHash ? { pHash } : {})
@@ -2741,35 +1974,6 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     return { httpStatus: 500, error: chapter.error };
   }
 }
-
-// Scrape a single chapter's page for manga images only, and download every
-// one of them to disk.
-app.post('/api/series/:id/chapters/:chapterId/scrape', async (req, res) => {
-  const { id, chapterId } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  const chapter = findChapter(series, chapterId);
-  if (!chapter) {
-    return res.status(404).json({ error: 'Chapter not found' });
-  }
-  if (scrapingChapters[chapterId]) {
-    return res.status(429).json({ error: 'This chapter is already being scraped' });
-  }
-
-  scrapingChapters[chapterId] = true;
-  try {
-    const result = await scrapeChapterCore(db, series, chapter);
-    if (result.error) {
-      return res.status(result.httpStatus).json({ error: result.error });
-    }
-    res.json(chapter);
-  } finally {
-    scrapingChapters[chapterId] = false;
-  }
-});
 
 // Extracts every "chapter link" from a series' listing page: an <a href>
 // whose target sits under the same path as the listing page itself (manga
@@ -3058,70 +2262,6 @@ function findNextListingPageUrl(html, pageUrl) {
   return null;
 }
 
-// Discover every chapter link from a series' "all chapters" listing page and
-// add the ones that aren't already tracked. The user only has to paste one
-// URL (the page shown in their screenshot with the full episode list)
-// instead of adding each chapter by hand.
-app.post('/api/series/:id/discover-chapters', async (req, res) => {
-  const { id } = req.params;
-  const { url } = req.body;
-  if (!url || !url.trim()) {
-    return res.status(400).json({ error: 'Series listing page URL is required' });
-  }
-
-  let formattedUrl = url.trim();
-  if (!/^https?:\/\//i.test(formattedUrl)) {
-    formattedUrl = 'http://' + formattedUrl;
-  }
-
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  try {
-    const result = await discoverAndAddNewChapters(db, series, formattedUrl);
-
-    if (result.disallowed) {
-      return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
-    }
-    if (result.fetchFailed) {
-      return res.status(502).json({ error: 'ไม่สามารถเปิดหรืออ่านเนื้อหาหน้ารวมตอนนี้ได้' });
-    }
-    if (result.discoveredCount === 0) {
-      return res.status(404).json({ error: 'ไม่พบลิงก์ตอนในหน้านี้ ลองตรวจสอบว่านี่เป็นหน้ารวมตอนจริงหรือไม่' });
-    }
-
-    saveSeries(series);
-
-    // Same as check-updates: don't just list what was found, actually download
-    // it too - otherwise a freshly-discovered series just sits there pending
-    // until someone remembers to click "Scrape ทุกตอนที่ยังไม่เสร็จ".
-    let scrape = { scrapedCount: 0, blockedEarly: false };
-    if (!scrapingSeries[id]) {
-      scrapingSeries[id] = true;
-      try {
-        scrape = await runScrapeAllForSeries(db, series);
-        saveSeriesMetadata(series);
-      } finally {
-        scrapingSeries[id] = false;
-      }
-    }
-
-    res.json({
-      discoveredCount: result.discoveredCount,
-      addedCount: result.addedCount,
-      skippedCount: result.discoveredCount - result.addedCount,
-      addedChapters: [],
-      ...scrape
-    });
-  } catch (error) {
-    console.error(`Error discovering chapters from ${formattedUrl}:`, error);
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างค้นหาตอน' });
-  }
-});
-
 // Shared by fetch-metadata and export below (both need to politely re-fetch
 // a series' own detail page) - checks robots.txt first, same posture as
 // discover-chapters above.
@@ -3196,46 +2336,6 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
   return { discoveredCount: discovered.length, addedCount };
 }
 
-// Scrapes (or re-scrapes) a series' SEO metadata from its own detail page -
-// the same page discover-chapters points at - and stores it on the series
-// record. Body may optionally override which URL to use; otherwise falls
-// back to the series' already-known listing/detail page.
-app.post('/api/series/:id/fetch-metadata', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-
-  const targetUrl = (req.body && req.body.url && req.body.url.trim()) || series.seriesUrl;
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'ไม่มี URL หน้าเรื่องนี้ กรุณาค้นหาตอนอัตโนมัติก่อน หรือระบุ URL' });
-  }
-
-  try {
-    const { disallowed, html } = await fetchSeriesPageRespectingRobots(targetUrl, series.useStealth);
-    if (disallowed) {
-      return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
-    }
-    if (!html) {
-      return res.status(502).json({ error: 'ไม่สามารถเปิดหรืออ่านเนื้อหาหน้าเรื่องนี้ได้' });
-    }
-
-    series.metadata = extractSeriesMetadataFromHtml(html, targetUrl);
-    series.metadataFetchedAt = new Date().toISOString();
-    await downloadCoverImageIfMissing(series);
-    saveSeriesMetadata(series);
-
-    res.json({ metadata: series.metadata, metadataFetchedAt: series.metadataFetchedAt });
-  } catch (error) {
-    console.error(`Error fetching SEO metadata from ${targetUrl}:`, error);
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างดึงข้อมูลเรื่อง' });
-  }
-});
-
-let downloadingCovers = false; // guards against two bulk backfills running at once
-
 // Backfills cover art for every series that's missing one: series that
 // already have a coverImageUrl cached just get the file downloaded, and
 // series with no metadata yet (but a known seriesUrl) get a best-effort
@@ -3275,276 +2375,6 @@ async function backfillCoverImages(db) {
   return { checked: (db.series || []).length, downloaded, skipped };
 }
 
-app.post('/api/series/download-covers', async (req, res) => {
-  const db = readDb();
-  if (downloadingCovers) {
-    return res.status(429).json({ error: 'กำลังดาวน์โหลดปกอยู่แล้ว รอสักครู่' });
-  }
-
-  downloadingCovers = true;
-  try {
-    const result = await backfillCoverImages(db);
-    res.json(result);
-  } catch (error) {
-    console.error('Error backfilling cover images:', error);
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างดาวน์โหลดปก' });
-  } finally {
-    downloadingCovers = false;
-  }
-});
-
-const cleaningSeries = {}; // seriesId -> true while a duplicate-image sweep is in-flight
-
-// Retroactively finds and strips reused ad/credit-slide images out of
-// already-downloaded chapters by content, not URL. The per-chapter scraper
-// (see contentHash tracking above) only catches these going forward once a
-// hash has shown up under a second chapter - chapters downloaded before that
-// point (or before this feature existed at all, so they have no stored hash
-// yet) still have the images sitting in them. This hashes every image of
-// every chapter once, and any hash that turns out to repeat across 2+
-// different chapters is treated as confirmed shared site furniture and
-// removed from all of them.
-app.post('/api/series/:id/clean-duplicate-images', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  if (cleaningSeries[id]) {
-    return res.status(429).json({ error: 'กำลังตรวจสอบรูปซ้ำของเรื่องนี้อยู่แล้ว' });
-  }
-
-  cleaningSeries[id] = true;
-  try {
-    const chapters = (series.chapters || []).filter(c => (c.images || []).length > 0);
-
-    // Backfill contentHash for any image downloaded before this feature
-    // existed (or before the hash was stored on it) - this is disk I/O per
-    // file, not CPU work, so running a batch of these concurrently instead
-    // of one at a time cuts wall time enormously on a series with thousands
-    // of images.
-    const allImageEntries = chapters.flatMap(chapter => chapter.images.map(image => ({ chapter, image })));
-    await mapWithConcurrency(allImageEntries.filter(e => !e.image.contentHash), 24, async ({ chapter, image }) => {
-      try {
-        const buffer = await fs.promises.readFile(path.join(MANGA_DIR, id, chapter.id, image.filename));
-        image.contentHash = crypto.createHash('sha256').update(buffer).digest('hex');
-      } catch (err) {
-        // file missing on disk - nothing to hash/compare, leave contentHash unset
-      }
-    });
-
-    // Group every image in the series by hash.
-    const hashToEntries = new Map(); // hash -> [{ chapter, image }]
-    for (const { chapter, image } of allImageEntries) {
-      if (!image.contentHash) continue;
-      if (!hashToEntries.has(image.contentHash)) hashToEntries.set(image.contentHash, []);
-      hashToEntries.get(image.contentHash).push({ chapter, image });
-    }
-
-    if (!series.sharedAssetHashes) series.sharedAssetHashes = [];
-    const sharedHashSet = new Set(series.sharedAssetHashes);
-
-    let imagesRemoved = 0;
-    const affectedChapterIds = new Set();
-    for (const [hash, entries] of hashToEntries.entries()) {
-      const distinctChapterIds = new Set(entries.map(e => e.chapter.id));
-      if (distinctChapterIds.size < 2) continue; // only ever appeared in one chapter - real page art
-
-      if (!sharedHashSet.has(hash)) {
-        sharedHashSet.add(hash);
-        series.sharedAssetHashes.push(hash);
-      }
-      for (const { chapter, image } of entries) {
-        fs.rm(path.join(MANGA_DIR, id, chapter.id, image.filename), { force: true }, () => {});
-        chapter.images = chapter.images.filter(img => img.filename !== image.filename);
-        affectedChapterIds.add(chapter.id);
-        imagesRemoved++;
-      }
-    }
-
-    // Phase 2: perceptual-hash near-duplicate clustering, for reused
-    // ad/credit graphics that survived phase 1 because they weren't
-    // byte-identical (re-compressed/re-exported slightly differently each
-    // time). Only first/last-page candidates are checked - see
-    // isPHashCandidatePosition - both because that's where this kind of
-    // image conventionally lives and to keep the (much slower) image-decode
-    // cost bounded on series with hundreds of chapters.
-    const candidates = [];
-    for (const chapter of chapters) {
-      const total = chapter.images.length;
-      chapter.images.forEach((image, index) => {
-        if (isPHashCandidatePosition(index, total)) candidates.push({ chapter, image });
-      });
-    }
-    // Image decode is CPU-bound (unlike the file-read-only hashing above) so
-    // this won't parallelize as cleanly on a single core, but Jimp's decode
-    // still yields on I/O internally - a modest concurrency limit keeps
-    // throughput up without spawning worker threads.
-    await mapWithConcurrency(candidates.filter(c => !c.image.pHash), 8, async ({ chapter, image }) => {
-      image.pHash = await computePerceptualHash(path.join(MANGA_DIR, id, chapter.id, image.filename));
-    });
-    const hashedCandidates = candidates.filter(c => c.image.pHash);
-
-    // Union-find: cluster every candidate whose perceptual hash is within
-    // PHASH_DISTANCE_THRESHOLD of another's into the same group, so a chain
-    // of slightly-different re-exports of the same graphic all end up
-    // together even if the first and last in the chain aren't themselves
-    // close enough to directly match.
-    const parent = hashedCandidates.map((_, i) => i);
-    function find(i) { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
-    function union(i, j) { const ri = find(i), rj = find(j); if (ri !== rj) parent[ri] = rj; }
-    for (let i = 0; i < hashedCandidates.length; i++) {
-      for (let j = i + 1; j < hashedCandidates.length; j++) {
-        if (compareHashes(hashedCandidates[i].image.pHash, hashedCandidates[j].image.pHash) <= PHASH_DISTANCE_THRESHOLD) {
-          union(i, j);
-        }
-      }
-    }
-
-    const clusters = new Map(); // root index -> entries
-    hashedCandidates.forEach((entry, i) => {
-      const root = find(i);
-      if (!clusters.has(root)) clusters.set(root, []);
-      clusters.get(root).push(entry);
-    });
-
-    let nearDuplicatesRemoved = 0;
-    for (const entries of clusters.values()) {
-      const distinctChapterIds = new Set(entries.map(e => e.chapter.id));
-      if (distinctChapterIds.size < 2) continue; // only ever appeared in one chapter - real page art
-
-      for (const { chapter, image } of entries) {
-        fs.rm(path.join(MANGA_DIR, id, chapter.id, image.filename), { force: true }, () => {});
-        chapter.images = chapter.images.filter(img => img.filename !== image.filename);
-        affectedChapterIds.add(chapter.id);
-        nearDuplicatesRemoved++;
-      }
-    }
-
-    saveSeries(series);
-    res.json({
-      chaptersScanned: chapters.length,
-      chaptersAffected: affectedChapterIds.size,
-      imagesRemoved: imagesRemoved + nearDuplicatesRemoved,
-      exactDuplicatesRemoved: imagesRemoved,
-      nearDuplicatesRemoved
-    });
-  } catch (error) {
-    console.error(`Error cleaning duplicate images for series ${id}:`, error);
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างตรวจสอบรูปซ้ำ' });
-  } finally {
-    cleaningSeries[id] = false;
-  }
-});
-
-const exportingSeries = {}; // seriesId -> true while an export is in-flight
-
-// Copies every finished ("done") chapter of a series out of the opaque
-// id-keyed storage folders under MANGA_DIR into a human-readable
-// <series title>/<chapter name>/ tree under EXPORT_DIR, alongside a
-// metadata.json carrying the series' SEO fields (scraped on demand if not
-// already cached) - meant to be handed off/archived/used for a public-
-// facing site, unlike the working storage folders which are keyed by
-// opaque ids.
-app.post('/api/series/:id/export', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  if (exportingSeries[id]) {
-    return res.status(429).json({ error: 'กำลัง export เรื่องนี้อยู่แล้ว' });
-  }
-
-  const doneChapters = (series.chapters || []).filter(c => c.status === 'done');
-  if (doneChapters.length === 0) {
-    return res.status(400).json({ error: 'ยังไม่มีตอนที่โหลดเสร็จสำหรับเรื่องนี้' });
-  }
-
-  exportingSeries[id] = true;
-  try {
-    // Best-effort refresh of SEO metadata if it hasn't been fetched yet, so
-    // export always produces a metadata.json even for series added before
-    // this existed - a failure here shouldn't block exporting the files
-    // themselves.
-    if (!series.metadata && series.seriesUrl) {
-      try {
-        const { disallowed, html } = await fetchSeriesPageRespectingRobots(series.seriesUrl, series.useStealth);
-        if (!disallowed && html) {
-          series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
-          series.metadataFetchedAt = new Date().toISOString();
-          await downloadCoverImageIfMissing(series);
-        }
-      } catch (err) {
-        console.error(`Export: failed to fetch SEO metadata for series ${id}:`, err);
-      }
-    }
-
-    const seriesFolderName = sanitizeForFilename(series.metadata?.title || series.name, `series-${id}`);
-    const seriesExportDir = path.join(EXPORT_DIR, seriesFolderName);
-    await fs.promises.mkdir(seriesExportDir, { recursive: true });
-
-    const exportedChapters = [];
-    for (let i = 0; i < doneChapters.length; i++) {
-      const chapter = doneChapters[i];
-      const number = extractLeadingNumber(chapter.name);
-      const paddedNumber = String(Math.trunc(number !== null ? number : i + 1)).padStart(4, '0');
-      const chapterFolderName = `${paddedNumber}_${sanitizeForFilename(chapter.name, `chapter-${chapter.id}`)}`;
-      const chapterExportDir = path.join(seriesExportDir, chapterFolderName);
-      await fs.promises.mkdir(chapterExportDir, { recursive: true });
-
-      let copiedCount = 0;
-      for (const image of chapter.images || []) {
-        try {
-          await fs.promises.copyFile(path.join(SAVED_DIR, image.relativePath), path.join(chapterExportDir, image.filename));
-          copiedCount++;
-        } catch (err) {
-          console.error(`Export: failed to copy ${image.relativePath}:`, err);
-        }
-      }
-
-      exportedChapters.push({
-        id: chapter.id,
-        name: chapter.name,
-        number,
-        url: chapter.url,
-        folder: chapterFolderName,
-        imageCount: copiedCount
-      });
-    }
-
-    const metadataJson = {
-      seriesId: series.id,
-      name: series.metadata?.title || series.name,
-      seriesUrl: series.seriesUrl,
-      exportedAt: new Date().toISOString(),
-      metadataFetchedAt: series.metadataFetchedAt || null,
-      seo: series.metadata || null,
-      totalChaptersInSeries: (series.chapters || []).length,
-      exportedChapterCount: exportedChapters.length,
-      chapters: exportedChapters
-    };
-    await fs.promises.writeFile(path.join(seriesExportDir, 'metadata.json'), JSON.stringify(metadataJson, null, 2), 'utf-8');
-
-    saveSeriesMetadata(series);
-
-    res.json({
-      seriesFolderName,
-      exportPath: path.relative(DATA_DIR, seriesExportDir),
-      exportedChapterCount: exportedChapters.length,
-      metadata: series.metadata || null
-    });
-  } catch (error) {
-    console.error(`Error exporting series ${id}:`, error);
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่าง export' });
-  } finally {
-    exportingSeries[id] = false;
-  }
-});
-
-const scrapingSeries = {}; // seriesId -> true while a bulk scrape-all is in-flight
 
 // Scrape every not-yet-downloaded chapter in a series, one after another,
 // with the same jittered delay between chapters as between images within a
@@ -3624,105 +2454,6 @@ async function runScrapeAllForSeries(db, series) {
   blockedEarly = blockedEarly || (series.chapters || []).some(c => c.status === 'blocked');
   return { scrapedCount, blockedEarly };
 }
-
-app.post('/api/series/:id/scrape-all', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  if (scrapingSeries[id]) {
-    return res.status(429).json({ error: 'This series is already being scraped' });
-  }
-
-  const eligible = (series.chapters || []).filter(
-    c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
-  );
-  if (eligible.length === 0) {
-    return res.json({ scrapedCount: 0, blockedEarly: false, message: 'ไม่มีตอนที่ต้องโหลดเพิ่ม' });
-  }
-
-  scrapingSeries[id] = true;
-  try {
-    const result = await runScrapeAllForSeries(db, series);
-    res.json(result);
-  } finally {
-    scrapingSeries[id] = false;
-  }
-});
-
-// Re-download the chapters that ended up incomplete (error / partial / blocked),
-// INCLUDING the ones that already used up their automatic retry budget - the
-// retry cap only stops the unattended passes from hammering forever; an
-// explicit click here means "try these again now", so it resets their counter
-// first and then runs the same download-with-retries loop as /scrape-all.
-app.post('/api/series/:id/retry-problem-chapters', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  if (scrapingSeries[id]) {
-    return res.status(429).json({ error: 'This series is already being scraped' });
-  }
-
-  const problemChapters = (series.chapters || []).filter(c => c.status !== 'done' && !scrapingChapters[c.id]);
-  if (problemChapters.length === 0) {
-    return res.json({ scrapedCount: 0, blockedEarly: false, message: 'ไม่มีตอนที่มีปัญหาให้ลองใหม่' });
-  }
-  // Clear the retry budget so chapters stuck at the cap become eligible again.
-  problemChapters.forEach(c => { c.retryCount = 0; updateChapter(c); });
-
-  scrapingSeries[id] = true;
-  try {
-    const result = await runScrapeAllForSeries(db, series);
-    res.json({ ...result, retriedProblemCount: problemChapters.length });
-  } finally {
-    scrapingSeries[id] = false;
-  }
-});
-
-// Manually check a series for newly-released chapters and download just the new
-// ones (same thing the auto-update watchdog does on a schedule). Never touches
-// chapters already downloaded.
-app.post('/api/series/:id/check-updates', async (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const series = findSeries(db, id);
-  if (!series) {
-    return res.status(404).json({ error: 'Series not found' });
-  }
-  if (!series.seriesUrl) {
-    return res.status(400).json({ error: 'ซีรีส์นี้ไม่มี URL หน้ารวมตอน เลยเช็คตอนใหม่ให้ไม่ได้' });
-  }
-  if (scrapingSeries[id]) {
-    return res.status(429).json({ error: 'This series is already being scraped' });
-  }
-
-  scrapingSeries[id] = true;
-  try {
-    const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
-    series.lastUpdateCheckAt = new Date().toISOString();
-    saveSeries(series);
-
-    if (result.disallowed) return res.status(403).json({ error: 'robots.txt ของเว็บนี้ไม่อนุญาตให้เข้าหน้านี้' });
-    if (result.fetchFailed) return res.status(502).json({ error: 'เปิดหน้ารวมตอนไม่ได้' });
-
-    // Not gated on result.addedCount: a chapter added on a previous check that
-    // never finished downloading (still 'pending'/errored) won't show up as
-    // "new" here since it's already tracked by URL, but it still needs to be
-    // downloaded - runScrapeAllForSeries is a no-op if nothing is eligible.
-    const scrape = await runScrapeAllForSeries(db, series);
-    saveSeriesMetadata(series);
-    res.json({ newChapters: result.addedCount, ...scrape });
-  } catch (error) {
-    res.status(500).json({ error: error.message || 'เกิดข้อผิดพลาดระหว่างเช็คตอนใหม่' });
-  } finally {
-    scrapingSeries[id] = false;
-  }
-});
 
 // ---------------------------------------------------------------------------
 // Whole-site crawl: hand over just a site's root/listing URL and the bot
@@ -4093,410 +2824,231 @@ async function runSiteCrawl(crawlId) {
   }
 }
 
-// Start a whole-site crawl: discover every series on the site, then every
-// chapter of every series, downloading manga-only images throughout. Kicks
-// the background loop off and returns immediately - use GET /api/site-crawls
-// to poll progress.
-app.post('/api/site-crawls', (req, res) => {
-  const { url, useStealth } = req.body;
-  if (!url || !url.trim()) {
-    return res.status(400).json({ error: 'Site URL is required' });
+// ---------------------------------------------------------------------------
+// CLI entrypoint - this module has no HTTP server. Every invocation is a
+// single pass: discover/scrape whatever there is to do, write it to SQLite,
+// then exit. There is no long-lived watchdog; run this again (e.g. from
+// cron) to pick up new chapters/series later.
+// ---------------------------------------------------------------------------
+
+// Discovers new chapters and downloads everything not yet 'done' for every
+// series already tracked in the DB, then backfills any missing cover art.
+async function syncAllSeries(db) {
+  for (const series of db.series || []) {
+    if (series.seriesUrl) {
+      try {
+        const { addedCount } = await discoverAndAddNewChapters(db, series, series.seriesUrl);
+        if (addedCount > 0) console.log(`[sync] "${series.name}": ${addedCount} new chapter(s)`);
+      } catch (err) {
+        console.error(`[sync] discover failed for "${series.name}":`, err.message);
+      }
+      saveSeriesMetadata(series);
+    }
+    const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
+    if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
   }
 
-  let formattedUrl = url.trim();
-  if (!/^https?:\/\//i.test(formattedUrl)) {
-    formattedUrl = 'http://' + formattedUrl;
+  const coverResult = await backfillCoverImages(db);
+  if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
+}
+
+// Finishes any site crawl left in 'running' state from an interrupted
+// previous run - a CLI invocation is a fresh process every time, so nothing
+// else will ever come back to resume it otherwise.
+async function resumeRunningCrawls(db) {
+  for (const crawl of (db.siteCrawls || []).filter(c => c.status === 'running')) {
+    console.log(`[sync] resuming site crawl for ${crawl.siteUrl}`);
+    crawlControl[crawl.id] = { stopRequested: false };
+    await runSiteCrawl(crawl.id);
   }
+}
+
+// Registers (or finds by URL/name) a series and immediately discovers +
+// downloads its chapters - the CLI's equivalent of the old "add series" form
+// plus an immediate scrape, since there's no UI to come back and click
+// "scrape" later.
+async function addSeriesCommand(url, { name, stealth } = {}) {
+  const seriesUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
+  const db = readDb();
+  if (!db.series) db.series = [];
+
+  const fallbackName = (name && name.trim()) || new URL(seriesUrl).pathname.split('/').filter(Boolean).pop() || seriesUrl;
+  const normalizedName = normalizeForComparison(fallbackName);
+  let series = db.series.find(s => normalizeForComparison(s.name) === normalizedName || s.seriesUrl === seriesUrl);
+
+  if (!series) {
+    series = {
+      id: Date.now().toString(),
+      name: fallbackName,
+      useStealth: !!stealth,
+      metadata: null,
+      metadataFetchedAt: null,
+      createdAt: new Date().toISOString(),
+      seriesUrl,
+      sourceUrls: [],
+      chapters: []
+    };
+    const possibleDuplicates = findPossibleDuplicateSeries(db, series);
+    if (possibleDuplicates.length > 0) {
+      console.warn(`[add] "${fallbackName}" looks similar to already-tracked series: ${possibleDuplicates.map(d => d.name).join(', ')}`);
+    }
+    db.series.push(series);
+    saveSeries(series);
+    console.log(`[add] created series "${fallbackName}" (${series.id})`);
+  } else {
+    console.log(`[add] "${series.name}" is already tracked (${series.id}) - syncing it`);
+  }
+
+  const result = await discoverAndAddNewChapters(db, series, seriesUrl);
+  if (result.disallowed) throw new Error(`robots.txt disallows ${seriesUrl}`);
+  if (result.fetchFailed) throw new Error(`could not fetch ${seriesUrl}`);
+  saveSeriesMetadata(series);
+  console.log(`[add] discovered ${result.discoveredCount} chapter(s), ${result.addedCount} new`);
+
+  const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
+  console.log(`[add] scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+}
+
+// Starts (or resumes) a whole-site crawl and runs it to completion in this
+// process - unlike the old web handler, which only kicked the crawl off and
+// returned immediately, a CLI invocation has to wait for it since nothing
+// else is left running once the process exits.
+async function crawlCommand(url, { stealth } = {}) {
+  const formattedUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
+  const targetOrigin = new URL(formattedUrl).origin;
 
   const db = readDb();
   if (!db.siteCrawls) db.siteCrawls = [];
-
-  try {
-    const targetOrigin = new URL(formattedUrl).origin;
-    const existingCrawl = db.siteCrawls.find(c => {
-      try { return new URL(c.siteUrl).origin === targetOrigin; } catch { return false; }
-    });
-
-    if (existingCrawl) {
-      existingCrawl.useStealth = !!useStealth;
-      if (existingCrawl.status !== 'running') {
-        existingCrawl.status = 'running';
-        existingCrawl.lastError = null;
-        writeDb(db);
-        runSiteCrawl(existingCrawl.id).catch(console.error);
-      }
-      return res.status(200).json({ message: 'Resumed existing crawl', crawlId: existingCrawl.id });
-    }
-  } catch (e) {
-    // If URL parsing fails, proceed to create a new one (it will likely fail later, but safe fallback)
-  }
-
-  const newCrawl = {
-    id: Date.now().toString(),
-    siteUrl: formattedUrl,
-    useStealth: !!useStealth,
-    status: 'running',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    discoveryDone: false,
-    visitedListingPages: [],
-    nextListingPageUrl: null,
-    discoveredSeries: [],
-    processedSeriesUrls: [],
-    currentSeriesUrl: null,
-    currentSeriesName: null,
-    consecutiveBlockedSeries: 0,
-    recheckRound: 0,
-    lastError: null,
-    stats: { seriesProcessed: 0, chaptersDownloaded: 0 }
-  };
-
-  db.siteCrawls.push(newCrawl);
-  writeDb(db);
-
-  crawlControl[newCrawl.id] = { stopRequested: false };
-  runSiteCrawl(newCrawl.id).catch(err => {
-    console.error(`Site crawl ${newCrawl.id} crashed:`, err);
-    const latestDb = readDb();
-    const crawl = findCrawl(latestDb, newCrawl.id);
-    if (crawl) {
-      crawl.status = 'error';
-      crawl.lastError = err.message || 'เกิดข้อผิดพลาดไม่ทราบสาเหตุ';
-      writeDb(latestDb);
-    }
+  let crawl = db.siteCrawls.find(c => {
+    try { return new URL(c.siteUrl).origin === targetOrigin; } catch { return false; }
   });
 
-  res.status(201).json(newCrawl);
-});
-
-// List every crawl job (running, stopped, done, error) with progress stats
-app.get('/api/site-crawls', (req, res) => {
-  const db = readDb();
-  res.json(db.siteCrawls || []);
-});
-
-// Stop a running crawl. The in-memory flag makes the loop bail out before
-// its next unit of work (next listing page, or next chapter within the
-// series it's currently on).
-app.post('/api/site-crawls/:id/stop', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const crawl = findCrawl(db, id);
   if (!crawl) {
-    return res.status(404).json({ error: 'Crawl not found' });
+    crawl = {
+      id: Date.now().toString(),
+      siteUrl: formattedUrl,
+      useStealth: !!stealth,
+      status: 'running',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      discoveryDone: false,
+      visitedListingPages: [],
+      nextListingPageUrl: null,
+      discoveredSeries: [],
+      processedSeriesUrls: [],
+      currentSeriesUrl: null,
+      currentSeriesName: null,
+      consecutiveBlockedSeries: 0,
+      recheckRound: 0,
+      lastError: null,
+      stats: { seriesProcessed: 0, chaptersDownloaded: 0 }
+    };
+    db.siteCrawls.push(crawl);
+    console.log(`[crawl] starting new crawl for ${formattedUrl} (${crawl.id})`);
+  } else {
+    crawl.status = 'running';
+    crawl.lastError = null;
+    console.log(`[crawl] resuming crawl for ${formattedUrl} (${crawl.id})`);
   }
-
-  if (!crawlControl[id]) crawlControl[id] = { stopRequested: false };
-  crawlControl[id].stopRequested = true;
-  crawl.status = 'stopped';
-  crawl.updatedAt = new Date().toISOString();
   writeDb(db);
 
-  res.json(crawl);
-});
+  crawlControl[crawl.id] = { stopRequested: false };
+  await runSiteCrawl(crawl.id);
 
-// Resume a stopped/errored crawl from wherever it left off.
-app.post('/api/site-crawls/:id/resume', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const crawl = findCrawl(db, id);
-  if (!crawl) {
-    return res.status(404).json({ error: 'Crawl not found' });
-  }
-  if (crawl.status === 'running') {
-    return res.status(429).json({ error: 'Crawl is already running' });
-  }
-
-  crawl.status = 'running';
-  crawl.lastError = null;
-  crawl.consecutiveBlockedSeries = 0;
-  crawl.updatedAt = new Date().toISOString();
-  writeDb(db);
-
-  crawlControl[id] = { stopRequested: false };
-  runSiteCrawl(id).catch(err => {
-    console.error(`Site crawl ${id} crashed:`, err);
-    const latestDb = readDb();
-    const c = findCrawl(latestDb, id);
-    if (c) {
-      c.status = 'error';
-      c.lastError = err.message || 'เกิดข้อผิดพลาดไม่ทราบสาเหตุ';
-      writeDb(latestDb);
-    }
-  });
-
-  res.json(crawl);
-});
-
-// Remove a crawl job record. Series/chapters it already downloaded are left
-// alone - they're regular series entries at this point, manage them from
-// the normal series list.
-app.delete('/api/site-crawls/:id', (req, res) => {
-  const { id } = req.params;
-  const db = readDb();
-  const initialLength = (db.siteCrawls || []).length;
-  db.siteCrawls = (db.siteCrawls || []).filter(c => c.id !== id);
-
-  if (db.siteCrawls.length === initialLength) {
-    return res.status(404).json({ error: 'Crawl not found' });
-  }
-
-  if (crawlControl[id]) crawlControl[id].stopRequested = true;
-  writeDb(db);
-
-  res.json({ message: 'Crawl deleted successfully' });
-});
-
-// Get alert logs
-app.get('/api/logs', (req, res) => {
-  const db = readDb();
-  res.json(db.logs || []);
-});
-
-// Clear alert logs
-app.post('/api/logs/clear', (req, res) => {
-  const db = readDb();
-  db.logs = [];
-  writeDb(db);
-  res.json({ message: 'Logs cleared successfully' });
-});
-
-// Get aggregate stats
-app.get('/api/stats', (req, res) => {
-  const db = readDb();
-  const monitors = db.monitors;
-
-  const total = monitors.length;
-  const up = monitors.filter(m => m.status === 'up').length;
-  const down = monitors.filter(m => m.status === 'down').length;
-  const unknown = monitors.filter(m => m.status === 'unknown').length;
-
-  // Calculate average response time for active online sites
-  const upSitesWithResponse = monitors.filter(m => m.status === 'up' && m.lastResponseTime);
-  const avgResponseTime = upSitesWithResponse.length > 0
-    ? Math.round(upSitesWithResponse.reduce((sum, m) => sum + m.lastResponseTime, 0) / upSitesWithResponse.length)
-    : 0;
-
-  res.json({
-    total,
-    up,
-    down,
-    unknown,
-    avgResponseTime
-  });
-});
-
-// Serve built frontend files in production
-if (fs.existsSync(DIST_DIR)) {
-  app.use(express.static(DIST_DIR));
-  app.get('*', (req, res) => {
-    // If it's not an API call, serve the index.html
-    if (!req.path.startsWith('/api')) {
-      res.sendFile(path.join(DIST_DIR, 'index.html'));
-    }
-  });
+  const finalDb = readDb();
+  const finalCrawl = findCrawl(finalDb, crawl.id);
+  console.log(`[crawl] finished: status=${finalCrawl?.status}, series processed=${finalCrawl?.stats?.seriesProcessed ?? 0}`);
 }
 
-// Resume any site crawls that were still "running" when the server last
-// stopped (a restart, a crash, ...) - progress already made is persisted in
-// db.json, so this picks up wherever it left off instead of starting over.
-function resumeRunningSiteCrawls() {
-  const db = readDb();
-  (db.siteCrawls || []).forEach(crawl => {
-    if (crawl.status !== 'running') return;
-    crawlControl[crawl.id] = { stopRequested: false };
-    runSiteCrawl(crawl.id).catch(err => {
-      console.error(`Resumed site crawl ${crawl.id} crashed:`, err);
-      const latestDb = readDb();
-      const c = findCrawl(latestDb, crawl.id);
-      if (c) {
-        c.status = 'error';
-        c.lastError = err.message || 'เกิดข้อผิดพลาดไม่ทราบสาเหตุ';
-        writeDb(latestDb);
-      }
-    });
-  });
+function parseArgs(argv) {
+  const [cmd, arg, ...rest] = argv;
+  const stealth = rest.includes('--stealth');
+  const nameFlag = rest.find(a => a.startsWith('--name='));
+  const name = nameFlag ? nameFlag.slice('--name='.length) : undefined;
+  return { cmd, arg, stealth, name };
 }
 
-// ---------------------------------------------------------------------------
-// Auto-retry watchdog: a standing background job so the user never has to click
-// "retry problem chapters" by hand. Every tick it sweeps ALL series, and for
-// any that still have incomplete chapters (error / partial / blocked) - and
-// that aren't already being scraped and haven't been auto-retried too recently
-// - it lifts the retry cap on those chapters and re-runs the same download loop
-// as /scrape-all. So a chapter a 429/403 briefly blocked heals itself once the
-// site cools off, without the crawl having to stay parked on it. On by default;
-// toggle with settings.autoRetryEnabled.
-// ---------------------------------------------------------------------------
-const AUTO_RETRY_TICK_MS = 10 * 60 * 1000;      // how often the watchdog wakes up
-// Per-series cooldown ESCALATES the longer a series stays stuck: retry soon at
-// first (a transient 429/403 block usually clears within minutes), then back
-// off geometrically toward a 2-hour ceiling so a stubborn series keeps getting
-// retried forever - automatically, gently, no manual clicks - without hammering
-// the source. Cooldown = min(BASE * 2^streak, MAX): 10m, 20m, 40m, 80m, 2h, 2h…
-const AUTO_RETRY_BASE_COOLDOWN_MS = 10 * 60 * 1000;   // first retry ~10 min after a failure
-const AUTO_RETRY_MAX_COOLDOWN_MS = 2 * 60 * 60 * 1000; // ...capped at every 2 hours forever
-let autoRetryRunning = false;
+// Every command shares one Chrome profile dir (CHROME_PROFILE_DIR above),
+// and getBrowser() pkills whatever's already holding it before launching -
+// fine for cleaning up a stale process from a previous crash, but two bot.js
+// invocations running at the same time would pkill each other's live Chrome
+// mid-scrape. Serialize the whole process instead of patching that one
+// spot: a second invocation waits here for the first to finish.
+const LOCK_FILE = path.join(DATA_DIR, 'bot.lock');
+const LOCK_POLL_MS = 3000;
+const LOCK_LOG_EVERY_MS = 15000; // don't spam "waiting..." every 3s
 
-async function autoRetryProblemChaptersSweep() {
-  if (autoRetryRunning) return; // never overlap two sweeps
-  const settingsDb = readDb();
-  if (settingsDb.settings && settingsDb.settings.autoRetryEnabled === false) return;
-
-  autoRetryRunning = true;
+function isPidAlive(pid) {
   try {
-    const seriesIds = (readDb().series || []).map(s => s.id);
-    for (const seriesId of seriesIds) {
-      // Re-read fresh each time - a scrape/crawl running in parallel may have
-      // changed this series (or another one) since the sweep started.
-      const db = readDb();
-      const series = findSeries(db, seriesId);
-      if (!series) continue;
-      if (scrapingSeries[seriesId]) continue; // a scrape/crawl already owns it
-
-      const problems = (series.chapters || []).filter(
-        c => c.status !== 'done' && !scrapingChapters[c.id]
-      );
-      if (problems.length === 0) {
-        // Nothing wrong anymore - clear the back-off streak so a future problem
-        // gets retried promptly again rather than starting at a long cooldown.
-        if (series.autoRetryStreak) { series.autoRetryStreak = 0; saveSeriesMetadata(series); }
-        continue;
-      }
-
-      // Escalating back-off: the more consecutive sweeps this series has stayed
-      // stuck, the longer we wait before the next retry (10m → 20m → … → 2h cap).
-      const streak = series.autoRetryStreak || 0;
-      const cooldown = Math.min(AUTO_RETRY_BASE_COOLDOWN_MS * Math.pow(2, streak), AUTO_RETRY_MAX_COOLDOWN_MS);
-      const lastAt = series.lastAutoRetryAt ? new Date(series.lastAutoRetryAt).getTime() : 0;
-      if (Date.now() - lastAt < cooldown) continue;
-
-      scrapingSeries[seriesId] = true;
-      try {
-        problems.forEach(c => { c.retryCount = 0; updateChapter(c); }); // fresh retry budget
-        series.lastAutoRetryAt = new Date().toISOString();
-        saveSeriesMetadata(series);
-        console.log(`[AutoRetry] retrying ${problems.length} problem chapter(s) in "${series.name}" (streak ${streak}, next in ~${Math.round(Math.min(AUTO_RETRY_BASE_COOLDOWN_MS * Math.pow(2, streak + 1), AUTO_RETRY_MAX_COOLDOWN_MS) / 60000)}m if still stuck)`);
-        await runScrapeAllForSeries(db, series);
-        // Bump the streak if it's still not fully done (keeps backing off toward
-        // the 2h ceiling); reset to 0 the moment everything downloaded.
-        const stillStuck = (series.chapters || []).some(c => c.status !== 'done');
-        series.autoRetryStreak = stillStuck ? streak + 1 : 0;
-        saveSeriesMetadata(series);
-      } catch (err) {
-        console.error(`[AutoRetry] series ${seriesId} failed:`, err);
-      } finally {
-        scrapingSeries[seriesId] = false;
-      }
-    }
-  } finally {
-    autoRetryRunning = false;
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // exists but owned by someone else - treat as alive
   }
 }
 
-function startAutoRetryWatchdog() {
-  console.log('Auto-retry watchdog started...');
-  setInterval(() => { autoRetryProblemChaptersSweep().catch(console.error); }, AUTO_RETRY_TICK_MS);
-}
-
-// ---------------------------------------------------------------------------
-// Auto-update watchdog: keeps already-downloaded series current. Periodically
-// re-checks each series' own listing page for chapters that have been released
-// since it was last scraped, and if any turned up, downloads just those new
-// ones (never re-downloading what's already 'done'). This is what makes a
-// "complete" series pick up new episodes on its own, no clicking required.
-// On by default; toggle with settings.autoUpdateEnabled.
-// ---------------------------------------------------------------------------
-const AUTO_UPDATE_TICK_MS = 3 * 60 * 60 * 1000;         // sweep every 3 hours
-const AUTO_UPDATE_SERIES_COOLDOWN_MS = 3 * 60 * 60 * 1000; // ...and re-check a given series at most that often
-let autoUpdateRunning = false;
-
-async function autoUpdateCheckSweep() {
-  if (autoUpdateRunning) return;
-  const settingsDb = readDb();
-  if (settingsDb.settings && settingsDb.settings.autoUpdateEnabled === false) return;
-
-  autoUpdateRunning = true;
-  try {
-    const seriesIds = (readDb().series || []).map(s => s.id);
-    for (const seriesId of seriesIds) {
-      const db = readDb();
-      const series = findSeries(db, seriesId);
-      if (!series || !series.seriesUrl) continue;
-      if (scrapingSeries[seriesId]) continue; // busy being scraped/retried
-
-      const lastAt = series.lastUpdateCheckAt ? new Date(series.lastUpdateCheckAt).getTime() : 0;
-      if (Date.now() - lastAt < AUTO_UPDATE_SERIES_COOLDOWN_MS) continue;
-
-      let added = 0;
-      try {
-        const result = await discoverAndAddNewChapters(db, series, series.seriesUrl);
-        added = result.addedCount || 0;
-        series.lastUpdateCheckAt = new Date().toISOString();
-        saveSeries(series);
-      } catch (err) {
-        console.error(`[AutoUpdate] discover failed for "${series.name}":`, err);
-        continue;
-      }
-
-      if (added > 0 && !scrapingSeries[seriesId]) {
-        console.log(`[AutoUpdate] "${series.name}": found ${added} new chapter(s), downloading...`);
-        scrapingSeries[seriesId] = true;
-        try {
-          await runScrapeAllForSeries(db, series);
-          saveSeriesMetadata(series);
-        } catch (err) {
-          console.error(`[AutoUpdate] download failed for "${series.name}":`, err);
-        } finally {
-          scrapingSeries[seriesId] = false;
-        }
-      }
-    }
-  } finally {
-    autoUpdateRunning = false;
-  }
-}
-
-function startAutoUpdateWatchdog() {
-  console.log('Auto-update watchdog started...');
-  // First sweep 2 minutes after boot (let resumed crawls settle), then every tick.
-  setTimeout(() => { autoUpdateCheckSweep().catch(console.error); }, 2 * 60 * 1000);
-  setInterval(() => { autoUpdateCheckSweep().catch(console.error); }, AUTO_UPDATE_TICK_MS);
-}
-
-// Cover-art watchdog: same idea as the auto-retry/auto-update watchdogs above -
-// periodically backfills cover art for any series still missing one, so a
-// freshly-added series (or one whose cover download failed transiently) gets
-// its cover without anyone having to remember to click "ดาวน์โหลดปกทั้งหมด".
-const COVER_BACKFILL_TICK_MS = 30 * 60 * 1000; // sweep every 30 minutes
-
-function startCoverBackfillWatchdog() {
-  console.log('Cover backfill watchdog started...');
-  const runSweep = async () => {
-    if (downloadingCovers) return; // manual button already running one
-    downloadingCovers = true;
+async function acquireLock() {
+  let waited = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
     try {
-      const db = readDb();
-      const result = await backfillCoverImages(db); // persists each touched series itself
-      if (result.downloaded > 0) {
-        console.log(`[CoverBackfill] downloaded ${result.downloaded} new cover(s)`);
-      }
+      const fd = fs.openSync(LOCK_FILE, 'wx'); // atomic create; throws EEXIST if already locked
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return;
     } catch (err) {
-      console.error('[CoverBackfill] sweep failed:', err);
-    } finally {
-      downloadingCovers = false;
+      if (err.code !== 'EEXIST') throw err;
+
+      const holderPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+      if (!Number.isInteger(holderPid) || !isPidAlive(holderPid)) {
+        // Stale lock left behind by a crash/kill - safe to take over.
+        fs.rmSync(LOCK_FILE, { force: true });
+        continue;
+      }
+
+      if (waited % LOCK_LOG_EVERY_MS === 0) {
+        console.log(`[lock] another bot.js run (pid ${holderPid}) is in progress - waiting...`);
+      }
+      await sleep(LOCK_POLL_MS);
+      waited += LOCK_POLL_MS;
     }
-  };
-  setTimeout(runSweep, 60 * 1000); // first sweep 1 minute after boot
-  setInterval(runSweep, COVER_BACKFILL_TICK_MS);
+  }
 }
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  startScheduler();
-  resumeRunningSiteCrawls();
-  startAutoRetryWatchdog();
-  startAutoUpdateWatchdog();
-  startCoverBackfillWatchdog();
-});
+function releaseLock() {
+  try {
+    if (fs.readFileSync(LOCK_FILE, 'utf8').trim() === String(process.pid)) {
+      fs.rmSync(LOCK_FILE, { force: true });
+    }
+  } catch (e) { /* already gone - nothing to do */ }
+}
+
+async function main() {
+  const { cmd, arg, stealth, name } = parseArgs(process.argv.slice(2));
+
+  if (cmd === 'add') {
+    if (!arg) throw new Error('Usage: node server/bot.js add <seriesUrl> [--name="..."] [--stealth]');
+    await addSeriesCommand(arg, { name, stealth });
+  } else if (cmd === 'crawl') {
+    if (!arg) throw new Error('Usage: node server/bot.js crawl <siteUrl> [--stealth]');
+    await crawlCommand(arg, { stealth });
+  } else if (!cmd) {
+    const db = readDb();
+    await resumeRunningCrawls(db);
+    await syncAllSeries(readDb());
+  } else {
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url>]`);
+  }
+}
+
+acquireLock()
+  .then(() => main())
+  .then(() => shutdownBrowser())
+  .then(() => { releaseLock(); process.exit(0); })
+  .catch(async (err) => {
+    console.error(err);
+    await shutdownBrowser();
+    releaseLock();
+    process.exit(1);
+  });
+

@@ -26,3 +26,6 @@ dist-ssr
 # Local Server Data / DB
 server/data
 
+# R2 credentials
+.env
+
