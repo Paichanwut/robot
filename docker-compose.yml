@@ -2,6 +2,12 @@ services:
   bot:
     build: .
     image: solo-manga-bot
+    # Runs Docker's built-in tini as PID 1 instead of xvfb-run itself.
+    # xvfb-run waits on a shell signal to know Xvfb is ready to accept
+    # connections - that signal never arrives when the shell is PID 1
+    # (no real init, signal delivery to PID 1 is unreliable), so without
+    # this xvfb-run hangs forever before ever launching node.
+    init: true
     env_file:
       - .env
     volumes:
