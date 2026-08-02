@@ -2974,18 +2974,26 @@ function parseArgs(argv) {
 // invocations running at the same time would pkill each other's live Chrome
 // mid-scrape. Serialize the whole process instead of patching that one
 // spot: a second invocation waits here for the first to finish.
+//
+// Staleness is judged by a heartbeat timestamp, NOT by checking whether the
+// holder's PID is still alive - `server/data` (and this lock file with it)
+// is a volume shared across separate Docker containers, each with its own
+// independent PID namespace starting back at 1. A PID recorded by a
+// previous container is essentially guaranteed to coincidentally match some
+// unrelated process in the next container, so a PID-liveness check would
+// almost always report a long-dead lock as "still alive" and hang forever
+// under Docker specifically (this happened - see git history).
 const LOCK_FILE = path.join(DATA_DIR, 'bot.lock');
 const LOCK_POLL_MS = 3000;
 const LOCK_LOG_EVERY_MS = 15000; // don't spam "waiting..." every 3s
+const LOCK_HEARTBEAT_MS = 20000; // how often the holder proves it's still alive
+const LOCK_STALE_MS = 90000; // 3+ missed heartbeats = holder is gone, safe to steal
 
-function isPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM'; // exists but owned by someone else - treat as alive
-  }
+function touchLock() {
+  fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, updatedAt: Date.now() }));
 }
+
+let lockHeartbeatTimer = null;
 
 async function acquireLock() {
   let waited = 0;
@@ -2993,21 +3001,26 @@ async function acquireLock() {
   while (true) {
     try {
       const fd = fs.openSync(LOCK_FILE, 'wx'); // atomic create; throws EEXIST if already locked
-      fs.writeSync(fd, String(process.pid));
       fs.closeSync(fd);
+      touchLock();
+      lockHeartbeatTimer = setInterval(touchLock, LOCK_HEARTBEAT_MS);
+      lockHeartbeatTimer.unref?.(); // don't let the heartbeat itself keep the process alive
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
 
-      const holderPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
-      if (!Number.isInteger(holderPid) || !isPidAlive(holderPid)) {
-        // Stale lock left behind by a crash/kill - safe to take over.
+      let holder = null;
+      try { holder = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8')); } catch (e) { /* corrupt/empty - treat as stale below */ }
+      const age = holder?.updatedAt ? Date.now() - holder.updatedAt : Infinity;
+      if (age > LOCK_STALE_MS) {
+        // No heartbeat in a while - the previous holder crashed, was killed,
+        // or (Docker) its container is simply gone. Safe to take over.
         fs.rmSync(LOCK_FILE, { force: true });
         continue;
       }
 
       if (waited % LOCK_LOG_EVERY_MS === 0) {
-        console.log(`[lock] another bot.js run (pid ${holderPid}) is in progress - waiting...`);
+        console.log(`[lock] another bot.js run (pid ${holder?.pid ?? '?'}) is in progress - waiting...`);
       }
       await sleep(LOCK_POLL_MS);
       waited += LOCK_POLL_MS;
@@ -3016,10 +3029,10 @@ async function acquireLock() {
 }
 
 function releaseLock() {
+  if (lockHeartbeatTimer) clearInterval(lockHeartbeatTimer);
   try {
-    if (fs.readFileSync(LOCK_FILE, 'utf8').trim() === String(process.pid)) {
-      fs.rmSync(LOCK_FILE, { force: true });
-    }
+    const holder = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+    if (holder.pid === process.pid) fs.rmSync(LOCK_FILE, { force: true });
   } catch (e) { /* already gone - nothing to do */ }
 }
 
