@@ -24,8 +24,10 @@ CREATE TABLE series (
   description       TEXT COMMENT 'เรื่องย่อ/คำโปรย',
   author            VARCHAR(255) COMMENT 'ชื่อผู้แต่ง/นักวาด',
   status            ENUM('ongoing','completed','hiatus') NOT NULL DEFAULT 'ongoing' COMMENT 'ongoing=กำลังฉาย, completed=จบแล้ว, hiatus=พักการเขียน',
+  type              VARCHAR(50) COMMENT 'ประเภทตามที่เว็บต้นทางระบุ เช่น Manhwa, Manhua, Manga, Novel',
   cover_image_key   VARCHAR(500) COMMENT 'R2 object key ของรูปปก (ไม่เก็บไฟล์รูปในตารางนี้)',
-  view_count        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'จำนวนครั้งที่หน้าเรื่องนี้ถูกเข้าชม',
+  view_count        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'จำนวนครั้งที่หน้าเรื่องนี้ถูกเข้าชมบนเว็บเรา (นับเอง ไม่ใช่ของเว็บต้นทาง)',
+  source_view_count BIGINT UNSIGNED COMMENT 'ยอดวิวที่เว็บต้นทางรายงานไว้ตอนดึงข้อมูลมา (อ้างอิงเท่านั้น คนละตัวกับ view_count ของเราเอง)',
   created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'วันที่เพิ่มเรื่องนี้เข้าระบบ',
   updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'วันที่แก้ไขข้อมูลเรื่องล่าสุด'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='ข้อมูลหลักของแต่ละเรื่องมังงะ';
@@ -34,6 +36,7 @@ CREATE TABLE chapters (
   id                INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'รหัสตอน (internal)',
   series_id         INT UNSIGNED NOT NULL COMMENT 'อ้างอิงถึง series.id ว่าตอนนี้เป็นของเรื่องไหน',
   source_chapter_id VARCHAR(64) COMMENT 'id ของตอนนี้ฝั่งบอท ใช้กัน sync ซ้ำ',
+  slug              VARCHAR(300) NOT NULL UNIQUE COMMENT 'ใช้ทำ URL เช่น /manga/<slug> รูปแบบ <series-slug>-epNNNN ตามแบบ URL ของเว็บต้นทาง',
   number            DECIMAL(8,2) NOT NULL COMMENT 'เลขตอน รองรับทศนิยมสำหรับตอนพิเศษ เช่น 12.5',
   title             VARCHAR(255) COMMENT 'ชื่อตอน เช่น "ราชาแห่งโลก"',
   published_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'วันที่ตอนนี้ถูกเผยแพร่บนเว็บเรา',
@@ -58,9 +61,10 @@ CREATE TABLE chapter_pages (
 -- -----------------------------------------------------
 
 CREATE TABLE genres (
-  id    INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'รหัสหมวดหมู่ (internal)',
-  slug  VARCHAR(100) NOT NULL UNIQUE COMMENT 'ใช้ทำ URL เช่น /genre/<slug>',
-  name  VARCHAR(100) NOT NULL COMMENT 'ชื่อหมวดหมู่ที่แสดงหน้าเว็บ เช่น แอ็คชั่น, แฟนตาซี'
+  id      INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'รหัสหมวดหมู่ (internal)',
+  slug    VARCHAR(100) NOT NULL UNIQUE COMMENT 'ใช้ทำ URL เช่น /genre/<slug> เป็นภาษาอังกฤษเสมอ (จาก href ของเว็บต้นทาง หรือ glossary ที่แปลไว้)',
+  name    VARCHAR(100) NOT NULL COMMENT 'ชื่อหมวดหมู่ภาษาอังกฤษ (ชื่อหลัก) เช่น Action, Fantasy',
+  name_th VARCHAR(100) COMMENT 'ชื่อภาษาไทยของหมวดหมู่นี้ ถ้าเว็บต้นทางแสดงเป็นไทย (ไม่บังคับ)'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='รายชื่อหมวดหมู่/แท็กทั้งหมด';
 
 CREATE TABLE series_genres (

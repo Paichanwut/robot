@@ -148,6 +148,32 @@ function normalizeSeriesStatus(rawStatus) {
   return 'ongoing';
 }
 
+// Parses a human-formatted view count ("3.5M", "49,226", "12.3K") into a
+// real integer for storage - source sites show this either as plain digits
+// or abbreviated with a K/M/B suffix, and naively stripping non-digits
+// would turn "3.5M" into "35", silently dropping the multiplier.
+function parseHumanNumber(raw) {
+  if (!raw) return null;
+  const cleaned = String(raw).replace(/,/g, '').trim();
+  const match = /^(\d+(?:\.\d+)?)\s*([kmb])?/i.exec(cleaned);
+  if (!match) return null;
+  const n = parseFloat(match[1]);
+  const suffix = (match[2] || '').toLowerCase();
+  const multiplier = suffix === 'k' ? 1e3 : suffix === 'm' ? 1e6 : suffix === 'b' ? 1e9 : 1;
+  return Math.round(n * multiplier);
+}
+
+// "ep<NNNN>" chapter-slug suffix matching the convention seen on the source
+// sites themselves (e.g. bully-manga.com/<series>-ep0148) - whole numbers
+// are zero-padded to 4 digits; a fractional chapter (12.5, a "special")
+// keeps its decimal as a dash instead (ep0012-5) since padStart on a
+// decimal string would produce something nonsensical like "012.5".
+function chapterSlugSuffix(number) {
+  if (Number.isInteger(number)) return `ep${String(number).padStart(4, '0')}`;
+  const [whole, frac] = String(number).split('.');
+  return `ep${whole.padStart(4, '0')}-${frac}`;
+}
+
 const MYSQL_SYNC_RETRIES = 3;
 
 // Runs `fn(conn)` with a few retries (mirrors uploadToR2's posture) - a sync
@@ -183,12 +209,13 @@ async function syncSeriesToWebsiteDb(conn, series) {
   // matched, since MySQL still enforces uniqueness on the OTHER column
   // even when the conflict is detected via a different one.
   await conn.execute(
-    `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, cover_image_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, type, cover_image_key, source_view_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        source_series_id = VALUES(source_series_id), title = VALUES(title), alt_titles = VALUES(alt_titles),
-       description = VALUES(description), author = VALUES(author), status = VALUES(status),
-       cover_image_key = COALESCE(VALUES(cover_image_key), cover_image_key)`,
+       description = VALUES(description), author = VALUES(author), status = VALUES(status), type = VALUES(type),
+       cover_image_key = COALESCE(VALUES(cover_image_key), cover_image_key),
+       source_view_count = COALESCE(VALUES(source_view_count), source_view_count)`,
     [
       series.id,
       slug,
@@ -197,19 +224,45 @@ async function syncSeriesToWebsiteDb(conn, series) {
       meta.synopsis || null,
       meta.author || meta.artist || null,
       normalizeSeriesStatus(meta.status),
-      meta.coverImagePath || null
+      meta.type || null,
+      meta.coverImagePath || null,
+      parseHumanNumber(meta.views)
     ]
   );
 
   const [[row]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
   const seriesRowId = row.id;
 
-  const genreNames = meta.genres || [];
+  // Each entry is { name, slug, enName } from extractGenreLinks - name is
+  // whatever the site displayed (often Thai), slug/enName are resolved
+  // English identity (from the site's own href, or the GENRE_TH_TO_EN
+  // glossary) when available. Plain strings (metadata cached in bot's own
+  // SQLite before this shape existed - won't get the new shape again until
+  // that series' page is re-fetched) are re-resolved against the glossary
+  // right here too, not just at scrape time - otherwise a series that
+  // hasn't been re-scraped keeps re-creating the same hash-slugged
+  // duplicate every single sync, forever.
+  const genreEntries = (meta.genres || []).map(g => {
+    if (typeof g !== 'string') return g;
+    const enName = GENRE_TH_TO_EN[g] || null;
+    return { name: g, slug: enName ? slugify(enName, null) : null, enName };
+  });
   await conn.execute('DELETE FROM series_genres WHERE series_id = ?', [seriesRowId]);
-  for (const name of genreNames) {
-    const genreSlug = slugify(name, null);
-    if (!genreSlug) continue;
-    await conn.execute('INSERT INTO genres (slug, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name)', [genreSlug, name]);
+  for (const g of genreEntries) {
+    const displayName = g.enName || g.name;
+    // Only a genre with no resolved English identity at all falls back to a
+    // transliterated slug - the one case left unmerged with its English/Thai
+    // counterpart is a genre this scraper has never seen paired with an
+    // English term anywhere (not in the glossary, no href on any site). Still
+    // derived from the actual name (readable-ish) rather than an opaque hash
+    // - a human can replace it with a real GENRE_TH_TO_EN entry once the
+    // correct English term is known.
+    const genreSlug = g.slug || slugify(transliterateThai(g.name), null) || slugify(g.name, `genre-${crypto.createHash('sha256').update(g.name).digest('hex').slice(0, 10)}`);
+    const nameTh = /[฀-๿]/.test(g.name) && g.name !== displayName ? g.name : null;
+    await conn.execute(
+      'INSERT INTO genres (slug, name, name_th) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), name_th = COALESCE(VALUES(name_th), name_th)',
+      [genreSlug, displayName, nameTh]
+    );
     const [[genreRow]] = await conn.execute('SELECT id FROM genres WHERE slug = ?', [genreSlug]);
     await conn.execute('INSERT IGNORE INTO series_genres (series_id, genre_id) VALUES (?, ?)', [seriesRowId, genreRow.id]);
   }
@@ -222,15 +275,16 @@ async function syncSeriesToWebsiteDb(conn, series) {
 // wipe-then-reinsert posture as the R2 chapter folder above, so a re-scrape
 // that drops a page (ad-filtering caught something new) doesn't leave a
 // stale row behind.
-async function syncChapterToWebsiteDb(seriesRowId, chapterNumber, chapterTitle, images) {
+async function syncChapterToWebsiteDb(seriesRowId, seriesSlug, chapterNumber, chapterTitle, images) {
+  const chapterSlug = `${seriesSlug}-${chapterSlugSuffix(chapterNumber)}`;
   await withMysqlRetry(async () => {
     const conn = await mysqlPool.getConnection();
     try {
       await conn.execute(
-        `INSERT INTO chapters (series_id, source_chapter_id, number, title)
-         VALUES (?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE source_chapter_id = VALUES(source_chapter_id), title = VALUES(title)`,
-        [seriesRowId, null, chapterNumber, chapterTitle]
+        `INSERT INTO chapters (series_id, source_chapter_id, slug, number, title)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE source_chapter_id = VALUES(source_chapter_id), slug = VALUES(slug), title = VALUES(title)`,
+        [seriesRowId, null, chapterSlug, chapterNumber, chapterTitle]
       );
       const [[chapterRow]] = await conn.execute(
         'SELECT id FROM chapters WHERE series_id = ? AND number = ?',
@@ -255,6 +309,7 @@ async function syncChapterToWebsiteDb(seriesRowId, chapterNumber, chapterTitle, 
 // throwing, so a MySQL hiccup never undoes work already safely in R2/SQLite.
 async function syncChapterToWebsiteDbSafe(series, chapter) {
   try {
+    const seriesSlug = slugify(series.metadata?.title || series.name, series.id);
     await withMysqlRetry(async () => {
       const conn = await mysqlPool.getConnection();
       try {
@@ -264,7 +319,7 @@ async function syncChapterToWebsiteDbSafe(series, chapter) {
       }
     }).then(seriesRowId => {
       const chapterNumber = extractLeadingNumber(chapter.name) ?? (chapter.orderIndex ?? 0) + 1;
-      return syncChapterToWebsiteDb(seriesRowId, chapterNumber, chapter.name, chapter.images || []);
+      return syncChapterToWebsiteDb(seriesRowId, seriesSlug, chapterNumber, chapter.name, chapter.images || []);
     });
   } catch (err) {
     console.error(`[sync-db] failed to sync chapter "${chapter.name}" of "${series.name}" to MySQL after retries:`, err.message);
@@ -1396,6 +1451,87 @@ function stripTags(html) {
   return decodeHtmlEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
 }
 
+// Hand-built Thai -> canonical-English-slug glossary for genre/tag terms
+// this scraper has actually seen paired with an English equivalent across
+// the tracked sites so far (either directly, when one series lists both the
+// English and Thai term for the same genre, or via a source site's own
+// href-encoded slug - see extractGenreLinks). Used only as a last resort
+// when a genre link carries no href-derived slug of its own - keeps a Thai
+// tag from becoming a second, disconnected row from its English counterpart
+// (e.g. "แฟนตาซี" landing on a different genre row than "Fantasy").
+const GENRE_TH_TO_EN = {
+  'ดราม่า': 'Drama', 'ผจญภัย': 'Adventure', 'แฟนตาซี': 'Fantasy', 'ต่างโลก': 'Isekai',
+  'มังงะเกาหลี': 'Manhwa', 'มังงะจีน': 'Manhua', 'ตลก': 'Comedy', 'โรแมนซ์': 'Romance',
+  'โชโจ': 'Shoujo', 'โชเน็น': 'Shounen', 'ลึกลับ': 'Mystery', 'เกิดใหม่': 'Reincarnation',
+  'ชีวิตประจำวัน': 'Slice of Life', 'จิตวิทยา': 'Psychological', 'เหนือธรรมชาติ': 'Supernatural',
+  'ต่อสู้': 'Action', 'สยองขวัญ': 'Horror', 'ผู้ใหญ่': 'Adult', 'ฮาเร็ม': 'Harem',
+  'เวทมนตร์': 'Magic', 'ล้างแค้น': 'Revenge', 'ไซไฟ': 'Sci-fi', 'โศกนาฏกรรม': 'Tragedy',
+  'ระบบ': 'System', 'ดันเจี้ยน': 'Dungeon', 'ย้อนยุค': 'Historical', 'ย้อนเวลา': 'Time Travel',
+  'ศิลปะการต่อสู้-แอคชั่น': 'Martial Arts'
+};
+
+// Rough Thai -> Latin letter-for-letter transliteration, used only as a slug
+// source for a genre/tag with no English name anywhere (not in
+// GENRE_TH_TO_EN, no href on any site that's carried it) - not a proper
+// romanization (real Thai transliteration reorders vowels around the
+// consonant they attach to, which this doesn't attempt), just enough to
+// turn e.g. "พระเอกเทพ" into a readable-ish "phraexkethph" slug instead of
+// an opaque content hash. A human can still add a real GENRE_TH_TO_EN entry
+// later to replace it with the actual English term once one is known.
+const THAI_TRANSLITERATION_MAP = {
+  'ก': 'k', 'ข': 'kh', 'ฃ': 'kh', 'ค': 'kh', 'ฅ': 'kh', 'ฆ': 'kh', 'ง': 'ng',
+  'จ': 'ch', 'ฉ': 'ch', 'ช': 'ch', 'ซ': 's', 'ฌ': 'ch', 'ญ': 'y',
+  'ฎ': 'd', 'ฏ': 't', 'ฐ': 'th', 'ฑ': 'th', 'ฒ': 'th', 'ณ': 'n',
+  'ด': 'd', 'ต': 't', 'ถ': 'th', 'ท': 'th', 'ธ': 'th', 'น': 'n',
+  'บ': 'b', 'ป': 'p', 'ผ': 'ph', 'ฝ': 'f', 'พ': 'ph', 'ฟ': 'f', 'ภ': 'ph', 'ม': 'm',
+  'ย': 'y', 'ร': 'r', 'ฤ': 'rue', 'ล': 'l', 'ฦ': 'lue', 'ว': 'w',
+  'ศ': 's', 'ษ': 's', 'ส': 's', 'ห': 'h', 'ฬ': 'l', 'อ': '', 'ฮ': 'h',
+  'ะ': 'a', 'ั': 'a', 'า': 'a', 'ำ': 'am', 'ิ': 'i', 'ี': 'i', 'ึ': 'ue', 'ื': 'ue',
+  'ุ': 'u', 'ู': 'u', 'เ': 'e', 'แ': 'ae', 'โ': 'o', 'ใ': 'ai', 'ไ': 'ai',
+  '่': '', '้': '', '๊': '', '๋': '', '์': '', 'ๅ': '', 'ฯ': '', 'ๆ': ''
+};
+
+function transliterateThai(text) {
+  return (text || '').split('').map(ch => THAI_TRANSLITERATION_MAP[ch] ?? ch).join('');
+}
+
+// Extracts every genre <a> tag matching optional className, returning
+// { name, slug } pairs. Prefers the source site's own href for the slug
+// (the last URL path segment, e.g. href="/genres/Isekai" -> slug "isekai")
+// over inventing one, since that's the site's own canonical English term
+// for the genre even when the link's visible text is shown in Thai - see
+// bully-manga.com/genres/Supernatural for a tag whose link text is
+// "เหนือธรรมชาติ" but whose href already says "Supernatural". Falls back to
+// the GENRE_TH_TO_EN glossary, then leaves slug unset (resolved later, at
+// sync time, via a content hash) when neither is available.
+function extractGenreLinks(html, className) {
+  const pattern = className
+    ? new RegExp(`<a[^>]*class=["'][^"']*${className}[^"']*["'][^>]*href=["']([^"']*)["'][^>]*>([\\s\\S]*?)<\\/a>`, 'gi')
+    : /<a[^>]*href=["']([^"']*)["'][^>]*>([^<]+)<\/a>/gi;
+  const results = [];
+  let m;
+  while ((m = pattern.exec(html)) !== null) {
+    const name = decodeHtmlEntities(stripTags(m[2]));
+    if (!name) continue;
+    let slug = null;
+    let enName = null;
+    try {
+      const segments = new URL(m[1], 'http://x').pathname.split('/').filter(Boolean);
+      const last = segments[segments.length - 1];
+      if (last && /[a-z]/i.test(last)) {
+        enName = decodeURIComponent(last).replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        slug = slugify(decodeURIComponent(last), null);
+      }
+    } catch (e) { /* not a usable URL - fall through to the glossary/hash below */ }
+    if (!slug && GENRE_TH_TO_EN[name]) {
+      enName = GENRE_TH_TO_EN[name];
+      slug = slugify(enName, null);
+    }
+    results.push({ name, slug, enName });
+  }
+  return results;
+}
+
 // Maps a manga-theme info-table row label to a canonical metadata key. Sites
 // running the same (very common) WordPress manga theme render this table in
 // whatever language they're localized to - Thai on the sites this scraper
@@ -1447,10 +1583,7 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
 
   const genreBlockMatch = /<div[^>]*class=["'][^"']*seriestugenre[^"']*["'][^>]*>([\s\S]*?)<\/div>/i.exec(html);
   if (genreBlockMatch) {
-    const genres = [];
-    const aRegex = /<a[^>]*>([^<]+)<\/a>/gi;
-    let aMatch;
-    while ((aMatch = aRegex.exec(genreBlockMatch[1])) !== null) genres.push(decodeHtmlEntities(aMatch[1]).trim());
+    const genres = extractGenreLinks(genreBlockMatch[1]);
     if (genres.length > 0) meta.genres = genres;
   }
 
@@ -1467,6 +1600,14 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
 
       const mapped = INFO_LABEL_MAP.find(([re]) => re.test(label));
       if (!mapped) continue;
+      // views is often rendered by a client-side view-counter plugin that
+      // leaves a placeholder glyph ("?", a loading icon, ...) in the
+      // server-rendered HTML this scraper actually sees - only keep it when
+      // it's recognizably a number (plain digits, or "3.5M"/"12K" style).
+      if (mapped[1] === 'views') {
+        if (/\d/.test(value)) meta.views = value;
+        continue;
+      }
       meta[mapped[1]] = value;
       if (mapped[1] === 'publishedDate' || mapped[1] === 'lastUpdatedDate') {
         const isoMatch = /datetime=["']([^"']+)["']/i.exec(valueHtml);
@@ -1497,7 +1638,11 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
   }
   if (meta.views == null) {
     const m = /<div[^>]*class=["'][^"']*sh-views-chip[^"']*["'][^>]*>([\s\S]*?)<\/div>/i.exec(html);
-    if (m) { const v = stripTags(m[1]).replace(/[^\d]/g, ''); if (v) meta.views = v; }
+    // Keep the raw "3.5M"/"49,226" text as-is (not digits-only) - stripping
+    // everything but digits would turn "3.5M" into "35", silently losing the
+    // thousand/million multiplier. parseHumanNumber (used at sync time)
+    // handles the K/M suffix properly.
+    if (m) { const v = stripTags(m[1]); if (/\d/.test(v)) meta.views = v; }
   }
   if (!meta.type) {
     const m = /<span[^>]*class=["'][^"']*sh-badge-type[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
@@ -1508,13 +1653,7 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
     if (m) meta.status = stripTags(m[1]);
   }
   if (!meta.genres) {
-    const genreRegex = /<a[^>]*class=["'][^"']*sh-genre[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
-    const shGenres = [];
-    let gm;
-    while ((gm = genreRegex.exec(html)) !== null) {
-      const g = stripTags(gm[1]);
-      if (g) shGenres.push(g);
-    }
+    const shGenres = extractGenreLinks(html, 'sh-genre');
     if (shGenres.length > 0) meta.genres = shGenres;
   }
   // Key/value "meta pills": <span class="sh-meta-k">อัปเดต</span><span class="sh-meta-v">2026-07-13 ...</span>
