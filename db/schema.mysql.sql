@@ -33,6 +33,12 @@ CREATE TABLE series (
   updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'วันที่แก้ไขข้อมูลเรื่องล่าสุด'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='ข้อมูลหลักของแต่ละเรื่องมังงะ';
 
+-- ใช้โดย GET /api/manga/search (solo-manga-api) - แทนที่ LIKE '%keyword%' บน
+-- title/description ซึ่ง scan ทั้งตารางทุกครั้งเพราะ wildcard นำหน้า index
+-- ใช้ไม่ได้ ส่วน slug ยังใช้ LIKE ต่อไปเพราะเป็นข้อความสั้น ไม่คุ้มที่จะทำ
+-- fulltext index ให้
+ALTER TABLE series ADD FULLTEXT INDEX ft_series_search (title, description);
+
 CREATE TABLE chapters (
   id                INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'รหัสตอน (internal)',
   series_id         INT UNSIGNED NOT NULL COMMENT 'อ้างอิงถึง series.id ว่าตอนนี้เป็นของเรื่องไหน',
