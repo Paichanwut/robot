@@ -25,6 +25,7 @@ CREATE TABLE series (
   author            VARCHAR(255) COMMENT 'ชื่อผู้แต่ง/นักวาด',
   status            ENUM('ongoing','completed','hiatus') NOT NULL DEFAULT 'ongoing' COMMENT 'ongoing=กำลังฉาย, completed=จบแล้ว, hiatus=พักการเขียน',
   type              VARCHAR(50) COMMENT 'ประเภทตามที่เว็บต้นทางระบุ เช่น Manhwa, Manhua, Manga, Novel',
+  rating            DECIMAL(3,1) COMMENT 'คะแนนที่เว็บต้นทางให้ไว้ (เช่น 8.0 จาก 10) - อ้างอิงเท่านั้น',
   cover_image_key   VARCHAR(500) COMMENT 'R2 object key ของรูปปก (ไม่เก็บไฟล์รูปในตารางนี้)',
   view_count        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'จำนวนครั้งที่หน้าเรื่องนี้ถูกเข้าชมบนเว็บเรา (นับเอง ไม่ใช่ของเว็บต้นทาง)',
   source_view_count BIGINT UNSIGNED COMMENT 'ยอดวิวที่เว็บต้นทางรายงานไว้ตอนดึงข้อมูลมา (อ้างอิงเท่านั้น คนละตัวกับ view_count ของเราเอง)',

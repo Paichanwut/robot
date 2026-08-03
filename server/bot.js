@@ -209,11 +209,12 @@ async function syncSeriesToWebsiteDb(conn, series) {
   // matched, since MySQL still enforces uniqueness on the OTHER column
   // even when the conflict is detected via a different one.
   await conn.execute(
-    `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, type, cover_image_key, source_view_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, type, rating, cover_image_key, source_view_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        source_series_id = VALUES(source_series_id), title = VALUES(title), alt_titles = VALUES(alt_titles),
        description = VALUES(description), author = VALUES(author), status = VALUES(status), type = VALUES(type),
+       rating = COALESCE(VALUES(rating), rating),
        cover_image_key = COALESCE(VALUES(cover_image_key), cover_image_key),
        source_view_count = COALESCE(VALUES(source_view_count), source_view_count)`,
     [
@@ -225,6 +226,7 @@ async function syncSeriesToWebsiteDb(conn, series) {
       meta.author || meta.artist || null,
       normalizeSeriesStatus(meta.status),
       meta.type || null,
+      typeof meta.rating === 'number' ? meta.rating : (parseFloat(meta.rating) || null),
       meta.coverImagePath || null,
       parseHumanNumber(meta.views)
     ]
@@ -1671,6 +1673,42 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
   return meta;
 }
 
+// Some WordPress manga-theme sites (go-manga.com and likely its siblings on
+// the same theme - up-manga.com, dark-manga.com) render the real page-view
+// count via a client-side AJAX call that fires *after* page load - the
+// server-rendered HTML this scraper actually fetches only ever has a "?"
+// placeholder in <span class="ts-views-count">?</span>, so no amount of
+// regex-tweaking on that HTML will ever find a real number there.
+//
+// The theme's own function.js does this instead (found by reading it):
+//   POST {origin}/wp-admin/admin-ajax.php
+//   body: action=dynamic_view_ajax&post_id=<id>
+//   -> { "views": "2.1M", ... }
+// <id> is the WordPress post id, already sitting in the page's own HTML as
+// `ts_dynamic_ajax_view(<id>)` - so this replicates that one AJAX call
+// directly over plain HTTP, no real browser needed, and gets the actual
+// number instead of the placeholder.
+async function fetchDynamicViewCount(pageUrl, html) {
+  const idMatch = /ts_dynamic_ajax_view\((\d+)\)/.exec(html);
+  if (!idMatch) return null;
+  try {
+    const origin = new URL(pageUrl).origin;
+    const response = await fetch(`${origin}/wp-admin/admin-ajax.php`, {
+      method: 'POST',
+      headers: clearanceHeaders(pageUrl, {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': pageUrl
+      }),
+      body: `action=dynamic_view_ajax&post_id=${idMatch[1]}`
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return (data && typeof data.views === 'string' && /\d/.test(data.views)) ? data.views : null;
+  } catch (e) {
+    return null; // theme without this endpoint, network hiccup, ... - views just stays whatever extractSeriesMetadataFromHtml found
+  }
+}
+
 // Downloads a series' cover art exactly once. Guarded by whether a cover
 // object already exists in R2 for this series id - not by whether metadata
 // was just (re-)fetched - so calling this after every SEO metadata refresh
@@ -2664,6 +2702,8 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
   if (!series.metadata) {
     series.metadata = extractSeriesMetadataFromHtml(html, listingUrl);
     series.metadataFetchedAt = new Date().toISOString();
+    const dynamicViews = await fetchDynamicViewCount(listingUrl, html);
+    if (dynamicViews) series.metadata.views = dynamicViews;
     await downloadCoverImageIfMissing(series);
   }
 
@@ -2726,6 +2766,8 @@ async function backfillCoverImages(db) {
         if (!disallowed && html) {
           series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
           series.metadataFetchedAt = new Date().toISOString();
+          const dynamicViews = await fetchDynamicViewCount(series.seriesUrl, html);
+          if (dynamicViews) series.metadata.views = dynamicViews;
         }
       } catch (err) {
         console.error(`Cover backfill: failed to fetch metadata for series ${series.id}:`, err.message);
@@ -3108,6 +3150,8 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
           if (!series.metadata) {
             series.metadata = extractSeriesMetadataFromHtml(html, nextLink.url);
             series.metadataFetchedAt = new Date().toISOString();
+            const dynamicViews = await fetchDynamicViewCount(nextLink.url, html);
+            if (dynamicViews) series.metadata.views = dynamicViews;
             await downloadCoverImageIfMissing(series);
           }
 
