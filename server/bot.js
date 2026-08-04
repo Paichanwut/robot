@@ -1728,8 +1728,27 @@ async function downloadCoverImageIfMissing(series) {
     if (download.blocked) return;
 
     const contentType = download.response.headers.get('content-type');
-    const ext = getExtension(coverUrl, contentType);
-    const buffer = Buffer.from(await download.response.arrayBuffer());
+    let ext = getExtension(coverUrl, contentType);
+    let buffer = Buffer.from(await download.response.arrayBuffer());
+
+    // Covers skip the chapter-page pipeline entirely, so scrub the source
+    // site's metadata here too - same reasoning as the chapter-page loop
+    // above: jpg/png/gif/bmp lose it for free via the Jimp round-trip,
+    // webp/svg need it stripped directly.
+    try {
+      const optimized = await optimizeMangaImage(buffer, ext);
+      buffer = optimized.buffer;
+      ext = optimized.ext;
+    } catch (err) {
+      // any decode/encode failure: fall back to the untouched original
+    }
+    try {
+      if (ext === 'webp') buffer = stripWebpMetadata(buffer);
+      else if (ext === 'svg') buffer = stripSvgMetadata(buffer);
+    } catch (err) {
+      // malformed container: leave buffer untouched rather than risk corrupting it
+    }
+
     // Plain <title>_cover.<ext> - no id suffix. Trade-off: two series that
     // happen to share the exact same title would overwrite each other's
     // cover in the shared cover/ folder, but that's rare enough for this
@@ -1910,6 +1929,65 @@ async function stripAggregatorBanner(buffer, ext) {
 // "optimized" output somehow comes back larger.
 const MAX_IMAGE_WIDTH_PX = 1600;
 const JPEG_QUALITY = 85;
+
+// Strips embedded metadata (EXIF/XMP) from formats that skip the Jimp
+// decode/encode round-trip above - that round-trip already drops metadata
+// for jpg/png/gif/bmp for free (Jimp's encoders never write EXIF/XMP back),
+// but webp and svg pass through untouched, so the source site's metadata
+// would otherwise ride along all the way into R2.
+function stripWebpMetadata(buffer) {
+  if (buffer.length < 12 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') {
+    return buffer;
+  }
+
+  const chunks = [];
+  let offset = 12;
+  let changed = false;
+  while (offset + 8 <= buffer.length) {
+    const fourCC = buffer.toString('ascii', offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    const paddedSize = size + (size % 2);
+    const dataStart = offset + 8;
+    if (dataStart + paddedSize > buffer.length) break; // truncated/malformed - stop and keep what parsed cleanly
+
+    if (fourCC === 'EXIF' || fourCC === 'XMP ') {
+      changed = true;
+    } else if (fourCC === 'VP8X') {
+      const data = Buffer.from(buffer.subarray(dataStart, dataStart + size));
+      const before = data[0];
+      data[0] = before & ~0x08 & ~0x04; // clear the Exif (bit 3) and XMP (bit 2) flag bits
+      if (data[0] !== before) changed = true;
+      chunks.push({ fourCC, data });
+    } else {
+      chunks.push({ fourCC, data: buffer.subarray(dataStart, dataStart + size) });
+    }
+    offset = dataStart + paddedSize;
+  }
+  if (!changed) return buffer;
+
+  const bodyLength = chunks.reduce((sum, c) => sum + 8 + c.data.length + (c.data.length % 2), 0);
+  const out = Buffer.alloc(12 + bodyLength);
+  out.write('RIFF', 0, 'ascii');
+  out.writeUInt32LE(4 + bodyLength, 4);
+  out.write('WEBP', 8, 'ascii');
+  let pos = 12;
+  for (const c of chunks) {
+    out.write(c.fourCC, pos, 'ascii');
+    out.writeUInt32LE(c.data.length, pos + 4);
+    c.data.copy(out, pos + 8);
+    pos += 8 + c.data.length;
+    if (c.data.length % 2) out[pos++] = 0; // pad byte
+  }
+  return out;
+}
+
+function stripSvgMetadata(buffer) {
+  const text = buffer.toString('utf8');
+  const cleaned = text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<metadata[\s\S]*?<\/metadata>/gi, '');
+  return cleaned === text ? buffer : Buffer.from(cleaned, 'utf8');
+}
 
 async function optimizeMangaImage(buffer, ext) {
   const mime = MIME_BY_EXT[(ext || '').toLowerCase()];
@@ -2289,6 +2367,17 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
           ext = optimized.ext;
         } catch (err) {
           // any decode/encode failure: fall back to the untouched original
+        }
+
+        // jpg/png/gif/bmp already lost their metadata for free in the Jimp
+        // round-trip above; webp/svg never went through Jimp at all, so scrub
+        // their metadata containers directly here before anything gets hashed
+        // or uploaded - a source site's EXIF/XMP must never reach our storage.
+        try {
+          if (ext === 'webp') buffer = stripWebpMetadata(buffer);
+          else if (ext === 'svg') buffer = stripSvgMetadata(buffer);
+        } catch (err) {
+          // malformed container: leave buffer untouched rather than risk corrupting it
         }
 
         const contentHash = crypto.createHash('sha256').update(buffer).digest('hex');
@@ -3275,9 +3364,14 @@ async function syncAllSeries(db) {
       } catch (err) {
         console.error(`[sync] discover failed for "${series.name}":`, err.message);
       }
-      saveSeriesMetadata(series);
     }
     await backfillMissingChaptersFromSiblings(db, series);
+    // Both discoverAndAddNewChapters and the sibling-backfill above only
+    // push new chapters onto series.chapters in memory - saveSeries() (not
+    // saveSeriesMetadata(), which explicitly skips chapters/images) must
+    // persist them before the scrape below, or its first image insert for a
+    // brand-new chapter violates the images.chapterId foreign key.
+    saveSeries(series);
     const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
     if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
   }
@@ -3402,7 +3496,12 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
   const result = await discoverAndAddNewChapters(db, series, seriesUrl);
   if (result.disallowed) throw new Error(`robots.txt disallows ${seriesUrl}`);
   if (result.fetchFailed) throw new Error(`could not fetch ${seriesUrl}`);
-  saveSeriesMetadata(series);
+  // discoverAndAddNewChapters just pushed new chapters onto series.chapters
+  // in memory - saveSeries() (not saveSeriesMetadata(), which explicitly
+  // skips chapters/images) must run before the scrape below or its first
+  // image insert violates the images.chapterId foreign key against a
+  // chapters row that was never written.
+  saveSeries(series);
   console.log(`[add] discovered ${result.discoveredCount} chapter(s), ${result.addedCount} new`);
 
   const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
