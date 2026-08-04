@@ -58,12 +58,22 @@ const R2_UPLOAD_RETRIES = 3;
 // request doesn't cost a full chapter re-scrape - see scrapeChapterCoreAttempt,
 // which still falls back to re-downloading from the source and retrying the
 // whole chapter (up to MAX_CHAPTER_RETRIES) if every attempt here fails.
+// Attached to every object as S3 "Custom Metadata" (x-amz-meta-* headers,
+// separate from any EXIF/XMP baked into the file bytes - see
+// stripWebpMetadata/stripSvgMetadata and optimizeMangaImage above for that)
+// so every file in the bucket is unambiguously ours, not the source site's.
+const R2_OBJECT_METADATA = {
+  source: 'solo-manga.com',
+  copyright: 'solo-manga.com',
+  publisher: 'Solo Manga'
+};
+
 async function uploadToR2(key, buffer, ext) {
   const contentType = R2_CONTENT_TYPE_BY_EXT[ext] || 'application/octet-stream';
   let lastError;
   for (let attempt = 1; attempt <= R2_UPLOAD_RETRIES; attempt++) {
     try {
-      await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: buffer, ContentType: contentType }));
+      await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: buffer, ContentType: contentType, Metadata: R2_OBJECT_METADATA }));
       return;
     } catch (err) {
       lastError = err;
@@ -1763,14 +1773,16 @@ async function downloadCoverImageIfMissing(series) {
   }
 }
 
-// Turns a series/chapter name into a filesystem-safe folder name for export
-// - strips characters that are invalid (or awkward) across macOS/Linux/
-// Windows rather than just the strict minimum, since exported folders are
-// meant to be browsed/shared directly.
+// Turns a series/chapter title into a safe path segment for R2 keys (cover
+// and manga-page paths both go through this) - strips characters that are
+// invalid (or awkward) across macOS/Linux/Windows/URLs, and collapses
+// whitespace to underscores rather than leaving raw spaces in the key
+// (spaces in an R2 key mean every URL needs %20-encoding to round-trip
+// correctly, which is easy to get wrong further down the pipeline).
 function sanitizeForFilename(name, fallback) {
   const cleaned = (name || '')
     .replace(/[\/\\:*?"<>|]/g, '-')
-    .replace(/\s+/g, ' ')
+    .replace(/\s+/g, '_')
     .trim()
     .slice(0, 150);
   return cleaned || fallback;
