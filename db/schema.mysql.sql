@@ -29,6 +29,8 @@ CREATE TABLE series (
   cover_image_key   VARCHAR(500) COMMENT 'R2 object key ของรูปปก (ไม่เก็บไฟล์รูปในตารางนี้)',
   view_count        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'จำนวนครั้งที่หน้าเรื่องนี้ถูกเข้าชมบนเว็บเรา (นับเอง ไม่ใช่ของเว็บต้นทาง)',
   source_view_count BIGINT UNSIGNED COMMENT 'ยอดวิวที่เว็บต้นทางรายงานไว้ตอนดึงข้อมูลมา (อ้างอิงเท่านั้น คนละตัวกับ view_count ของเราเอง)',
+  is_edited         TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'แอดมินเคยเข้ามาแก้ไขข้อมูลเรื่องนี้แล้วหรือยัง (0=ยังไม่เคยแตะเลยตั้งแต่บอทดึงมา, 1=แอดมินแก้แล้ว) - บอทไม่แตะคอลัมน์นี้เวลา sync ซ้ำ',
+  is_published      TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'สวิตช์เปิด/ปิดการเผยแพร่บนเว็บสาธารณะ (0=ปิด/ยังไม่โชว์, 1=เปิด/โชว์แล้ว) - แอดมินเป็นคนกดเปิดเท่านั้น บอทไม่แตะคอลัมน์นี้เวลา sync ซ้ำ',
   created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'วันที่เพิ่มเรื่องนี้เข้าระบบ',
   updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'วันที่แก้ไขข้อมูลเรื่องล่าสุด'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='ข้อมูลหลักของแต่ละเรื่องมังงะ';
@@ -38,6 +40,10 @@ CREATE TABLE series (
 -- ใช้ไม่ได้ ส่วน slug ยังใช้ LIKE ต่อไปเพราะเป็นข้อความสั้น ไม่คุ้มที่จะทำ
 -- fulltext index ให้
 ALTER TABLE series ADD FULLTEXT INDEX ft_series_search (title, description);
+
+-- ทุก endpoint สาธารณะของ solo-manga-api กรอง WHERE is_published = 1 เสมอ
+-- (ดู internal/repo/lists.go) - index นี้กันไม่ให้ scan เต็มตารางทุก list query
+ALTER TABLE series ADD INDEX idx_series_published (is_published);
 
 CREATE TABLE chapters (
   id                INT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'รหัสตอน (internal)',

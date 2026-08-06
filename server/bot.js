@@ -218,6 +218,11 @@ async function syncSeriesToWebsiteDb(conn, series) {
   // then throw on the slug UNIQUE constraint the moment their titles
   // matched, since MySQL still enforces uniqueness on the OTHER column
   // even when the conflict is detected via a different one.
+  //
+  // is_edited/is_published are deliberately absent from both the column
+  // list and ON DUPLICATE KEY UPDATE below - they're admin-only flags (see
+  // db/schema.mysql.sql). Adding them here would reset an admin's
+  // edit/publish decision every time this series re-syncs on a new chapter.
   await conn.execute(
     `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, type, rating, cover_image_key, source_view_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3301,6 +3306,18 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     // failed scrape bumps retryCount (see scrapeChapterCore), so a chapter drops
     // out of `pending` after MAX_CHAPTER_RETRIES sweeps - the loop can't spin.
     // The stop signal is checked before every chapter so a stop lands promptly.
+    // Chapters that used up their retry budget in an earlier visit (e.g. the
+    // source hadn't uploaded the page's images yet, or a run of transient
+    // errors) would otherwise stay stuck in 'error'/'partial' forever, since
+    // nothing else resets retryCount. Give them one fresh budget every time
+    // the round-robin crawl comes back around to this series - still capped
+    // at MAX_CHAPTER_RETRIES attempts within *this* pass, so a permanently
+    // broken chapter just costs one extra sweep per revisit, not a spin.
+    series.chapters.forEach(c => {
+      if (c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+        c.retryCount = 0;
+      }
+    });
     let seriesBlocked = false;
     let seriesRetryAfterMs = null;
     let firstChapterOfSeries = true;
