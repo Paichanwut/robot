@@ -2206,6 +2206,19 @@ async function backfillMissingChaptersFromSiblings(db, series) {
 // from the UI always resets this and tries again regardless of the cap.
 const MAX_CHAPTER_RETRIES = 3;
 
+// How often (in series processed) a whole-site crawl prints its "found X /
+// done Y / Z left" progress summary - see runSiteCrawl. Kept infrequent on
+// purpose: a line per series would flood the log on a big site for no real
+// benefit.
+const SITE_PROGRESS_LOG_EVERY = 20;
+
+// How long a fully-scraped tracked series is left alone before it's due for
+// another "did a new chapter come out" check - see the nextLink priority
+// pick in runSiteCrawl. Deliberately not too short: re-fetching a series
+// page that basically never changes wastes a request against the same
+// per-site rate budget that new-chapter downloads compete for.
+const SERIES_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 async function scrapeChapterCore(db, series, chapter) {
   // Serialize against every other scrape/crawl operation hitting this same
   // site (see runExclusiveByOrigin above) - this is the one function every
@@ -3110,8 +3123,30 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
       continue;
     }
 
-    // Phase 2: process discovered series one at a time.
-    const nextLink = crawl.discoveredSeries.find(s => !crawl.processedSeriesUrls.includes(s.url));
+    // Phase 2: process discovered series one at a time - but not in plain
+    // discovery order. A series we already track should reach its latest
+    // chapter before we spend time discovering one we've never touched, so
+    // that whatever's actively updating gets caught up fastest. Priority:
+    //   1) already tracked AND still has an incomplete chapter
+    //   2) already tracked, fully done, but overdue for an update check
+    //      (SERIES_RECHECK_INTERVAL_MS - see lastUpdateCheckAt above)
+    //   3) never tracked before - falls back to plain discovery order
+    const unprocessedLinks = crawl.discoveredSeries.filter(s => !crawl.processedSeriesUrls.includes(s.url));
+    const findTrackedSeries = (url) => (db.series || []).find(
+      ds => ds.seriesUrl === url || (ds.sourceUrls || []).includes(url)
+    );
+    const nextLink =
+      unprocessedLinks.find(s => {
+        const tracked = findTrackedSeries(s.url);
+        return tracked && (tracked.chapters || []).some(c => c.status !== 'done');
+      }) ||
+      unprocessedLinks.find(s => {
+        const tracked = findTrackedSeries(s.url);
+        if (!tracked) return false;
+        const age = tracked.lastUpdateCheckAt ? Date.now() - new Date(tracked.lastUpdateCheckAt).getTime() : Infinity;
+        return age > SERIES_RECHECK_INTERVAL_MS;
+      }) ||
+      unprocessedLinks[0];
     if (!nextLink) {
       // Phase 3: retry pass. Every series has been attempted once, but some
       // chapters may have come out partial/error/blocked (a transient
@@ -3220,6 +3255,20 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     crawl.currentSeriesName = nextLink.name;
     writeDb(db);
 
+    // A per-series line here would be one log line per series - fine for a
+    // handful of sites, but noisy (and a needless bit of stdout I/O) on a
+    // site with hundreds of series. Only print a site-level progress summary
+    // on the very first series of this run and every SITE_PROGRESS_LOG_EVERY
+    // series after that, so long crawls still surface "found X / done Y /
+    // Z left" periodically without a line per series.
+    if (crawl.processedSeriesUrls.length % SITE_PROGRESS_LOG_EVERY === 0) {
+      console.log(
+        `[crawl:${crawl.siteUrl}] found ${crawl.discoveredSeries.length} series so far, ` +
+        `done ${crawl.processedSeriesUrls.length}, ${crawl.discoveredSeries.length - crawl.processedSeriesUrls.length} left ` +
+        `(now on: "${nextLink.name}") - ${crawl.stats.chaptersDownloaded} chapter(s) downloaded this run`
+      );
+    }
+
     if (!db.series) db.series = [];
     // Dedup against series already tracked (from a prior crawl, or added by
     // hand) so re-running a crawl never creates a duplicate series entry.
@@ -3253,6 +3302,13 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
       if (!isPathDisallowed(nextLink.url, seriesRobotsRules.disallowPaths)) {
         const html = await fetchTextOrNull(nextLink.url, 15000, crawl.useStealth);
         if (html) {
+          // We just fetched this series's own page and are about to scan it
+          // for chapter links below - that IS the "did anything new come
+          // out" check, so stamp it now regardless of whether new chapters
+          // turned up. This is what lets the priority pick above (further
+          // up this file) tell "recently checked" apart from "overdue for
+          // a check" once a series has no incomplete chapters left.
+          series.lastUpdateCheckAt = new Date().toISOString();
           if (!series.metadata) {
             series.metadata = extractSeriesMetadataFromHtml(html, nextLink.url);
             series.metadataFetchedAt = new Date().toISOString();
@@ -3467,6 +3523,30 @@ async function repairMysqlSync(db) {
 // before ever touching the next - a site with hundreds of series to work
 // through would otherwise starve every other tracked site of any progress
 // at all for as long as it takes to finish (could be days).
+// One "round" below is one full pass of the round-robin, i.e. every active
+// site gets to fully scrape one series (see maxUnitsThisTurn: 1 and
+// unitsDone++ at the end of the per-series loop in runSiteCrawl - one unit
+// really is one whole series, so a round can already take a while). Printing
+// the cross-site table every round would still be too chatty on a long
+// multi-site sync, so it only prints every ROUND_ROBIN_SUMMARY_EVERY_ROUNDS.
+const ROUND_ROBIN_SUMMARY_EVERY_ROUNDS = 5;
+
+function logRoundRobinSummary(ids) {
+  const db = readDb(); // fresh read - ids' crawl objects were written by runSiteCrawl mid-loop
+  console.log(`[sync] --- progress across ${ids.length} site(s) ---`);
+  for (const id of ids) {
+    const c = findCrawl(db, id);
+    if (!c) continue;
+    const found = c.discoveredSeries.length;
+    const done = c.processedSeriesUrls.length;
+    const discoveryNote = c.discoveryDone ? 'หาเรื่องครบแล้ว' : 'ยังหาเรื่องเพิ่มอยู่';
+    console.log(
+      `[sync]   ${c.siteUrl}: เจอ ${found} เรื่อง, โหลดจบแล้ว ${done}, เหลือ ${found - done} เรื่อง ` +
+      `(${discoveryNote}) - กำลังทำ: "${c.currentSeriesName || '-'}"`
+    );
+  }
+}
+
 async function resumeRunningCrawls(db) {
   let activeIds = (db.siteCrawls || []).filter(c => c.status === 'running').map(c => c.id);
   if (activeIds.length === 0) return;
@@ -3474,6 +3554,7 @@ async function resumeRunningCrawls(db) {
   console.log(`[sync] resuming ${activeIds.length} site crawl(s) round-robin: ${activeIds.map(id => findCrawl(db, id)?.siteUrl).join(', ')}`);
   activeIds.forEach(id => { crawlControl[id] = { stopRequested: false }; });
 
+  let round = 0;
   while (activeIds.length > 0) {
     for (const id of [...activeIds]) {
       await runSiteCrawl(id, { maxUnitsThisTurn: 1 });
@@ -3482,6 +3563,10 @@ async function resumeRunningCrawls(db) {
         activeIds = activeIds.filter(x => x !== id);
         console.log(`[sync] site crawl for ${latest?.siteUrl || id} finished with status: ${latest?.status || 'gone'}`);
       }
+    }
+    round++;
+    if (activeIds.length > 0 && round % ROUND_ROBIN_SUMMARY_EVERY_ROUNDS === 0) {
+      logRoundRobinSummary(activeIds);
     }
   }
 }
