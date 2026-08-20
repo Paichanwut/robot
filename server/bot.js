@@ -194,17 +194,43 @@ function chapterSlugSuffix(number) {
 }
 
 const MYSQL_SYNC_RETRIES = 3;
+const MYSQL_QUERY_TIMEOUT_MS = 20000;
 
-// Runs `fn(conn)` with a few retries (mirrors uploadToR2's posture) - a sync
-// failure is logged and swallowed by the caller, not fatal to the scrape
-// itself, since the image is already safely in R2 and the bot's own SQLite
-// already has the chapter marked 'done' by the time this runs.
+// Runs `fn(conn)` with a fresh pooled connection, retrying a few times on
+// failure (mirrors uploadToR2's posture) - a sync failure is logged and
+// swallowed by the caller, not fatal to the scrape itself, since the image
+// is already safely in R2 and the bot's own SQLite already has the chapter
+// marked 'done' by the time this runs.
+//
+// Bounded with its own timeout because a mysql2 connection that goes dark
+// mid-query (route to MYSQL_HOST breaks after the connection is already
+// established) hangs the `await conn.execute(...)` forever with no error -
+// same class of bug as the R2 client hanging with no request timeout (see
+// NodeHttpHandler above). Left unbounded, one stuck query never releases
+// its pool connection either, so repeated hangs quietly exhaust the whole
+// 5-connection pool. A timed-out connection is destroyed rather than
+// released back to the pool - its socket may still have a stale server
+// response in flight, unsafe to hand to the next borrower.
 async function withMysqlRetry(fn) {
   let lastError;
   for (let attempt = 1; attempt <= MYSQL_SYNC_RETRIES; attempt++) {
+    const conn = await mysqlPool.getConnection();
+    let timedOut = false;
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`mysql operation timed out after ${MYSQL_QUERY_TIMEOUT_MS}ms`));
+      }, MYSQL_QUERY_TIMEOUT_MS);
+    });
     try {
-      return await fn();
+      const result = await Promise.race([fn(conn), timeoutPromise]);
+      clearTimeout(timer);
+      conn.release();
+      return result;
     } catch (err) {
+      clearTimeout(timer);
+      if (timedOut) conn.destroy(); else conn.release();
       lastError = err;
       if (attempt < MYSQL_SYNC_RETRIES) await sleep(500 * attempt);
     }
@@ -320,28 +346,23 @@ async function syncSeriesToWebsiteDb(conn, series) {
 // stale row behind.
 async function syncChapterToWebsiteDb(seriesRowId, seriesSlug, chapterNumber, chapterTitle, images) {
   const chapterSlug = `${seriesSlug}-${chapterSlugSuffix(chapterNumber)}`;
-  await withMysqlRetry(async () => {
-    const conn = await mysqlPool.getConnection();
-    try {
-      await conn.execute(
-        `INSERT INTO chapters (series_id, source_chapter_id, slug, number, title)
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE source_chapter_id = VALUES(source_chapter_id), slug = VALUES(slug), title = VALUES(title)`,
-        [seriesRowId, null, chapterSlug, chapterNumber, chapterTitle]
-      );
-      const [[chapterRow]] = await conn.execute(
-        'SELECT id FROM chapters WHERE series_id = ? AND number = ?',
-        [seriesRowId, chapterNumber]
-      );
-      const chapterRowId = chapterRow.id;
+  await withMysqlRetry(async (conn) => {
+    await conn.execute(
+      `INSERT INTO chapters (series_id, source_chapter_id, slug, number, title)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE source_chapter_id = VALUES(source_chapter_id), slug = VALUES(slug), title = VALUES(title)`,
+      [seriesRowId, null, chapterSlug, chapterNumber, chapterTitle]
+    );
+    const [[chapterRow]] = await conn.execute(
+      'SELECT id FROM chapters WHERE series_id = ? AND number = ?',
+      [seriesRowId, chapterNumber]
+    );
+    const chapterRowId = chapterRow.id;
 
-      await conn.execute('DELETE FROM chapter_pages WHERE chapter_id = ?', [chapterRowId]);
-      if (images.length > 0) {
-        const values = images.map(img => [chapterRowId, img.order, img.relativePath]);
-        await conn.query('INSERT INTO chapter_pages (chapter_id, page_number, image_key) VALUES ?', [values]);
-      }
-    } finally {
-      conn.release();
+    await conn.execute('DELETE FROM chapter_pages WHERE chapter_id = ?', [chapterRowId]);
+    if (images.length > 0) {
+      const values = images.map(img => [chapterRowId, img.order, img.relativePath]);
+      await conn.query('INSERT INTO chapter_pages (chapter_id, page_number, image_key) VALUES ?', [values]);
     }
   });
 }
@@ -353,14 +374,7 @@ async function syncChapterToWebsiteDb(seriesRowId, seriesSlug, chapterNumber, ch
 async function syncChapterToWebsiteDbSafe(series, chapter) {
   try {
     const seriesSlug = slugify(series.metadata?.title || series.name, series.id);
-    await withMysqlRetry(async () => {
-      const conn = await mysqlPool.getConnection();
-      try {
-        return await syncSeriesToWebsiteDb(conn, series);
-      } finally {
-        conn.release();
-      }
-    }).then(seriesRowId => {
+    await withMysqlRetry(conn => syncSeriesToWebsiteDb(conn, series)).then(seriesRowId => {
       const chapterNumber = extractLeadingNumber(chapter.name) ?? (chapter.orderIndex ?? 0) + 1;
       return syncChapterToWebsiteDb(seriesRowId, seriesSlug, chapterNumber, chapter.name, chapter.images || []);
     });
@@ -3510,17 +3524,15 @@ async function repairMysqlSync(db) {
 
     let existingNumbers;
     try {
-      const conn = await mysqlPool.getConnection();
-      try {
+      existingNumbers = await withMysqlRetry(async (conn) => {
         const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
-        existingNumbers = new Set();
+        const numbers = new Set();
         if (seriesRow) {
           const [rows] = await conn.execute('SELECT number FROM chapters WHERE series_id = ?', [seriesRow.id]);
-          rows.forEach(r => existingNumbers.add(Number(r.number)));
+          rows.forEach(r => numbers.add(Number(r.number)));
         }
-      } finally {
-        conn.release();
-      }
+        return numbers;
+      });
     } catch (err) {
       // MySQL still unreachable (e.g. VPN blocking it) - skip this series
       // for now, next repair pass (next bot run) will try again.
