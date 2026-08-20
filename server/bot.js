@@ -7,6 +7,7 @@ import { Jimp, compareHashes } from 'jimp';
 import { connect } from 'puppeteer-real-browser';
 import { spawnSync } from 'child_process';
 import { S3Client, PutObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 import mysql from 'mysql2/promise';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -41,10 +42,18 @@ if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
   );
 }
 
+// The SDK's default NodeHttpHandler has NO timeout at all - a stalled TCP
+// connection (network blip, R2 hiccup) hangs the in-flight r2.send() call
+// forever with no error and no log line, wedging the whole crawl (it's
+// single-threaded/sequential) until something outside the process notices.
+// This happened - see git history. Bounding both the connect phase and the
+// overall request turns that silent-forever hang into a normal rejection
+// that uploadToR2/deleteR2Prefix's own retry loops already know how to handle.
 const r2 = new S3Client({
   region: 'auto',
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  requestHandler: new NodeHttpHandler({ connectionTimeout: 10000, requestTimeout: 30000 })
 });
 
 const R2_CONTENT_TYPE_BY_EXT = {
@@ -223,12 +232,29 @@ async function syncSeriesToWebsiteDb(conn, series) {
   // list and ON DUPLICATE KEY UPDATE below - they're admin-only flags (see
   // db/schema.mysql.sql). Adding them here would reset an admin's
   // edit/publish decision every time this series re-syncs on a new chapter.
+  //
+  // Same reasoning extends to the editorial content columns themselves
+  // (title/alt_titles/description/author/status/type): once an admin has
+  // edited a series (is_edited=1), every later resync must leave THOSE
+  // columns alone too, or the admin's rewritten synopsis/title gets quietly
+  // clobbered back to whatever the bot originally scraped the next time a
+  // new chapter comes in and triggers a sync. Guarded with IF(is_edited=0, ...)
+  // rather than dropping them from the UPDATE entirely, since a
+  // not-yet-edited series should still pick up fresher scrapes (e.g. the
+  // source site correcting a typo) right up until an admin steps in.
+  // rating/cover_image_key/source_view_count stay unconditional - they're
+  // reference metrics from the source site, not editorial content.
   await conn.execute(
     `INSERT INTO series (source_series_id, slug, title, alt_titles, description, author, status, type, rating, cover_image_key, source_view_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
-       source_series_id = VALUES(source_series_id), title = VALUES(title), alt_titles = VALUES(alt_titles),
-       description = VALUES(description), author = VALUES(author), status = VALUES(status), type = VALUES(type),
+       source_series_id = VALUES(source_series_id),
+       title = IF(is_edited = 0, VALUES(title), title),
+       alt_titles = IF(is_edited = 0, VALUES(alt_titles), alt_titles),
+       description = IF(is_edited = 0, VALUES(description), description),
+       author = IF(is_edited = 0, VALUES(author), author),
+       status = IF(is_edited = 0, VALUES(status), status),
+       type = IF(is_edited = 0, VALUES(type), type),
        rating = COALESCE(VALUES(rating), rating),
        cover_image_key = COALESCE(VALUES(cover_image_key), cover_image_key),
        source_view_count = COALESCE(VALUES(source_view_count), source_view_count)`,
