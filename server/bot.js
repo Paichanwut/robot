@@ -49,11 +49,20 @@ if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY) {
 // This happened - see git history. Bounding both the connect phase and the
 // overall request turns that silent-forever hang into a normal rejection
 // that uploadToR2/deleteR2Prefix's own retry loops already know how to handle.
+//
+// throwOnRequestTimeout is NOT optional here despite the misleading name -
+// without it, requestTimeout does nothing but print a one-line warning and
+// let the request keep hanging forever anyway (see
+// @smithy/node-http-handler/dist-es/set-request-timeout.js: the timer only
+// calls req.destroy()/reject() when this flag is set; otherwise it just
+// logs). This was caught live - a container spent ~20 hours spewing
+// "exceeded the configured 30000 ms requestTimeout" warnings with zero
+// actual progress before this was set.
 const r2 = new S3Client({
   region: 'auto',
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-  requestHandler: new NodeHttpHandler({ connectionTimeout: 10000, requestTimeout: 30000 })
+  requestHandler: new NodeHttpHandler({ connectionTimeout: 10000, requestTimeout: 30000, throwOnRequestTimeout: true })
 });
 
 const R2_CONTENT_TYPE_BY_EXT = {
