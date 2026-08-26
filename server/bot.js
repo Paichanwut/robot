@@ -791,11 +791,16 @@ function writeDb(data) {
 // first use. This makes a dedup-logic change like the threshold=2->3 one
 // self-healing on next deploy - no manual `reset-dedup` run required.
 //
-// A chapter that hit this specific error is exactly the failure mode this
-// migration exists to undo - false-positive shared-asset filtering under
-// the old logic. Match on the error text (not just status:'error') so
-// chapters that failed for an unrelated reason keep their retry count.
-const SHARED_ASSET_ERROR_TEXT = 'ถูกกรองว่าเป็นโฆษณาหรือรูปที่ใช้ซ้ำทั้งเว็บ';
+// A chapter that hit either of these two errors (URL-based filter emptied
+// the page, or hash/pHash-based filter emptied it after download) is
+// exactly the failure mode this migration exists to undo - false-positive
+// shared-asset filtering under the old logic. Match on the error text (not
+// just status:'error') so chapters that failed for an unrelated reason
+// keep their retry count.
+const SHARED_ASSET_ERROR_TEXTS = [
+  'ถูกกรองว่าเป็นโฆษณาหรือรูปที่ใช้ซ้ำทั้งเว็บ',
+  'ทุกรูปในหน้านี้ถูกกรองว่าเป็นรูปโฆษณา/เครดิตที่ใช้ซ้ำ'
+];
 
 function runDedupSchemaMigration() {
   let migratedSeries = 0;
@@ -814,7 +819,7 @@ function runDedupSchemaMigration() {
     // at/over the retry cap) would otherwise never touch them again -
     // resetting retryCount here is what actually lets them re-scrape.
     (series.chapters || []).forEach(chapter => {
-      if (chapter.status === 'error' && chapter.error?.includes(SHARED_ASSET_ERROR_TEXT) && (chapter.retryCount || 0) > 0) {
+      if (chapter.status === 'error' && SHARED_ASSET_ERROR_TEXTS.some(text => chapter.error?.includes(text)) && (chapter.retryCount || 0) > 0) {
         chapter.retryCount = 0;
         updateChapter(chapter);
         unstuckChapters++;
@@ -2445,17 +2450,15 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       }
     });
 
-    const preSharedFilterImages = mangaImages;
+    // NOTE: deliberately no "fall back to unfiltered if this empties the
+    // page" here. That was tried and reverted - in production it forced
+    // through a page's favicon/wallpaper furniture as if it were chapter
+    // art on a chapter where the source site itself had no real images to
+    // serve (confirmed by a reader comment on the site saying exactly that).
+    // An all-excluded page is NOT reliably a filter false positive, so it
+    // must still surface as an error for a human to check, not be papered
+    // over automatically.
     mangaImages = mangaImages.filter(img => !sharedSet.has(img.url));
-
-    if (mangaImages.length === 0 && preSharedFilterImages.length > 0) {
-      // Every image got caught by the shared-asset filter, which almost
-      // certainly means the filter is wrong here (a page that's genuinely
-      // 100% ads/reused furniture is vanishingly rare) - fall back to the
-      // unfiltered set rather than erroring the chapter out.
-      console.warn(`[scrape] "${chapter.name}": all ${preSharedFilterImages.length} image(s) were excluded as shared/reused assets - falling back to the unfiltered set instead of erroring`);
-      mangaImages = preSharedFilterImages;
-    }
 
     console.log(`[scrape] "${chapter.name}": ${mangaImages.length} image(s) after shared-asset filter`);
 
@@ -2562,39 +2565,56 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
 
         // Same cross-chapter-reuse check as the URL-based one above, but by
         // content hash - catches a translator's credit slide/ad banner even
-        // when it's re-uploaded under a fresh URL every chapter. A hash seen
-        // under a different chapter id already confirms it's reused site
-        // furniture, not unique page art, so skip saving it at all.
-        const seenInChapter = series.seenAssetHashes[contentHash];
-        if ((seenInChapter && seenInChapter !== chapter.id) || sharedHashSet.has(contentHash)) {
-          if (!sharedHashSet.has(contentHash)) {
+        // when it's re-uploaded under a fresh URL every chapter. Same
+        // distinct-chapter counter/threshold as the URL check above (see
+        // SHARED_ASSET_CHAPTER_THRESHOLD) - one repeat isn't enough.
+        let seenHash = series.seenAssetHashes[contentHash];
+        if (typeof seenHash === 'string') seenHash = { lastChapterId: seenHash, count: 1 };
+
+        let isSharedHash = sharedHashSet.has(contentHash);
+        if (seenHash) {
+          if (seenHash.lastChapterId !== chapter.id) {
+            seenHash.count += 1;
+            seenHash.lastChapterId = chapter.id;
+          }
+          series.seenAssetHashes[contentHash] = seenHash;
+          if (seenHash.count >= SHARED_ASSET_CHAPTER_THRESHOLD && !isSharedHash) {
             sharedHashSet.add(contentHash);
             series.sharedAssetHashes.push(contentHash);
+            isSharedHash = true;
           }
-          excludedAsSharedCount++;
-          continue;
-        }
-        if (!seenInChapter) {
-          series.seenAssetHashes[contentHash] = chapter.id;
+        } else {
+          series.seenAssetHashes[contentHash] = { lastChapterId: chapter.id, count: 1 };
         }
 
         // Perceptual-hash check, only for first/last-page candidates (see
         // isPHashCandidatePosition) - catches a reused ad/credit graphic
         // that's visually the same but wasn't byte-identical, which the
-        // exact contentHash check above just let through.
+        // exact contentHash check above just let through. Same
+        // distinct-chapter threshold as above: count how many OTHER
+        // chapters logged a near-identical image, don't exclude on a single
+        // prior sighting.
         let pHash = null;
+        let isSharedPHash = false;
         if (isPHashCandidatePosition(i, mangaImages.length)) {
           pHash = await computePerceptualHash(buffer);
           if (pHash) {
-            const nearMatch = series.assetPHashLog.find(entry =>
-              entry.chapterId !== chapter.id && compareHashes(entry.hash, pHash) <= PHASH_DISTANCE_THRESHOLD
+            const nearMatchChapterIds = new Set(
+              series.assetPHashLog
+                .filter(entry => entry.chapterId !== chapter.id && compareHashes(entry.hash, pHash) <= PHASH_DISTANCE_THRESHOLD)
+                .map(entry => entry.chapterId)
             );
-            if (nearMatch) {
-              excludedAsSharedCount++;
-              continue;
+            if (nearMatchChapterIds.size >= SHARED_ASSET_CHAPTER_THRESHOLD) {
+              isSharedPHash = true;
+            } else {
+              series.assetPHashLog.push({ hash: pHash, chapterId: chapter.id });
             }
-            series.assetPHashLog.push({ hash: pHash, chapterId: chapter.id });
           }
+        }
+
+        if (isSharedHash || isSharedPHash) {
+          excludedAsSharedCount++;
+          continue;
         }
 
         const filename = `${seriesTitleForFile}_ep${chapterLabel}_${String(i + 1).padStart(3, '0')}.${ext}`;
@@ -3597,6 +3617,24 @@ async function syncAllSeries(db) {
     // persist them before the scrape below, or its first image insert for a
     // brand-new chapter violates the images.chapterId foreign key.
     saveSeries(series);
+
+    // Give any chapter that used up its retry budget in an earlier run (this
+    // routine sync is what docker/cron actually runs on a schedule - see
+    // the identical reset in crawlCommand for the whole-site-crawl path) one
+    // fresh budget every time this series comes up again, so a chapter that
+    // failed 3x (dedup false-positive, transient block, site hiccup, ...)
+    // gets retried on the next sync pass instead of staying 'error' forever.
+    // Still capped at MAX_CHAPTER_RETRIES attempts within this pass, so a
+    // permanently broken chapter costs one extra sweep per sync, not a spin.
+    let unstuckCount = 0;
+    series.chapters.forEach(c => {
+      if (c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+        c.retryCount = 0;
+        unstuckCount++;
+      }
+    });
+    if (unstuckCount > 0) console.log(`[sync] "${series.name}": giving ${unstuckCount} exhausted chapter(s) a fresh retry budget`);
+
     const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
     if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
   }
