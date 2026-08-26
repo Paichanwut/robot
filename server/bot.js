@@ -548,6 +548,15 @@ const insertImageStmt = sqliteDb.prepare(`
 // scraper-internal indexes, never queried relationally - kept as one JSON
 // blob column on the series row rather than their own tables.
 const DEDUP_STATE_FIELDS = ['seenAssetUrls', 'seenAssetHashes', 'sharedAssetUrls', 'sharedAssetHashes', 'assetPHashLog'];
+// Bumped whenever a change to the dedup logic above can make OLD blacklist
+// entries wrong (e.g. the threshold=2->3 change here: entries added under
+// the old logic were blacklisted off a single repeat and may be false
+// positives under the new one). runDedupSchemaMigration() below compares
+// each series' saved version against this at every startup and, if it's
+// behind, wipes just the derived blacklists (sharedAssetUrls/Hashes,
+// assetPHashLog) so they rebuild from scratch under the current logic -
+// no manual `reset-dedup` needed for a logic-change rollout like this one.
+const DEDUP_SCHEMA_VERSION = 2;
 
 // Loads every series, chapter, and image with exactly 3 queries total
 // (not N+1 per series/chapter) and assembles the same nested shape the rest
@@ -606,6 +615,8 @@ function buildSeriesTree() {
     DEDUP_STATE_FIELDS.forEach(field => {
       series[field] = dedupState[field] ?? (field === 'seenAssetUrls' || field === 'seenAssetHashes' ? {} : []);
     });
+    // Missing entirely = data written before this versioning existed = version 1.
+    series.dedupSchemaVersion = dedupState.dedupSchemaVersion || 1;
     return series;
   });
 }
@@ -623,6 +634,7 @@ let seriesCache = [];
 const saveSeriesTxn = sqliteDb.transaction((series) => {
   const dedupState = {};
   DEDUP_STATE_FIELDS.forEach(field => { dedupState[field] = series[field]; });
+  dedupState.dedupSchemaVersion = series.dedupSchemaVersion || DEDUP_SCHEMA_VERSION;
 
   upsertSeriesStmt.run({
     id: series.id,
@@ -695,6 +707,7 @@ const updateSeriesRowStmt = sqliteDb.prepare(`
 function saveSeriesMetadata(series) {
   const dedupState = {};
   DEDUP_STATE_FIELDS.forEach(field => { dedupState[field] = series[field]; });
+  dedupState.dedupSchemaVersion = series.dedupSchemaVersion || DEDUP_SCHEMA_VERSION;
 
   updateSeriesRowStmt.run({
     id: series.id,
@@ -768,8 +781,54 @@ function writeDb(data) {
   }
 }
 
+// Runs once at every process startup, before anything scrapes. For any
+// series whose saved dedup state predates DEDUP_SCHEMA_VERSION, wipes the
+// DERIVED blacklists (sharedAssetUrls/Hashes, assetPHashLog) - built under
+// whatever the old logic was and possibly wrong under the current one - so
+// they rebuild from a clean slate. seenAssetUrls/seenAssetHashes (the raw
+// per-chapter sighting log) are left alone; scrapeChapterCoreAttempt already
+// normalizes their old string-shaped entries to {lastChapterId, count} on
+// first use. This makes a dedup-logic change like the threshold=2->3 one
+// self-healing on next deploy - no manual `reset-dedup` run required.
+//
+// A chapter that hit this specific error is exactly the failure mode this
+// migration exists to undo - false-positive shared-asset filtering under
+// the old logic. Match on the error text (not just status:'error') so
+// chapters that failed for an unrelated reason keep their retry count.
+const SHARED_ASSET_ERROR_TEXT = 'ถูกกรองว่าเป็นโฆษณาหรือรูปที่ใช้ซ้ำทั้งเว็บ';
+
+function runDedupSchemaMigration() {
+  let migratedSeries = 0;
+  let unstuckChapters = 0;
+  seriesCache.forEach(series => {
+    if ((series.dedupSchemaVersion || 1) >= DEDUP_SCHEMA_VERSION) return;
+    series.sharedAssetUrls = [];
+    series.sharedAssetHashes = [];
+    series.assetPHashLog = [];
+    series.dedupSchemaVersion = DEDUP_SCHEMA_VERSION;
+    saveSeriesMetadata(series);
+    migratedSeries++;
+
+    // These chapters exhausted MAX_CHAPTER_RETRIES against a blacklist that
+    // just got wiped above, so the normal retry pass (which skips anything
+    // at/over the retry cap) would otherwise never touch them again -
+    // resetting retryCount here is what actually lets them re-scrape.
+    (series.chapters || []).forEach(chapter => {
+      if (chapter.status === 'error' && chapter.error?.includes(SHARED_ASSET_ERROR_TEXT) && (chapter.retryCount || 0) > 0) {
+        chapter.retryCount = 0;
+        updateChapter(chapter);
+        unstuckChapters++;
+      }
+    });
+  });
+  if (migratedSeries > 0) {
+    console.log(`[dedup-migration] reset shared-asset blacklist for ${migratedSeries} series, unstuck ${unstuckChapters} chapter(s) for retry (schema v${DEDUP_SCHEMA_VERSION})`);
+  }
+}
+
 dbCache = loadDbFromDisk();
 seriesCache = buildSeriesTree();
+runDedupSchemaMigration();
 
 // Node's global fetch (undici) wraps the real network failure in err.cause with a
 // libuv/OpenSSL error code (ENOTFOUND, ECONNREFUSED, CERT_HAS_EXPIRED, ...).
@@ -1862,6 +1921,11 @@ function extractLeadingNumber(text) {
 // against real chapter art from this scraper: unrelated manga pages came
 // out at 0.27-0.63) to keep false positives on genuine, unique page art rare.
 const PHASH_DISTANCE_THRESHOLD = 0.12;
+// How many DISTINCT chapters must serve the exact same image URL before it's
+// blacklisted as a shared site asset (see the cross-chapter dedup below) - 2
+// (i.e. "seen twice") was too aggressive: a title/credits/afterword page can
+// legitimately repeat once across two chapters without being site furniture.
+const SHARED_ASSET_CHAPTER_THRESHOLD = 3;
 // Ad/credit/translator-note images are conventionally spliced in at the very
 // start or end of a chapter, never in the middle of the actual page
 // sequence - restricting perceptual hashing to these positions keeps the
@@ -2299,6 +2363,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
   chapter.status = 'scraping';
   chapter.error = null;
   updateChapter(chapter);
+  console.log(`[scrape] starting "${series.name}" / "${chapter.name}" (${chapter.id}) - ${chapter.url}`);
 
   try {
     // Respect robots.txt for the chapter's page before touching the site at all.
@@ -2329,15 +2394,19 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     // the homepage gallery classifier does) would silently drop almost all
     // of them and keep only a stray keyword-matched thumbnail.
     let mangaImages = pageDetail.images.filter(img => img.type !== 'ad');
+    console.log(`[scrape] "${chapter.name}": ${pageDetail.images.length} image(s) on page, ${mangaImages.length} after ad filter`);
 
     // Cross-chapter dedup: a real page is essentially never byte-identical
     // reused between two different chapters, but a site's own promo banner
     // or a UI icon (a lightbox "close" button, a "read more manga" ad slot
     // shaped like 728x400) often is - and its filename/keywords can look
-    // completely innocuous. Track which chapter first served each image URL
-    // on this series; the moment the same URL shows up under a second,
-    // different chapter, it's confirmed to be a shared site asset rather
-    // than chapter art, so it gets excluded here and on every future scrape.
+    // completely innocuous. Track how many DISTINCT chapters have served each
+    // image URL on this series; only once the same URL has shown up under
+    // SHARED_ASSET_CHAPTER_THRESHOLD or more different chapters is it
+    // confirmed to be a shared site asset rather than chapter art (a single
+    // repeat is not enough - a title/credits/afterword page can legitimately
+    // reuse the same file across two chapters), so it gets excluded here and
+    // on every future scrape.
     if (!series.seenAssetUrls) series.seenAssetUrls = {};
     if (!series.sharedAssetUrls) series.sharedAssetUrls = [];
     const sharedSet = new Set(series.sharedAssetUrls);
@@ -2356,18 +2425,39 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     if (!series.assetPHashLog) series.assetPHashLog = [];
 
     mangaImages.forEach(img => {
-      const seenInChapter = series.seenAssetUrls[img.url];
-      if (seenInChapter && seenInChapter !== chapter.id) {
-        if (!sharedSet.has(img.url)) {
+      let seen = series.seenAssetUrls[img.url];
+      // Back-compat: older dedupStateJson stored just the first chapter id
+      // (a string) instead of {lastChapterId, count} - normalize on read.
+      if (typeof seen === 'string') seen = { lastChapterId: seen, count: 1 };
+
+      if (seen) {
+        if (seen.lastChapterId !== chapter.id) {
+          seen.count += 1;
+          seen.lastChapterId = chapter.id;
+        }
+        series.seenAssetUrls[img.url] = seen;
+        if (seen.count >= SHARED_ASSET_CHAPTER_THRESHOLD && !sharedSet.has(img.url)) {
           sharedSet.add(img.url);
           series.sharedAssetUrls.push(img.url);
         }
-      } else if (!seenInChapter) {
-        series.seenAssetUrls[img.url] = chapter.id;
+      } else {
+        series.seenAssetUrls[img.url] = { lastChapterId: chapter.id, count: 1 };
       }
     });
 
+    const preSharedFilterImages = mangaImages;
     mangaImages = mangaImages.filter(img => !sharedSet.has(img.url));
+
+    if (mangaImages.length === 0 && preSharedFilterImages.length > 0) {
+      // Every image got caught by the shared-asset filter, which almost
+      // certainly means the filter is wrong here (a page that's genuinely
+      // 100% ads/reused furniture is vanishingly rare) - fall back to the
+      // unfiltered set rather than erroring the chapter out.
+      console.warn(`[scrape] "${chapter.name}": all ${preSharedFilterImages.length} image(s) were excluded as shared/reused assets - falling back to the unfiltered set instead of erroring`);
+      mangaImages = preSharedFilterImages;
+    }
+
+    console.log(`[scrape] "${chapter.name}": ${mangaImages.length} image(s) after shared-asset filter`);
 
     if (mangaImages.length === 0) {
       chapter.status = 'error';
@@ -2541,6 +2631,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       ? 'เว็บเริ่มบล็อก (429/403) ระหว่างโหลดรูป ระบบหยุดให้อัตโนมัติ - โหลดได้บางส่วน'
       : (expectedCount === 0 ? 'ทุกรูปในหน้านี้ถูกกรองว่าเป็นรูปโฆษณา/เครดิตที่ใช้ซ้ำ' : null);
     chapter.scrapedAt = new Date().toISOString();
+    console.log(`[scrape] "${chapter.name}" finished: status=${chapter.status}, downloaded=${downloaded.length}/${expectedCount}, excludedAsShared=${excludedAsSharedCount}`);
 
     updateChapter(chapter);
     return { httpStatus: 200, error: null, blockedEarly, retryAfterMs };
@@ -3669,6 +3760,24 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
   console.log(`[add] scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
 }
 
+// Wipes the cross-chapter dedup bookkeeping (seenAssetUrls/Hashes,
+// sharedAssetUrls/Hashes, assetPHashLog) for one series so the next scrape
+// relearns which images are genuinely shared site furniture from scratch -
+// use this after a false-positive blacklist entry (or a threshold/logic
+// change like this one) has already poisoned a series' saved state.
+async function resetDedupCommand(url) {
+  const seriesUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
+  const db = readDb();
+  const series = (db.series || []).find(s => s.seriesUrl === seriesUrl || (s.sourceUrls || []).includes(seriesUrl));
+  if (!series) throw new Error(`No tracked series found for ${seriesUrl}`);
+
+  DEDUP_STATE_FIELDS.forEach(field => {
+    series[field] = field === 'seenAssetUrls' || field === 'seenAssetHashes' ? {} : [];
+  });
+  saveSeriesMetadata(series);
+  console.log(`[reset-dedup] cleared dedup state for "${series.name}" (${series.id})`);
+}
+
 // Starts (or resumes) a whole-site crawl and runs it to completion in this
 // process - unlike the old web handler, which only kicked the crawl off and
 // returned immediately, a CLI invocation has to wait for it since nothing
@@ -3807,6 +3916,9 @@ async function main() {
     await crawlCommand(arg, { stealth });
   } else if (cmd === 'repair-sync') {
     await repairMysqlSync(readDb());
+  } else if (cmd === 'reset-dedup') {
+    if (!arg) throw new Error('Usage: node server/bot.js reset-dedup <seriesUrl>');
+    await resetDedupCommand(arg);
   } else if (!cmd) {
     const db = readDb();
     await resumeRunningCrawls(db);
@@ -3816,7 +3928,7 @@ async function main() {
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl>]`);
   }
 }
 
