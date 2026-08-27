@@ -1009,7 +1009,14 @@ async function getBrowser() {
     turnstile: true,
     customConfig: { userDataDir: CHROME_PROFILE_DIR },
     connectOption: { defaultViewport: null },
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,800'],
+    // --disable-dev-shm-usage: makes Chrome use /tmp instead of /dev/shm for
+    // its shared memory - Docker's default 64MB /dev/shm is too small for a
+    // real (non-headless) Chrome and causes exactly the renderer
+    // hangs/crashes behind the "navigation didn't settle" warnings seen in
+    // production. Paired with shm_size: '1gb' in docker-compose.yml (the
+    // faster fix when available); this flag is the fallback for any host
+    // that doesn't let us raise shm_size.
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1280,800'],
   });
   browserInstance = browser;
   initialBlankPage = page || null;
@@ -1412,7 +1419,32 @@ function parseRetryAfterMs(response) {
 
 // Fetches one page's status (reusing the same rich error diagnosis as the
 // uptime checker) plus every image found on it.
-async function fetchPageDetails(pageUrl, useStealth = false) {
+// Error codes worth retrying automatically - a blip at the network/DNS
+// layer, not a real property of the target (a domain that genuinely
+// doesn't exist, or a bad TLS cert, will fail identically on retry, so
+// those are excluded and left to error out immediately as before).
+const TRANSIENT_NETWORK_ERROR_CODES = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH']);
+
+// A container's DNS resolver can go temporarily unresponsive under load
+// (EAI_AGAIN) for a few seconds - seen in production causing a burst of
+// otherwise-healthy chapters to error out together. Retry a couple of
+// times with a short backoff before giving up, so one resolver hiccup
+// doesn't cost this chapter a whole retry-budget slot.
+async function fetchPageDetails(pageUrl, useStealth = false, attempt = 1) {
+  const result = await fetchPageDetailsOnce(pageUrl, useStealth);
+  if (result.status === 'down' && attempt < 3) {
+    const code = result.errorCode;
+    if (code && TRANSIENT_NETWORK_ERROR_CODES.has(code)) {
+      console.warn(`[fetch] ${pageUrl}: transient network error (${code}), retrying (${attempt}/2)...`);
+      await sleep(2000 * attempt);
+      return fetchPageDetails(pageUrl, useStealth, attempt + 1);
+    }
+  }
+  delete result.errorCode;
+  return result;
+}
+
+async function fetchPageDetailsOnce(pageUrl, useStealth = false) {
   const startTime = performance.now();
   try {
     const controller = new AbortController();
@@ -1465,7 +1497,7 @@ async function fetchPageDetails(pageUrl, useStealth = false) {
     return { url: pageUrl, status: 'up', statusCode, responseTime, error: null, images: extractImagesFromHtml(html, pageUrl) };
   } catch (err) {
     const responseTime = Math.round(performance.now() - startTime);
-    return { url: pageUrl, status: 'down', statusCode: null, responseTime, error: describeCheckError(err), images: [] };
+    return { url: pageUrl, status: 'down', statusCode: null, responseTime, error: describeCheckError(err), errorCode: err.cause?.code || null, images: [] };
   }
 }
 

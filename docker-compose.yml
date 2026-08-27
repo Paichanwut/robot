@@ -8,6 +8,13 @@ services:
     # (no real init, signal delivery to PID 1 is unreliable), so without
     # this xvfb-run hangs forever before ever launching node.
     init: true
+    # Docker's default /dev/shm is 64MB, which the real (non-headless) Chrome
+    # this bot drives (see getBrowser() in server/bot.js) can exhaust under
+    # normal page rendering - seen in production as frequent "navigation
+    # didn't settle" warnings. 1GB matches what Google's own Puppeteer-in-
+    # Docker guidance recommends; --disable-dev-shm-usage in bot.js's Chrome
+    # args is a second layer of the same fix for hosts that ignore this.
+    shm_size: '1gb'
     env_file:
       - .env
     volumes:
