@@ -949,7 +949,7 @@ function extractImagesFromHtml(html, pageUrl) {
       }
     }
     if (lower.includes('logo') || lower.includes('favicon') || lower.includes('icon') || lower.includes('avatar') || lower.includes('profile_image') || lower.includes('twimg.com')) return false;
-    if (lower.includes('ad-') || lower.includes('/ads/') || lower.includes('banner') || lower.includes('advertisement')) return false;
+    if (AD_TOKEN_REGEX.test(lower) || lower.includes('banner') || lower.includes('advertisement')) return false;
     if (lower.includes('play_w.png') || lower.includes('scroll-down.svg') || lower.includes('gamestore.gif')) return false;
     // Generic UI-chrome graphics (a lightbox "close" button, "next/prev"
     // arrows, loading spinners, ...) sometimes ship as their own file with
@@ -959,7 +959,7 @@ function extractImagesFromHtml(html, pageUrl) {
     // data-src swaps in) - a page with no data-* lazy attribute at all and
     // just one of these as `src` means the real URL is injected by JS this
     // scraper can't run, not that this placeholder is actual page art.
-    if (/\/(blank|placeholder|loading|lazy|spinner|transparent|1x1|pixel)\.(png|gif|svg|jpe?g|webp)(\?|$)/i.test(lower)) return false;
+    if (/\/(blank|placeholder|loading|lazy|spinner|transparent|1x1|pixel|readerarea)\.(png|gif|svg|jpe?g|webp)(\?|$)/i.test(lower)) return false;
     return true;
   });
 
@@ -1086,6 +1086,30 @@ async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
       console.log(`[Puppeteer] Cloudflare challenge passed or timed out after ${checks}s on ${url}`);
     }
 
+    // Some manga-reader themes (confirmed on go-manga.com/up-manga.com's
+    // shared "mangareader" WordPress theme) render the actual page <img>
+    // tags into #readerarea via client-side JS AFTER domcontentloaded - the
+    // element exists in the server HTML but starts empty, so reading the
+    // DOM immediately (as above) captures it before the real images ever
+    // appear. Worse, the theme's own JS re-renders #readerarea's contents
+    // in what looks like batches/passes - a single "wait for any children"
+    // check can resolve right as a re-render briefly empties or partially
+    // fills it, capturing far fewer real (data-src-bearing) images than the
+    // chapter actually has. Poll instead: keep checking the count of
+    // images with a real data-src until it stops growing across two checks
+    // in a row (settled), not just the first non-empty sighting. No-op
+    // (loop just idles out) on any page without this element at all.
+    const hasReaderArea = await page.$('#readerarea').then(Boolean).catch(() => false);
+    if (hasReaderArea) {
+      let lastCount = -1;
+      for (let i = 0; i < 12; i++) {
+        const count = await page.$$eval('#readerarea img[data-src]', els => els.length).catch(() => 0);
+        if (count > 0 && count === lastCount) break;
+        lastCount = count;
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
     const finalHtml = await readContent();
     // Remember the cookie AND the User-Agent this page was served with, keyed
     // by host, so browser-less fetches (page HTML + image downloads) can replay
@@ -1170,7 +1194,7 @@ async function fetchWithClearanceOrNull(url, timeoutMs) {
   }
 }
 
-async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false) {
+async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false, forceFullRender = false) {
   try {
     if (useStealth) {
       // "solve once, fetch many": try a browser-less fetch with the clearance
@@ -1178,8 +1202,17 @@ async function fetchTextOrNull(url, timeoutMs = 8000, useStealth = false) {
       // go through here and never open Chrome. Only when there's no clearance
       // yet, or it's expired (challenge came back), do we spin up the real
       // browser to (re)solve, which refreshes the cookie/UA for next time.
-      const viaCookie = await fetchWithClearanceOrNull(url, timeoutMs + 5000);
-      if (viaCookie) return viaCookie;
+      //
+      // forceFullRender skips this shortcut entirely - a plain cookie-replay
+      // fetch never executes JS, so a page whose real content is injected
+      // client-side (a chapter reader that populates #readerarea after load,
+      // not a Cloudflare challenge at all - see fetchTextWithPuppeteer) would
+      // otherwise silently come back looking "successful" but empty, forever,
+      // once this host's clearance cookie is cached from any earlier request.
+      if (!forceFullRender) {
+        const viaCookie = await fetchWithClearanceOrNull(url, timeoutMs + 5000);
+        if (viaCookie) return viaCookie;
+      }
       return await fetchTextWithPuppeteer(url, timeoutMs + 5000);
     }
 
@@ -1453,11 +1486,15 @@ async function fetchPageDetailsOnce(pageUrl, useStealth = false) {
     let html;
     let statusCode;
     if (useStealth) {
-        // Cloudflare-fronted page: go through the clearance path (reuse the
-        // cf_clearance cookie if we have one, only open the browser to
-        // (re)solve). This is what a chapter page on dark-manga needs - a plain
-        // fetch here is exactly what returned HTTP 403.
-        html = await fetchTextOrNull(pageUrl, 15000, true);
+        // forceFullRender: true - this is a chapter's own page, whose real
+        // content some reader themes (see fetchTextWithPuppeteer) inject via
+        // client-side JS rather than serving in the initial HTML. A
+        // cookie-replay fetch can't run that JS, so it must always go
+        // through the real browser here, not just when Cloudflare is
+        // involved - a plain fetch (or a JS-blind "clearance" replay) is
+        // exactly what returned HTTP 403 on dark-manga, or a silently empty
+        // reader area on go-manga/up-manga.
+        html = await fetchTextOrNull(pageUrl, 15000, true, true);
         statusCode = html ? 200 : 500;
         if (!html) {
             return { url: pageUrl, status: 'down', statusCode, responseTime: Math.round(performance.now() - startTime), error: 'ไม่สามารถผ่าน Cloudflare ได้', images: [] };
@@ -1528,8 +1565,15 @@ function getExtension(url, contentType) {
 // included, as that type. Alt text isn't hostname-scoped so it's checked as-is.
 const MANGA_TYPE_KEYWORDS = ['chapter', 'backcat', 'manga', 'comic', 'toon'];
 const MANGA_EPISODE_REGEX = /ep[-_]?\d/;
+// A bare substring check for "ad-" (still used further down for '/ads/') is
+// too broad on its own - real manga titles/filenames routinely contain "ad"
+// immediately before a hyphenated word boundary (e.g. "Bad-Born-Blood",
+// "Dead-End", "Load-Out"), which would misclassify every page of those
+// series as an ad. Require "ad"/"ads" to be its own path/word segment
+// (bounded by /, _, ., -, or the string edges) instead of a raw substring.
+const AD_TOKEN_REGEX = /(?:^|[/_.-])ads?(?:[/_.-]|$)/i;
 const AD_TYPE_KEYWORDS = [
-  'ad-', '/ads/', 'banner', 'advertisement', 'promo', 'bonus', 'sponsor',
+  '/ads/', 'banner', 'advertisement', 'promo', 'bonus', 'sponsor',
   'bet', 'ufa', 'casino', 'lsm', 'joker', 'slot', 'huay', 'lotto', 'crypto',
   'sa-game', 'sagame', 'sexy', 'gclub', 'baccarat', 'roulette', 'jackpot',
   'vip', 'deposit', 'withdraw', 'discord', 'facebook', 'fbcdn', 'cdninstagram',
@@ -1550,7 +1594,7 @@ function classifyImageType(url, altText = '') {
   }
   const lower = pathPortion.toLowerCase();
   const combined = `${lower} ${altText}`;
-  if (AD_TYPE_KEYWORDS.some(k => combined.includes(k.toLowerCase()))) return 'ad';
+  if (AD_TOKEN_REGEX.test(combined) || AD_TYPE_KEYWORDS.some(k => combined.includes(k.toLowerCase()))) return 'ad';
   if (MANGA_TYPE_KEYWORDS.some(k => lower.includes(k)) || MANGA_EPISODE_REGEX.test(lower)) return 'manga';
   return 'content';
 }
