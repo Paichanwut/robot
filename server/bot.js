@@ -3213,6 +3213,27 @@ const MAX_CONSECUTIVE_BLOCKED_SERIES = 3;
 const MAX_RECHECK_ROUNDS = 5;
 const RECHECK_COOLDOWN_BASE_MS = 3 * 60 * 1000; // 3, 6, 9, 12, 15 min between rounds
 
+// Temporary throttle: while we focus scraping effort on one source site,
+// this lets discovery (finding NEW series or NEW chapters) be paused for
+// every other site without touching their code paths - see syncAllSeries
+// and resumeRunningCrawls below, the only two callers that check this.
+// Deliberately does NOT stop scraping chapters that are already known/
+// pending for a paused origin - only stops looking for MORE work there.
+// Empty/unset ACTIVE_DISCOVERY_ORIGINS = no restriction (every site's
+// discovery runs, the historical default) - this is opt-in, not a new
+// default that could silently stop discovery if the env var is forgotten
+// somewhere.
+const ACTIVE_DISCOVERY_ORIGINS = (process.env.ACTIVE_DISCOVERY_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+function isDiscoveryActiveForOrigin(origin) {
+  return ACTIVE_DISCOVERY_ORIGINS.length === 0 || ACTIVE_DISCOVERY_ORIGINS.includes(origin);
+}
+
+function originOf(url) {
+  try { return new URL(url).origin; } catch (e) { return null; }
+}
+
 function findCrawl(db, crawlId) {
   return (db.siteCrawls || []).find(c => c.id === crawlId);
 }
@@ -3634,7 +3655,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
 // series already tracked in the DB, then backfills any missing cover art.
 async function syncAllSeries(db) {
   for (const series of db.series || []) {
-    if (series.seriesUrl) {
+    if (series.seriesUrl && isDiscoveryActiveForOrigin(originOf(series.seriesUrl))) {
       try {
         const { addedCount } = await discoverAndAddNewChapters(db, series, series.seriesUrl);
         if (addedCount > 0) console.log(`[sync] "${series.name}": ${addedCount} new chapter(s)`);
@@ -3642,6 +3663,10 @@ async function syncAllSeries(db) {
         console.error(`[sync] discover failed for "${series.name}":`, err.message);
       }
     }
+    // A paused origin (see ACTIVE_DISCOVERY_ORIGINS) still falls through to
+    // backfill/scrape below - only the "look for brand-new chapters" step
+    // above is skipped, not the "finish downloading what we already know
+    // about" work every series gets regardless of origin.
     await backfillMissingChaptersFromSiblings(db, series);
     // Both discoverAndAddNewChapters and the sibling-backfill above only
     // push new chapters onto series.chapters in memory - saveSeries() (not
@@ -3756,7 +3781,18 @@ function logRoundRobinSummary(ids) {
 }
 
 async function resumeRunningCrawls(db) {
-  let activeIds = (db.siteCrawls || []).filter(c => c.status === 'running').map(c => c.id);
+  const pausedIds = [];
+  let activeIds = (db.siteCrawls || [])
+    .filter(c => c.status === 'running')
+    .filter(c => {
+      if (isDiscoveryActiveForOrigin(originOf(c.siteUrl))) return true;
+      pausedIds.push(c.siteUrl);
+      return false;
+    })
+    .map(c => c.id);
+  if (pausedIds.length > 0) {
+    console.log(`[sync] discovery paused for ${pausedIds.length} site crawl(s) (ACTIVE_DISCOVERY_ORIGINS): ${pausedIds.join(', ')}`);
+  }
   if (activeIds.length === 0) return;
 
   console.log(`[sync] resuming ${activeIds.length} site crawl(s) round-robin: ${activeIds.map(id => findCrawl(db, id)?.siteUrl).join(', ')}`);
@@ -3828,6 +3864,119 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
 
   const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
   console.log(`[add] scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+}
+
+// How many of a site's own listing pages (its homepage, then whatever
+// pagination it exposes) to walk when checking for newly-updated/newly-
+// added series - see checkLatestUpdatesForSite below. Deliberately tiny
+// compared to a full whole-site crawl (MAX_LISTING_PAGES=400, meant to
+// discover an entire catalog once): most manga aggregator homepages
+// surface recently-updated series at the front, so a handful of pages is
+// enough to catch what's new without paying for an exhaustive crawl.
+const LATEST_UPDATES_MAX_PAGES = 5;
+// How often to re-run that check per site - see runDueLatestUpdatesChecks.
+const LATEST_UPDATES_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// Which site homepages get the check at all - empty/unset = feature off
+// (opt-in, same posture as ACTIVE_DISCOVERY_ORIGINS above).
+const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Walks up to `maxPages` of a site's listing pages (following whatever
+// pagination discoverSeriesLinksFromHtml/findNextListingPageUrl - the same
+// helpers runSiteCrawl's discovery phase uses - can find from the given
+// starting URL), collects every series link seen, and feeds each one
+// through addSeriesCommand: if we already track it, that's just a normal
+// discover-new-chapters-and-scrape pass; if we don't, it gets created and
+// scraped from scratch. Either way this is exactly "if we have it, update
+// it; if not, add it" with no separate logic needed here.
+async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false } = {}) {
+  console.log(`[latest-updates] checking first ${maxPages} listing page(s) of ${siteUrl}...`);
+
+  let pageUrl = siteUrl;
+  const visited = new Set();
+  const seriesLinks = new Map(); // url -> {url, name}
+
+  for (let page = 1; page <= maxPages && pageUrl && !visited.has(pageUrl); page++) {
+    visited.add(pageUrl);
+    const pageOrigin = originOf(pageUrl);
+    if (!pageOrigin) break;
+
+    let robotsRules = { disallowPaths: [], crawlDelaySeconds: null };
+    const { disallowed, html } = await runExclusiveByOrigin(pageUrl, async () => {
+      const robotsText = await fetchTextOrNull(`${pageOrigin}/robots.txt`, 8000, false);
+      robotsRules = robotsText ? parseRobotsRules(robotsText) : robotsRules;
+      if (isPathDisallowed(pageUrl, robotsRules.disallowPaths)) {
+        return { disallowed: true, html: null };
+      }
+      return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, false) };
+    });
+
+    if (disallowed) {
+      console.warn(`[latest-updates] robots.txt disallows ${pageUrl} - stopping early`);
+      break;
+    }
+    if (!html) {
+      console.warn(`[latest-updates] could not fetch ${pageUrl} - stopping early`);
+      break;
+    }
+
+    for (const link of discoverSeriesLinksFromHtml(html, pageUrl)) {
+      if (!seriesLinks.has(link.url)) seriesLinks.set(link.url, link);
+    }
+
+    const nextPage = findNextListingPageUrl(html, pageUrl);
+    pageUrl = (nextPage && !visited.has(nextPage)) ? nextPage : null;
+    if (pageUrl && page < maxPages) {
+      await sleep(computeNextDelayMs(robotsRules.crawlDelaySeconds));
+    }
+  }
+
+  console.log(`[latest-updates] found ${seriesLinks.size} series link(s) across ${visited.size} page(s) of ${siteUrl}`);
+
+  if (dryRun) {
+    // Preview only - used by the `check-latest-updates --dry-run` CLI
+    // command to see what a real run WOULD do without touching R2/MySQL.
+    const db = readDb();
+    for (const { url, name } of seriesLinks.values()) {
+      const tracked = (db.series || []).find(s => s.seriesUrl === url || (s.sourceUrls || []).includes(url));
+      console.log(`[latest-updates]   ${tracked ? 'ALREADY TRACKED' : 'NEW'} - "${name}" - ${url}`);
+    }
+    console.log(`[latest-updates] dry-run: would process ${seriesLinks.size} series link(s), nothing written`);
+    return;
+  }
+
+  let okCount = 0;
+  for (const { url } of seriesLinks.values()) {
+    try {
+      await addSeriesCommand(url, {});
+      okCount++;
+    } catch (err) {
+      console.error(`[latest-updates] failed for ${url}:`, err.message);
+    }
+  }
+  console.log(`[latest-updates] done with ${siteUrl}: ${okCount}/${seriesLinks.size} series link(s) processed successfully`);
+}
+
+// Runs checkLatestUpdatesForSite for each configured site, but only once
+// per LATEST_UPDATES_INTERVAL_MS - the last-checked timestamp is persisted
+// in the store blob (db.latestUpdatesChecks) the same way db.siteCrawls is,
+// so the cadence holds regardless of how often (or briefly) this process
+// itself gets invoked by cron/docker.
+async function runDueLatestUpdatesChecks(db) {
+  if (LATEST_UPDATES_SITE_URLS.length === 0) return;
+  if (!db.latestUpdatesChecks) db.latestUpdatesChecks = {};
+
+  for (const siteUrl of LATEST_UPDATES_SITE_URLS) {
+    const lastCheckedAt = db.latestUpdatesChecks[siteUrl];
+    const msSinceLastCheck = lastCheckedAt ? Date.now() - new Date(lastCheckedAt).getTime() : Infinity;
+    if (msSinceLastCheck < LATEST_UPDATES_INTERVAL_MS) {
+      console.log(`[latest-updates] ${siteUrl} last checked ${(msSinceLastCheck / 3600000).toFixed(1)}h ago - not due yet`);
+      continue;
+    }
+    await checkLatestUpdatesForSite(siteUrl);
+    db.latestUpdatesChecks[siteUrl] = new Date().toISOString();
+    writeDb(db);
+  }
 }
 
 // Wipes the cross-chapter dedup bookkeeping (seenAssetUrls/Hashes,
@@ -3904,7 +4053,8 @@ function parseArgs(argv) {
   const stealth = rest.includes('--stealth');
   const nameFlag = rest.find(a => a.startsWith('--name='));
   const name = nameFlag ? nameFlag.slice('--name='.length) : undefined;
-  return { cmd, arg, stealth, name };
+  const dryRun = rest.includes('--dry-run');
+  return { cmd, arg, stealth, name, dryRun };
 }
 
 // Every command shares one Chrome profile dir (CHROME_PROFILE_DIR above),
@@ -3976,7 +4126,7 @@ function releaseLock() {
 }
 
 async function main() {
-  const { cmd, arg, stealth, name } = parseArgs(process.argv.slice(2));
+  const { cmd, arg, stealth, name, dryRun } = parseArgs(process.argv.slice(2));
 
   if (cmd === 'add') {
     if (!arg) throw new Error('Usage: node server/bot.js add <seriesUrl> [--name="..."] [--stealth]');
@@ -3989,16 +4139,23 @@ async function main() {
   } else if (cmd === 'reset-dedup') {
     if (!arg) throw new Error('Usage: node server/bot.js reset-dedup <seriesUrl>');
     await resetDedupCommand(arg);
+  } else if (cmd === 'check-latest-updates') {
+    if (!arg) throw new Error('Usage: node server/bot.js check-latest-updates <siteUrl> [--dry-run]');
+    await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
   } else if (!cmd) {
     const db = readDb();
     await resumeRunningCrawls(db);
+    // Runs before the normal per-series sync below, per site, at most once
+    // a day - picks up brand-new series a full sync of already-tracked
+    // series would never find. See runDueLatestUpdatesChecks.
+    await runDueLatestUpdatesChecks(readDb());
     await syncAllSeries(readDb());
     // Cheap catch-up pass every regular run too, not just on-demand - covers
     // chapters that finished downloading while MySQL was briefly unreachable
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl>]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run]]`);
   }
 }
 
