@@ -472,6 +472,10 @@ sqliteDb.exec(`
     contentHash TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_images_chapter ON images(chapterId);
+  -- Used by the low-image-count cross-check below (finds whether a page
+  -- image already exists under a different chapter, system-wide) - without
+  -- this, that lookup would full-scan the whole images table.
+  CREATE INDEX IF NOT EXISTS idx_images_contenthash ON images(contentHash);
 `);
 const selectStoreStmt = sqliteDb.prepare('SELECT data FROM store WHERE id = 1');
 const upsertStoreStmt = sqliteDb.prepare(`
@@ -542,6 +546,13 @@ const insertImageStmt = sqliteDb.prepare(`
   INSERT INTO images (chapterId, orderIndex, filename, relativePath, originalUrl, contentHash)
   VALUES (@chapterId, @orderIndex, @filename, @relativePath, @originalUrl, @contentHash)
 `);
+// Used only by the low-image-count safety net in scrapeChapterCoreAttempt -
+// finds another chapter (any series) that already has this exact image
+// content saved, system-wide (not just within the current series' own
+// in-memory dedup bookkeeping).
+const findOtherChapterWithHashStmt = sqliteDb.prepare(
+  'SELECT chapterId FROM images WHERE contentHash = ? AND chapterId != ? LIMIT 1'
+);
 
 // Dedup-bookkeeping maps the scraper keeps per series (seenAssetUrls,
 // seenAssetHashes, sharedAssetUrls, sharedAssetHashes, assetPHashLog) are
@@ -2007,6 +2018,12 @@ const PHASH_DISTANCE_THRESHOLD = 0.12;
 // (i.e. "seen twice") was too aggressive: a title/credits/afterword page can
 // legitimately repeat once across two chapters without being site furniture.
 const SHARED_ASSET_CHAPTER_THRESHOLD = 3;
+// A chapter finishing with this many pages or fewer gets the extra,
+// system-wide, zero-threshold reused-image check in scrapeChapterCoreAttempt
+// (see LOW_IMAGE_COUNT_SAFETY_THRESHOLD usage there) - below this a false
+// dedup positive costs a large fraction of the whole chapter, so it's worth
+// the (rare, since it only fires on already-small chapters) extra DB lookup.
+const LOW_IMAGE_COUNT_SAFETY_THRESHOLD = 5;
 // Ad/credit/translator-note images are conventionally spliced in at the very
 // start or end of a chapter, never in the middle of the actual page
 // sequence - restricting perceptual hashing to these positions keeps the
@@ -2726,6 +2743,32 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     chapter.error = blockedEarly
       ? 'เว็บเริ่มบล็อก (429/403) ระหว่างโหลดรูป ระบบหยุดให้อัตโนมัติ - โหลดได้บางส่วน'
       : (expectedCount === 0 ? 'ทุกรูปในหน้านี้ถูกกรองว่าเป็นรูปโฆษณา/เครดิตที่ใช้ซ้ำ' : null);
+
+    // Extra scrutiny for a chapter that would otherwise finish 'done' with
+    // very few pages - this is exactly the shape of the "Bad Born Blood"
+    // incident (a site-wide filler image saved as page 1, only caught once
+    // it repeated a 3rd time and tripped the normal per-series dedup
+    // threshold - the first couple of occurrences always slip through that
+    // check by design, see SHARED_ASSET_CHAPTER_THRESHOLD above). A losing
+    // 1-in-1 (or 1-in-3) image to a false dedup positive is a much bigger
+    // relative loss than losing 1-in-50, so a low page count gets a
+    // stricter, immediate, system-wide check instead of waiting for the
+    // normal per-series threshold: does ANY of these images already exist
+    // under a different chapter, anywhere in the whole database, at all
+    // (no threshold)? A genuine short chapter (an epilogue, a bonus page)
+    // has unique art and will never match; reused site furniture almost
+    // always already exists under at least one earlier chapter somewhere.
+    if (chapter.status === 'done' && downloaded.length <= LOW_IMAGE_COUNT_SAFETY_THRESHOLD) {
+      const reusedElsewhere = downloaded.filter(img => findOtherChapterWithHashStmt.get(img.contentHash, chapter.id));
+      if (reusedElsewhere.length > 0) {
+        console.warn(`[scrape] "${chapter.name}": only ${downloaded.length} image(s) total and ${reusedElsewhere.length} of them already exist under a different chapter elsewhere in the database - too suspicious to trust as a real chapter, marking as error instead of done`);
+        await deleteR2Prefix(chapterKeyPrefix);
+        chapter.images = [];
+        chapter.status = 'error';
+        chapter.error = 'รูปในตอนนี้มีน้อยผิดปกติและซ้ำกับตอนอื่นในระบบ - น่าจะเป็นรูปเว็บที่ใช้ซ้ำ ไม่ใช่หน้าการ์ตูนจริง ต้องตรวจสอบ';
+      }
+    }
+
     chapter.scrapedAt = new Date().toISOString();
     console.log(`[scrape] "${chapter.name}" finished: status=${chapter.status}, downloaded=${downloaded.length}/${expectedCount}, excludedAsShared=${excludedAsSharedCount}`);
 
