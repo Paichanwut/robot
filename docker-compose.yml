@@ -17,6 +17,11 @@ services:
     shm_size: '1gb'
     env_file:
       - .env
+    # Caps Node's heap at 1GB - the production host is memory-constrained
+    # and an unbounded heap risks the OOM killer taking out the whole
+    # container mid-scrape instead of Node handling the pressure itself.
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=1024
     volumes:
       - ./server/data:/app/server/data
     # No restart policy on purpose - this is a one-shot CLI (discover+scrape,
