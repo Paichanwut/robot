@@ -4231,11 +4231,17 @@ async function main() {
     await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
   } else if (!cmd) {
     const db = readDb();
-    await resumeRunningCrawls(db);
-    // Runs before the normal per-series sync below, per site, at most once
-    // a day - picks up brand-new series a full sync of already-tracked
-    // series would never find. See runDueLatestUpdatesChecks.
-    await runDueLatestUpdatesChecks(readDb());
+    // Runs FIRST, before resumeRunningCrawls below - a whole-site crawl can
+    // take a very long time to work through its backlog (hundreds of
+    // series), and resumeRunningCrawls doesn't return until every active
+    // crawl finishes or errors. If the daily update-check ran after it, a
+    // slow crawl would starve it indefinitely - it might never get a turn.
+    // The whole point of this check is to be the cheap, always-happens
+    // thing that keeps already-known/front-page series current every day;
+    // the exhaustive whole-site crawl is lower priority and can keep
+    // grinding through its backlog afterward. See runDueLatestUpdatesChecks.
+    await runDueLatestUpdatesChecks(db);
+    await resumeRunningCrawls(readDb());
     await syncAllSeries(readDb());
     // Cheap catch-up pass every regular run too, not just on-demand - covers
     // chapters that finished downloading while MySQL was briefly unreachable
