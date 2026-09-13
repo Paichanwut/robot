@@ -1059,8 +1059,12 @@ function shutdownBrowser() {
   try { if (browserInstance) browserInstance.close(); } catch (e) { /* ignore */ }
   killStaleProfileChrome();
 }
-process.on('SIGINT', () => { shutdownBrowser(); process.exit(); });
-process.on('SIGTERM', () => { shutdownBrowser(); process.exit(); });
+// Without releaseLock() here, a `docker stop` (SIGTERM) always leaves a
+// stale lock file behind - the next run then has to sit through the full
+// LOCK_STALE_MS wait (or someone has to delete it by hand) before it's
+// allowed to steal it, even though the previous holder is provably gone.
+process.on('SIGINT', () => { shutdownBrowser(); releaseLock(); process.exit(); });
+process.on('SIGTERM', () => { shutdownBrowser(); releaseLock(); process.exit(); });
 
 async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
   let page = null;
