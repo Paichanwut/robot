@@ -1653,19 +1653,27 @@ function findChapter(series, chapterId) {
   return (series.chapters || []).find(c => c.id === chapterId);
 }
 
-// Decodes the handful of HTML entities that actually show up in scraped text
-// nodes (titles, table cells, meta descriptions) - not a general-purpose
-// entity decoder, just enough for what these manga sites emit.
+// Decodes HTML entities that show up in scraped text nodes (titles, table
+// cells, meta descriptions). Handles the common named entities directly,
+// PLUS every numeric (&#8217;) and hex (&#x2019;) entity generically - a
+// WordPress title's smart quotes/dashes (&#8216; &#8217; &#8220; &#8221;
+// &#8211; &#8212; ...) come through as numeric entities, and a fixed list
+// of named-only replacements (the previous version of this function) left
+// those completely undecoded in the stored title. &amp; is decoded LAST -
+// decoding it first would turn a deliberately double-escaped literal (a
+// source using `&amp;lt;` to display the literal text "&lt;") into `<`
+// instead of leaving the intended literal text alone.
 function decodeHtmlEntities(str) {
   if (!str) return str;
   return str
     .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
-    .replace(/&#0?39;/gi, "'")
     .replace(/&apos;/gi, "'")
     .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>');
+    .replace(/&gt;/gi, '>')
+    .replace(/&#x([0-9a-f]+);/gi, (m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (m, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/gi, '&');
 }
 
 function stripTags(html) {
@@ -2850,7 +2858,11 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
     const linkPath = absoluteUrl.pathname.replace(/\/+$/, '');
     if (linkPath === seriesPath) continue; // link back to the listing page itself
 
-    const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
+    // stripTags both removes nested tags (badges, chapter-number spans that
+    // share this grid tile) AND runs the full entity decoder - the old
+    // hand-rolled version here only handled &nbsp;/&amp;, so a title with a
+    // curly quote (&#8217; etc.) or &quot;/&lt;/&gt; came through raw.
+    const text = stripTags(match[2]);
     let decodedLinkPath = linkPath;
     try { decodedLinkPath = decodeURIComponent(linkPath); } catch(e) {}
 
@@ -2988,7 +3000,11 @@ function discoverSeriesLinksFromHtml(html, pageUrl) {
     if (segments.length === 1 && CATALOG_ROOT_WORDS_REGEX.test(segments[0])) continue;
     if (/^\d+$/.test(segments[segments.length - 1])) continue; // page/2, ?p=3 style pure-numeric segments
 
-    const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim();
+    // stripTags both removes nested tags (badges, chapter-number spans that
+    // share this grid tile) AND runs the full entity decoder - the old
+    // hand-rolled version here only handled &nbsp;/&amp;, so a title with a
+    // curly quote (&#8217; etc.) or &quot;/&lt;/&gt; came through raw.
+    const text = stripTags(match[2]);
     if (text.length < 2) continue; // icon-only links (social buttons, etc.)
     if (NON_SERIES_NAME_REGEX.test(text)) continue;
     if (CHAPTER_LIKE_PATH_REGEX.test(text) || CHAPTER_LIKE_PATH_REGEX.test(absoluteUrl.pathname)) continue;
@@ -3162,14 +3178,30 @@ async function backfillCoverImages(db) {
   let skipped = 0;
 
   for (const series of db.series || []) {
-    if (!series.metadata && series.seriesUrl) {
+    // Retry metadata fetch whenever there's no cover URL yet, not just when
+    // metadata itself is null - a series graduated from the whole-site
+    // crawl or the 5-page daily check only ever gets ONE metadata-fetch
+    // attempt at creation time (see runSiteCrawl/addSeriesCommand's
+    // `if (!series.metadata)` gate), so a single blocked/failed fetch, or
+    // a page whose cover markup this extractor missed, left it permanently
+    // uncovered - this backfill (runs every sync pass) is the only thing
+    // that ever gets a second attempt.
+    if (series.seriesUrl && !series.metadata?.coverImageUrl) {
       try {
         const { disallowed, html } = await fetchSeriesPageRespectingRobots(series.seriesUrl, series.useStealth);
         if (!disallowed && html) {
-          series.metadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
-          series.metadataFetchedAt = new Date().toISOString();
-          const dynamicViews = await fetchDynamicViewCount(series.seriesUrl, html);
-          if (dynamicViews) series.metadata.views = dynamicViews;
+          const freshMetadata = extractSeriesMetadataFromHtml(html, series.seriesUrl);
+          if (!series.metadata) {
+            series.metadata = freshMetadata;
+            series.metadataFetchedAt = new Date().toISOString();
+            const dynamicViews = await fetchDynamicViewCount(series.seriesUrl, html);
+            if (dynamicViews) series.metadata.views = dynamicViews;
+          } else if (freshMetadata.coverImageUrl) {
+            // Metadata already exists (title/description were fine) - only
+            // fill in the cover URL that was missing, don't clobber
+            // everything else with a full re-extraction.
+            series.metadata.coverImageUrl = freshMetadata.coverImageUrl;
+          }
         }
       } catch (err) {
         console.error(`Cover backfill: failed to fetch metadata for series ${series.id}:`, err.message);
@@ -4037,9 +4069,18 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
   }
 
   let okCount = 0;
-  for (const { url } of seriesLinks.values()) {
+  for (const { url, name } of seriesLinks.values()) {
     try {
-      await addSeriesCommand(url, {});
+      // Pass the title actually seen on the listing tile through as the
+      // fallback name (addSeriesCommand only uses it if this isn't already
+      // a tracked series, or as the name to create a new one with) -
+      // normalizeForComparison strips non-ASCII/punctuation, so a Thai
+      // subtitle baked into the tile text ("Lookism ลุกคิซึม") still
+      // matches an existing plain "Lookism" row. Previously this was
+      // dropped entirely, leaving addSeriesCommand to fall back to a raw
+      // URL-slug name that never gets replaced if the one metadata-fetch
+      // attempt on creation fails (see backfillCoverImages above).
+      await addSeriesCommand(url, { name });
       okCount++;
     } catch (err) {
       console.error(`[latest-updates] failed for ${url}:`, err.message);
