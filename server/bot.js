@@ -3998,7 +3998,7 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
 // enough to catch what's new without paying for an exhaustive crawl.
 const LATEST_UPDATES_MAX_PAGES = 5;
 // How often to re-run that check per site - see runDueLatestUpdatesChecks.
-const LATEST_UPDATES_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const LATEST_UPDATES_INTERVAL_MS = 12 * 60 * 60 * 1000;
 // Which site homepages get the check at all - empty/unset = feature off
 // (opt-in, same posture as ACTIVE_DISCOVERY_ORIGINS above).
 const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
