@@ -3850,16 +3850,12 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
 // ---------------------------------------------------------------------------
 
 // Discovers new chapters and downloads everything not yet 'done' for every
-// series already tracked in the DB. Backfills missing cover art FIRST, not
-// after - a cover is one page fetch + one image download per series, while
-// the per-series loop below can spend hours working through a large chapter
-// backlog (a single series can have 70+ new chapters); a cover stuck behind
-// that queue would stay missing on the live site for just as long even
-// though fixing it is nearly free by comparison.
+// series already tracked in the DB. Cover backfill used to run here too,
+// but even this can run for a long time (a single series can have 70+ new
+// chapters) - it's now called once, earlier, at the very top of main()'s
+// no-arg path instead, so a missing cover never waits behind ANY backlog,
+// including one discovered by the "cheap" 5-page check itself (see there).
 async function syncAllSeries(db) {
-  const coverResult = await backfillCoverImages(db);
-  if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
-
   for (const series of db.series || []) {
     if (series.seriesUrl && isDiscoveryActiveForOrigin(originOf(series.seriesUrl))) {
       try {
@@ -4363,7 +4359,16 @@ async function main() {
     console.log(`[remove-series] stopped tracking "${arg}" - its chapters/images are gone from the bot's own DB (the live website row is untouched; delete that separately if needed)`);
   } else if (!cmd) {
     const db = readDb();
-    // Runs FIRST, before resumeRunningCrawls below - a whole-site crawl can
+    // Runs before EVERYTHING else, including the "cheap" 5-page check right
+    // below - that check calls addSeriesCommand per series it finds, which
+    // fully scrapes that series' entire backlog before returning (in
+    // practice not cheap at all whenever a front-page series turns out to
+    // have a large backlog). A missing cover costs one page fetch + one
+    // image download; nothing else this run might do should be able to
+    // delay that.
+    const coverResult = await backfillCoverImages(db);
+    if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
+    // Runs next, before resumeRunningCrawls below - a whole-site crawl can
     // take a very long time to work through its backlog (hundreds of
     // series), and resumeRunningCrawls doesn't return until every active
     // crawl finishes or errors. If the daily update-check ran after it, a
