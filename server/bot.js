@@ -3850,8 +3850,16 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
 // ---------------------------------------------------------------------------
 
 // Discovers new chapters and downloads everything not yet 'done' for every
-// series already tracked in the DB, then backfills any missing cover art.
+// series already tracked in the DB. Backfills missing cover art FIRST, not
+// after - a cover is one page fetch + one image download per series, while
+// the per-series loop below can spend hours working through a large chapter
+// backlog (a single series can have 70+ new chapters); a cover stuck behind
+// that queue would stay missing on the live site for just as long even
+// though fixing it is nearly free by comparison.
 async function syncAllSeries(db) {
+  const coverResult = await backfillCoverImages(db);
+  if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
+
   for (const series of db.series || []) {
     if (series.seriesUrl && isDiscoveryActiveForOrigin(originOf(series.seriesUrl))) {
       try {
@@ -3893,9 +3901,6 @@ async function syncAllSeries(db) {
     const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
     if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
   }
-
-  const coverResult = await backfillCoverImages(db);
-  if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
 }
 
 // Catches up any chapter that finished downloading (status 'done', so R2
