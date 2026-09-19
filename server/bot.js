@@ -4368,6 +4368,13 @@ async function main() {
     // delay that.
     const coverResult = await backfillCoverImages(db);
     if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
+    // Same reasoning as the cover backfill just above, run right alongside
+    // it: this only pushes chapters that already finished downloading in a
+    // previous run (images already sit in R2, so it's 1-2 MySQL queries per
+    // series, no scraping) - a reader shouldn't have to wait behind a fresh
+    // multi-hundred-chapter backlog to see content the bot already has.
+    const repairedNowCount = await repairMysqlSync(readDb());
+    if (repairedNowCount > 0) console.log(`[sync] re-synced ${repairedNowCount} already-downloaded chapter(s) that were missing from the live site`);
     // Runs next, before resumeRunningCrawls below - a whole-site crawl can
     // take a very long time to work through its backlog (hundreds of
     // series), and resumeRunningCrawls doesn't return until every active
