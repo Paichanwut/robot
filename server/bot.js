@@ -308,7 +308,17 @@ async function syncSeriesToWebsiteDb(conn, series) {
     ]
   );
 
-  const [[row]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
+  // Looked up by source_series_id, not the slug just computed above - slug
+  // is deliberately left out of the UPDATE clause (URLs shouldn't churn), so
+  // once a title correction (e.g. a decode fix) changes what slugify(title)
+  // produces, that freshly-computed slug no longer matches the row's actual
+  // (unchanged) stored slug and a slug-based lookup here would find nothing.
+  // source_series_id, by contrast, IS set unconditionally in both the INSERT
+  // and the UPDATE clause above to this exact series' id, so it always
+  // identifies the row this call just touched - including the merge case
+  // from the comment above, where the row's source_series_id ends up as
+  // whichever series last synced into it.
+  const [[row]] = await conn.execute('SELECT id FROM series WHERE source_series_id = ?', [series.id]);
   const seriesRowId = row.id;
 
   // Each entry is { name, slug, enName } from extractGenreLinks - name is
