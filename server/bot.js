@@ -3216,13 +3216,78 @@ async function backfillCoverImages(db) {
 
     const hadPath = series.metadata.coverImagePath;
     await downloadCoverImageIfMissing(series);
-    if (!hadPath && series.metadata.coverImagePath) downloaded++;
+    if (!hadPath && series.metadata.coverImagePath) {
+      downloaded++;
+      // syncSeriesToWebsiteDb only otherwise runs as a side effect of a
+      // chapter finishing (syncChapterToWebsiteDbSafe) - an already-fully-
+      // synced series with no new chapter has nothing left to trigger that,
+      // so a cover backfilled here would sit in R2/SQLite forever without
+      // this, never reaching the live site's cover_image_key column.
+      try {
+        await withMysqlRetry(conn => syncSeriesToWebsiteDb(conn, series));
+      } catch (err) {
+        console.error(`Cover backfill: failed to push new cover to MySQL for series ${series.id}:`, err.message);
+      }
+    }
     saveSeriesMetadata(series);
   }
 
   return { checked: (db.series || []).length, downloaded, skipped };
 }
 
+// One-time repair for series saved before decodeHtmlEntities understood
+// numeric entities (&#8217; etc.) - those titles are stuck with the literal
+// escape sequence forever otherwise, since metadata is only ever re-fetched
+// here when a cover is missing (see backfillCoverImages), not when the
+// title itself is stale. Re-decodes what's already cached in SQLite and, if
+// anything changed, pushes the corrected row straight to MySQL (still
+// subject to syncSeriesToWebsiteDb's own is_edited guard, so an admin's
+// manual edit is never overwritten).
+async function repairEntityTitlesCommand() {
+  const db = readDb();
+  let fixedCount = 0;
+
+  for (const series of db.series || []) {
+    let changed = false;
+
+    const decodedName = decodeHtmlEntities(series.name);
+    if (decodedName !== series.name) { series.name = decodedName; changed = true; }
+
+    const m = series.metadata;
+    if (m) {
+      if (m.title) {
+        const d = decodeHtmlEntities(m.title);
+        if (d !== m.title) { m.title = d; changed = true; }
+      }
+      if (m.synopsis) {
+        const d = decodeHtmlEntities(m.synopsis);
+        if (d !== m.synopsis) { m.synopsis = d; changed = true; }
+      }
+      if (m.author) {
+        const d = decodeHtmlEntities(m.author);
+        if (d !== m.author) { m.author = d; changed = true; }
+      }
+      if (Array.isArray(m.altTitles)) {
+        const decodedAlts = m.altTitles.map(t => typeof t === 'string' ? decodeHtmlEntities(t) : t);
+        if (decodedAlts.some((t, i) => t !== m.altTitles[i])) { m.altTitles = decodedAlts; changed = true; }
+      }
+    }
+
+    if (!changed) continue;
+
+    saveSeriesMetadata(series);
+    try {
+      await withMysqlRetry(conn => syncSeriesToWebsiteDb(conn, series));
+      fixedCount++;
+      console.log(`[repair-entities] fixed "${series.name}"`);
+    } catch (err) {
+      console.error(`[repair-entities] fixed locally but failed to push "${series.name}" to MySQL:`, err.message);
+    }
+  }
+
+  console.log(`[repair-entities] done - ${fixedCount} series fixed`);
+  return fixedCount;
+}
 
 // Scrape every not-yet-downloaded chapter in a series, one after another,
 // with the same jittered delay between chapters as between images within a
@@ -4274,6 +4339,8 @@ async function main() {
   } else if (cmd === 'check-latest-updates') {
     if (!arg) throw new Error('Usage: node server/bot.js check-latest-updates <siteUrl> [--dry-run]');
     await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
+  } else if (cmd === 'repair-entities') {
+    await repairEntityTitlesCommand();
   } else if (!cmd) {
     const db = readDb();
     // Runs FIRST, before resumeRunningCrawls below - a whole-site crawl can
@@ -4293,7 +4360,7 @@ async function main() {
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run]]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities]`);
   }
 }
 
