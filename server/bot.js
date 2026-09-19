@@ -4351,6 +4351,11 @@ async function main() {
     await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
   } else if (cmd === 'repair-entities') {
     await repairEntityTitlesCommand();
+  } else if (cmd === 'remove-series') {
+    if (!arg) throw new Error('Usage: node server/bot.js remove-series <seriesId>');
+    if (!readDb().series.some(s => s.id === arg)) throw new Error(`No tracked series with id "${arg}"`);
+    deleteSeriesRow(arg);
+    console.log(`[remove-series] stopped tracking "${arg}" - its chapters/images are gone from the bot's own DB (the live website row is untouched; delete that separately if needed)`);
   } else if (!cmd) {
     const db = readDb();
     // Runs FIRST, before resumeRunningCrawls below - a whole-site crawl can
@@ -4370,7 +4375,7 @@ async function main() {
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities | remove-series <seriesId>]`);
   }
 }
 
