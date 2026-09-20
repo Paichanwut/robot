@@ -2006,8 +2006,23 @@ async function downloadCoverImageIfMissing(series) {
 // whitespace to underscores rather than leaving raw spaces in the key
 // (spaces in an R2 key mean every URL needs %20-encoding to round-trip
 // correctly, which is easy to get wrong further down the pipeline).
+//
+// Also drops every non-ASCII character (Thai, CJK, ...) - discovered
+// 2026-09-20 that apibo.solo-manga.com (the back office's own API, a
+// separate service we don't control) silently fails to return a chapter's
+// pages whenever its image_key contains non-ASCII characters (confirmed:
+// R2 has the file, MySQL has the row, only apibo's response breaks - e.g.
+// chapter 8726 "Lookism_ลูกคิซึม_..." never responds, while an all-ASCII
+// chapter on the same endpoint works fine). R2/MySQL/solo/api all handle
+// UTF-8 keys correctly, so this is purely a workaround for that other
+// service's bug, not a storage requirement - keeps titleForFile ASCII-only
+// so newly scraped chapters never hit it. Falls back to the caller's id
+// (same as slugify's fallback) if the title is ASCII-empty (e.g. an
+// all-Thai title), so two different all-Thai titles never collide on the
+// same R2 prefix.
 function sanitizeForFilename(name, fallback) {
   const cleaned = (name || '')
+    .replace(/[^\x00-\x7F]/g, '')
     .replace(/[\/\\:*?"<>|]/g, '-')
     .replace(/\s+/g, '_')
     .trim()
