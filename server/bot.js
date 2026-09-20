@@ -3900,13 +3900,19 @@ async function syncAllSeries(db) {
 }
 
 // Catches up any chapter that finished downloading (status 'done', so R2
-// already has its pages) but never made it into MySQL - e.g. the sync in
-// scrapeChapterCore ran while the website DB was briefly unreachable (VPN,
-// network blip, ...). syncChapterToWebsiteDbSafe() only runs once, right
-// when a chapter finishes, and nothing revisits a 'done' chapter afterward
-// - without this pass, a chapter that failed to sync that one time would
-// stay missing from the website forever even though its images are safely
-// in R2. Cheap to run every cycle: 1-2 queries per series, not per chapter.
+// already has its pages) but never made it into MySQL, or made it in only
+// partially - e.g. the sync in scrapeChapterCore ran while the website DB
+// was briefly unreachable (VPN, network blip, ...), or the `chapters` row
+// upsert succeeded but the subsequent `chapter_pages` insert kept failing
+// on every retry (leaving a chapter row with zero pages behind - the
+// website shows the chapter but "fails to load page images" since R2 has
+// the files but MySQL never got the rows pointing at them).
+// syncChapterToWebsiteDbSafe() only runs once, right when a chapter
+// finishes, and nothing revisits a 'done' chapter afterward - without this
+// pass, a chapter that failed to sync (fully or partially) that one time
+// would stay broken on the website forever even though its images are
+// safely in R2. Cheap to run every cycle: 1-2 queries per series, not per
+// chapter.
 async function repairMysqlSync(db) {
   let repairedCount = 0;
   for (const series of db.series || []) {
@@ -3916,16 +3922,22 @@ async function repairMysqlSync(db) {
     const title = series.metadata?.title || series.name;
     const slug = slugify(title, series.id);
 
-    let existingNumbers;
+    let pageCountsByNumber;
     try {
-      existingNumbers = await withMysqlRetry(async (conn) => {
+      pageCountsByNumber = await withMysqlRetry(async (conn) => {
         const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
-        const numbers = new Set();
+        const counts = new Map();
         if (seriesRow) {
-          const [rows] = await conn.execute('SELECT number FROM chapters WHERE series_id = ?', [seriesRow.id]);
-          rows.forEach(r => numbers.add(Number(r.number)));
+          const [rows] = await conn.execute(
+            `SELECT c.number AS number, COUNT(cp.id) AS pageCount
+             FROM chapters c LEFT JOIN chapter_pages cp ON cp.chapter_id = c.id
+             WHERE c.series_id = ?
+             GROUP BY c.id, c.number`,
+            [seriesRow.id]
+          );
+          rows.forEach(r => counts.set(Number(r.number), Number(r.pageCount)));
         }
-        return numbers;
+        return counts;
       });
     } catch (err) {
       // MySQL still unreachable (e.g. VPN blocking it) - skip this series
@@ -3936,13 +3948,17 @@ async function repairMysqlSync(db) {
 
     for (const chapter of doneChapters) {
       const num = extractLeadingNumber(chapter.name);
-      if (num === null || existingNumbers.has(num)) continue;
-      console.log(`[repair-sync] "${series.name}" ep${num}: missing in MySQL, re-syncing`);
+      if (num === null) continue;
+      const expectedPages = (chapter.images || []).length;
+      const existingPages = pageCountsByNumber.get(num);
+      if (existingPages !== undefined && (existingPages > 0 || expectedPages === 0)) continue;
+      const reason = existingPages === undefined ? 'missing in MySQL' : 'chapter row exists but has 0 pages';
+      console.log(`[repair-sync] "${series.name}" ep${num}: ${reason}, re-syncing`);
       await syncChapterToWebsiteDbSafe(series, chapter);
       repairedCount++;
     }
   }
-  if (repairedCount > 0) console.log(`[repair-sync] re-synced ${repairedCount} chapter(s) that were missing from MySQL`);
+  if (repairedCount > 0) console.log(`[repair-sync] re-synced ${repairedCount} chapter(s) that were missing or incomplete in MySQL`);
   return repairedCount;
 }
 
@@ -4072,7 +4088,12 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
 // discover an entire catalog once): most manga aggregator homepages
 // surface recently-updated series at the front, so a handful of pages is
 // enough to catch what's new without paying for an exhaustive crawl.
-const LATEST_UPDATES_MAX_PAGES = 5;
+// Lowered from 5 to 2 (2026-09-20): a front-page series with a large
+// backlog makes addSeriesCommand fully scrape it before this check can
+// return (see repairMysqlSync/cover-backfill ordering notes above), so 5
+// pages was making this "quick" check too slow to keep up with how often
+// it's meant to run.
+const LATEST_UPDATES_MAX_PAGES = 2;
 // How often to re-run that check per site - see runDueLatestUpdatesChecks.
 const LATEST_UPDATES_INTERVAL_MS = 12 * 60 * 60 * 1000;
 // Which site homepages get the check at all - empty/unset = feature off
