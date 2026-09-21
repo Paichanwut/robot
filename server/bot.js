@@ -176,6 +176,23 @@ function normalizeSeriesStatus(rawStatus) {
   return 'ongoing';
 }
 
+// Canonicalizes a scraped story-format label ("Manhwa"/"Manhua"/"Manga"/
+// "Novel") to consistent Title Case - different source sites render this
+// badge's text with different CSS/casing conventions (e.g. some literally
+// write "MANHWA" in the markup, others "Manhwa"), so series.type ended up
+// inconsistently cased depending on which site a series was scraped from.
+// Harmless for the is_published/type lookups in solo/api (MySQL's ci
+// collation matches regardless of case) but confusing in the back office
+// dropdown and inconsistent in the public API's story_type field. Unknown
+// values are left as-is (trimmed) rather than dropped, in case a source
+// site uses a real category this list hasn't seen yet.
+const STORY_TYPE_CANONICAL = { manhwa: 'Manhwa', manhua: 'Manhua', manga: 'Manga', novel: 'Novel' };
+function normalizeStoryType(rawType) {
+  const trimmed = (rawType || '').trim();
+  if (!trimmed) return null;
+  return STORY_TYPE_CANONICAL[trimmed.toLowerCase()] || trimmed;
+}
+
 // Parses a human-formatted view count ("3.5M", "49,226", "12.3K") into a
 // real integer for storage - source sites show this either as plain digits
 // or abbreviated with a K/M/B suffix, and naively stripping non-digits
@@ -301,7 +318,7 @@ async function syncSeriesToWebsiteDb(conn, series) {
       meta.synopsis || null,
       meta.author || meta.artist || null,
       normalizeSeriesStatus(meta.status),
-      meta.type || null,
+      normalizeStoryType(meta.type),
       typeof meta.rating === 'number' ? meta.rating : (parseFloat(meta.rating) || null),
       meta.coverImagePath || null,
       parseHumanNumber(meta.views)
@@ -1885,7 +1902,7 @@ function extractSeriesMetadataFromHtml(html, pageUrl) {
   }
   if (!meta.type) {
     const m = /<span[^>]*class=["'][^"']*sh-badge-type[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
-    if (m) meta.type = stripTags(m[1]);
+    if (m) meta.type = normalizeStoryType(stripTags(m[1]));
   }
   if (!meta.status) {
     const m = /<span[^>]*class=["'][^"']*sh-badge-status[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
