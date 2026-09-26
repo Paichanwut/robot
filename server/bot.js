@@ -3990,13 +3990,18 @@ async function repairMysqlSync(db) {
     const doneChapters = (series.chapters || []).filter(c => c.status === 'done');
     if (doneChapters.length === 0) continue;
 
-    const title = series.metadata?.title || series.name;
-    const slug = slugify(title, series.id);
-
     let pageCountsByNumber;
     try {
       pageCountsByNumber = await withMysqlRetry(async (conn) => {
-        const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slug]);
+        // By source_series_id, not a freshly-recomputed slug - the same fix
+        // syncSeriesToWebsiteDb got on 2026-09-19 (see the comment there):
+        // a title correction after the row was created leaves the row's
+        // actual (unchanged, by design) slug mismatched against slugify()
+        // of the current title, so a slug-based lookup here would find
+        // nothing and misreport every one of this series' chapters as
+        // "missing" even though they're all fine - seen live 2026-09-26,
+        // re-"repairing" 242 already-correct chapters every single run.
+        const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE source_series_id = ?', [series.id]);
         const counts = new Map();
         if (seriesRow) {
           const [rows] = await conn.execute(
