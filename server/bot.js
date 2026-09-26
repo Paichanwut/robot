@@ -4161,10 +4161,11 @@ async function addSeriesCommand(url, { name, stealth, scrape = true } = {}) {
   saveSeries(series);
   console.log(`[add] discovered ${result.discoveredCount} chapter(s), ${result.addedCount} new`);
 
-  if (!scrape) return;
+  if (!scrape) return series;
 
   const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
   console.log(`[add] scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+  return series;
 }
 
 // How many of a site's own listing pages (its homepage, then whatever
@@ -4192,9 +4193,18 @@ const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
 // helpers runSiteCrawl's discovery phase uses - can find from the given
 // starting URL), collects every series link seen, and feeds each one
 // through addSeriesCommand: if we already track it, that's just a normal
-// discover-new-chapters-and-scrape pass; if we don't, it gets created and
-// scraped from scratch. Either way this is exactly "if we have it, update
-// it; if not, add it" with no separate logic needed here.
+// discover-new-chapters pass; if we don't, it gets created. Either way this
+// is exactly "if we have it, update it; if not, add it" with no separate
+// logic needed here.
+//
+// This whole check is the bot's top scheduling priority (2026-09-26): every
+// series found on these front pages is downloaded to FULL completion -
+// round-robined fairly against just each other so one huge backlog among
+// them doesn't starve the rest of THIS batch - before this function
+// returns and main() moves on to anything lower-priority (already-tracked
+// series that didn't happen to be on these pages this cycle, then
+// whole-site discovery). A reader following the source site's front page
+// should see a fully caught-up series here, not just its first chapter.
 async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false } = {}) {
   console.log(`[latest-updates] checking first ${maxPages} listing page(s) of ${siteUrl}...`);
 
@@ -4252,6 +4262,7 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
   }
 
   let okCount = 0;
+  const found = [];
   for (const { url, name } of seriesLinks.values()) {
     try {
       // Pass the title actually seen on the listing tile through as the
@@ -4264,19 +4275,41 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       // URL-slug name that never gets replaced if the one metadata-fetch
       // attempt on creation fails (see backfillCoverImages above).
       //
-      // scrape: false - this check's whole point is to stay fast regardless
-      // of any single series' backlog size, so it only registers the
-      // series and discovers chapter links here; syncAllSeries (which
-      // main() always runs right after this) does the actual downloading,
-      // round-robined fairly across every tracked series instead of
-      // draining whichever one happened to be on the front page first.
-      await addSeriesCommand(url, { name, scrape: false });
+      // scrape: false here too - registers the series and discovers
+      // chapter links only. The actual downloading for everything found on
+      // these front pages happens below, as its own round-robin pass
+      // (fair across just THIS batch, same reasoning as
+      // SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) so one huge backlog among
+      // them can't starve the others found on the same pages - but unlike
+      // syncAllSeries's pass, this one always finishes every series found
+      // here before checkLatestUpdatesForSite returns, so a reader
+      // following what's on the source site's front page actually gets a
+      // fully caught-up series, not just its first chapter, before the bot
+      // moves on to lower-priority work (older already-tracked series,
+      // whole-site discovery).
+      const series = await addSeriesCommand(url, { name, scrape: false });
+      if (series) found.push(series);
       okCount++;
     } catch (err) {
       console.error(`[latest-updates] failed for ${url}:`, err.message);
     }
   }
   console.log(`[latest-updates] done with ${siteUrl}: ${okCount}/${seriesLinks.size} series link(s) processed successfully`);
+
+  const db = readDb();
+  let active = found;
+  while (active.length > 0) {
+    const next = [];
+    for (const series of active) {
+      const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
+      if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+      const stillEligible = (series.chapters || []).some(
+        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+      );
+      if (stillEligible && !blockedEarly) next.push(series);
+    }
+    active = next;
+  }
 }
 
 // Runs checkLatestUpdatesForSite for each configured site, but only once
@@ -4485,10 +4518,11 @@ async function main() {
     // multi-hundred-chapter backlog to see content the bot already has.
     const repairedNowCount = await repairMysqlSync(readDb());
     if (repairedNowCount > 0) console.log(`[sync] re-synced ${repairedNowCount} already-downloaded chapter(s) that were missing from the live site`);
-    // Runs next, before resumeRunningCrawls below. checkLatestUpdatesForSite
-    // (inside runDueLatestUpdatesChecks) now only discovers chapter links
-    // for whatever it finds on the front pages (scrape: false - see there),
-    // so it stays quick regardless of any single series' backlog size.
+    // Runs next, before everything below - this is the bot's top priority
+    // (see checkLatestUpdatesForSite's doc comment): every series found on
+    // the source site's front pages gets downloaded to full completion
+    // here, round-robined fairly against just each other, before anything
+    // lower-priority gets a turn.
     await runDueLatestUpdatesChecks(db);
     // Runs before resumeRunningCrawls (whole-site discovery of BRAND NEW
     // series, lowest priority - see its own round-robin/while loop, which
