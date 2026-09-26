@@ -3345,7 +3345,16 @@ async function repairEntityTitlesCommand() {
 // across up to MAX_CHAPTER_RETRIES rounds (a longer, gentler gap between
 // rounds). Shared by /scrape-all and /retry-problem-chapters. Assumes the
 // caller holds the scrapingSeries[id] lock. Returns { scrapedCount, blockedEarly }.
-async function runScrapeAllForSeries(db, series) {
+// maxChaptersThisTurn lets a caller round-robin scraping work across many
+// series (see syncAllSeries) instead of draining one series' entire backlog
+// before ever touching the next - a single series with a huge backlog (a
+// long-completed title being onboarded, or one that slipped behind) would
+// otherwise starve every other tracked series' freshness for as long as it
+// takes to finish (could be days - this is exactly what happened 2026-09-26,
+// see the fix alongside this one for checkLatestUpdatesForSite). A chapter
+// already in flight when the cap is hit is finished before returning -
+// stopping is checked between chapters, not mid-scrape.
+async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinity } = {}) {
   const findEligible = () => (series.chapters || []).filter(
     c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
   );
@@ -3355,6 +3364,7 @@ async function runScrapeAllForSeries(db, series) {
   let lastRetryAfterMs = null;
 
   for (let round = 0; round < MAX_CHAPTER_RETRIES; round++) {
+    if (scrapedCount >= maxChaptersThisTurn) break;
     const chaptersToScrape = findEligible();
     if (chaptersToScrape.length === 0) break;
 
@@ -3371,6 +3381,7 @@ async function runScrapeAllForSeries(db, series) {
 
     let blockedThisRound = false;
     for (let i = 0; i < chaptersToScrape.length; i++) {
+      if (scrapedCount >= maxChaptersThisTurn) break;
       if (i > 0) {
         await sleep(computeNextDelayMs(null));
       }
@@ -3881,13 +3892,21 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
 // cron) to pick up new chapters/series later.
 // ---------------------------------------------------------------------------
 
+// One round-robin unit for syncAllSeries's scrape phase below - deliberately
+// tiny (a single chapter) so a series with a huge backlog (a long-completed
+// title being onboarded, or one that slipped behind) only ever holds up
+// every other tracked series' freshness by about one chapter's worth of
+// time, not its entire backlog - see runScrapeAllForSeries's doc comment.
+const SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND = 1;
+
 // Discovers new chapters and downloads everything not yet 'done' for every
 // series already tracked in the DB. Cover backfill used to run here too,
 // but even this can run for a long time (a single series can have 70+ new
 // chapters) - it's now called once, earlier, at the very top of main()'s
 // no-arg path instead, so a missing cover never waits behind ANY backlog,
-// including one discovered by the "cheap" 5-page check itself (see there).
+// including one discovered by the "cheap" 2-page check itself (see there).
 async function syncAllSeries(db) {
+  const pending = [];
   for (const series of db.series || []) {
     if (series.seriesUrl && isDiscoveryActiveForOrigin(originOf(series.seriesUrl))) {
       try {
@@ -3926,8 +3945,28 @@ async function syncAllSeries(db) {
     });
     if (unstuckCount > 0) console.log(`[sync] "${series.name}": giving ${unstuckCount} exhausted chapter(s) a fresh retry budget`);
 
-    const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
-    if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+    pending.push(series);
+  }
+
+  // Round-robins the actual scraping across every series (one chapter each
+  // per round, cycling back around) instead of draining one series' entire
+  // backlog before ever touching the next - same reasoning as
+  // resumeRunningCrawls' round-robin over site crawls, applied one level
+  // down at the per-chapter granularity.
+  let active = pending;
+  while (active.length > 0) {
+    const next = [];
+    for (const series of active) {
+      const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
+      if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+      // A blocked series sits out the rest of this pass rather than being
+      // fed straight back into the very next round against the same site.
+      const stillEligible = (series.chapters || []).some(
+        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+      );
+      if (stillEligible && !blockedEarly) next.push(series);
+    }
+    active = next;
   }
 }
 
@@ -4066,7 +4105,15 @@ async function resumeRunningCrawls(db) {
 // downloads its chapters - the CLI's equivalent of the old "add series" form
 // plus an immediate scrape, since there's no UI to come back and click
 // "scrape" later.
-async function addSeriesCommand(url, { name, stealth } = {}) {
+//
+// scrape: false skips the download step entirely, leaving newly-discovered
+// chapters as pending records for syncAllSeries to pick up later - used by
+// checkLatestUpdatesForSite, which needs to stay fast regardless of how
+// large a backlog any single front-page series happens to have (a series
+// with a big pending backlog used to make this "quick" 2-page check take
+// as long as that one series' entire backlog, sometimes days - see the
+// 2026-09-26 fix alongside this one).
+async function addSeriesCommand(url, { name, stealth, scrape = true } = {}) {
   const seriesUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
   const db = readDb();
   if (!db.series) db.series = [];
@@ -4108,6 +4155,8 @@ async function addSeriesCommand(url, { name, stealth } = {}) {
   // chapters row that was never written.
   saveSeries(series);
   console.log(`[add] discovered ${result.discoveredCount} chapter(s), ${result.addedCount} new`);
+
+  if (!scrape) return;
 
   const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series);
   console.log(`[add] scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
@@ -4209,7 +4258,14 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       // dropped entirely, leaving addSeriesCommand to fall back to a raw
       // URL-slug name that never gets replaced if the one metadata-fetch
       // attempt on creation fails (see backfillCoverImages above).
-      await addSeriesCommand(url, { name });
+      //
+      // scrape: false - this check's whole point is to stay fast regardless
+      // of any single series' backlog size, so it only registers the
+      // series and discovers chapter links here; syncAllSeries (which
+      // main() always runs right after this) does the actual downloading,
+      // round-robined fairly across every tracked series instead of
+      // draining whichever one happened to be on the front page first.
+      await addSeriesCommand(url, { name, scrape: false });
       okCount++;
     } catch (err) {
       console.error(`[latest-updates] failed for ${url}:`, err.message);
@@ -4412,12 +4468,8 @@ async function main() {
     console.log(`[remove-series] stopped tracking "${arg}" - its chapters/images are gone from the bot's own DB (the live website row is untouched; delete that separately if needed)`);
   } else if (!cmd) {
     const db = readDb();
-    // Runs before EVERYTHING else, including the "cheap" 5-page check right
-    // below - that check calls addSeriesCommand per series it finds, which
-    // fully scrapes that series' entire backlog before returning (in
-    // practice not cheap at all whenever a front-page series turns out to
-    // have a large backlog). A missing cover costs one page fetch + one
-    // image download; nothing else this run might do should be able to
+    // Runs before EVERYTHING else. A missing cover costs one page fetch +
+    // one image download; nothing else this run might do should be able to
     // delay that.
     const coverResult = await backfillCoverImages(db);
     if (coverResult.downloaded > 0) console.log(`[sync] downloaded ${coverResult.downloaded} new cover(s)`);
@@ -4428,18 +4480,22 @@ async function main() {
     // multi-hundred-chapter backlog to see content the bot already has.
     const repairedNowCount = await repairMysqlSync(readDb());
     if (repairedNowCount > 0) console.log(`[sync] re-synced ${repairedNowCount} already-downloaded chapter(s) that were missing from the live site`);
-    // Runs next, before resumeRunningCrawls below - a whole-site crawl can
-    // take a very long time to work through its backlog (hundreds of
-    // series), and resumeRunningCrawls doesn't return until every active
-    // crawl finishes or errors. If the daily update-check ran after it, a
-    // slow crawl would starve it indefinitely - it might never get a turn.
-    // The whole point of this check is to be the cheap, always-happens
-    // thing that keeps already-known/front-page series current every day;
-    // the exhaustive whole-site crawl is lower priority and can keep
-    // grinding through its backlog afterward. See runDueLatestUpdatesChecks.
+    // Runs next, before resumeRunningCrawls below. checkLatestUpdatesForSite
+    // (inside runDueLatestUpdatesChecks) now only discovers chapter links
+    // for whatever it finds on the front pages (scrape: false - see there),
+    // so it stays quick regardless of any single series' backlog size.
     await runDueLatestUpdatesChecks(db);
-    await resumeRunningCrawls(readDb());
+    // Runs before resumeRunningCrawls (whole-site discovery of BRAND NEW
+    // series, lowest priority - see its own round-robin/while loop, which
+    // can genuinely take days to fully finish one pass). syncAllSeries keeps
+    // every ALREADY-tracked series current (round-robined one chapter at a
+    // time per series - see SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) and must
+    // never wait behind that: a reader following an ongoing series shouldn't
+    // go stale for days just because the bot is also mid-crawl discovering
+    // an entirely new site's catalog. Old, not-yet-discovered backlogs can
+    // wait - freshness of what's already live can't.
     await syncAllSeries(readDb());
+    await resumeRunningCrawls(readDb());
     // Cheap catch-up pass every regular run too, not just on-demand - covers
     // chapters that finished downloading while MySQL was briefly unreachable
     // during THIS run (or a previous one) without needing a separate command.
