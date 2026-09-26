@@ -4198,19 +4198,24 @@ const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
 // logic needed here.
 //
 // This whole check is the bot's top scheduling priority (2026-09-26): every
-// series found on these front pages is downloaded to FULL completion -
-// round-robined fairly against just each other so one huge backlog among
-// them doesn't starve the rest of THIS batch - before this function
-// returns and main() moves on to anything lower-priority (already-tracked
-// series that didn't happen to be on these pages this cycle, then
-// whole-site discovery). A reader following the source site's front page
-// should see a fully caught-up series here, not just its first chapter.
+// series found on a front page is downloaded to FULL completion -
+// round-robined fairly against just the others found on that SAME page, so
+// one huge backlog among them doesn't starve the rest of that page's batch
+// - before moving on to the next page, and before main() moves on to
+// anything lower-priority (already-tracked series that didn't happen to be
+// on these pages this cycle, then whole-site discovery). Page order is
+// strict: page 1's batch finishes completely before page 2 is even
+// fetched, page 2's batch finishes completely before page 3, and so on -
+// never a combined pool across pages. A reader following the source
+// site's front page should see a fully caught-up series here, not just
+// its first chapter.
 async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false } = {}) {
   console.log(`[latest-updates] checking first ${maxPages} listing page(s) of ${siteUrl}...`);
 
   let pageUrl = siteUrl;
   const visited = new Set();
-  const seriesLinks = new Map(); // url -> {url, name}
+  let totalFound = 0;
+  let totalOk = 0;
 
   for (let page = 1; page <= maxPages && pageUrl && !visited.has(pageUrl); page++) {
     visited.add(pageUrl);
@@ -4236,8 +4241,67 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       break;
     }
 
+    // Dedup within this page only (a listing page rarely repeats a series,
+    // but pagination overlap isn't unheard of) - deliberately NOT deduped
+    // against earlier pages, since each page is its own complete-before-
+    // moving-on batch now.
+    const pageLinks = new Map(); // url -> {url, name}
     for (const link of discoverSeriesLinksFromHtml(html, pageUrl)) {
-      if (!seriesLinks.has(link.url)) seriesLinks.set(link.url, link);
+      if (!pageLinks.has(link.url)) pageLinks.set(link.url, link);
+    }
+    console.log(`[latest-updates] page ${page}: found ${pageLinks.size} series link(s) on ${pageUrl}`);
+    totalFound += pageLinks.size;
+
+    if (dryRun) {
+      // Preview only - used by the `check-latest-updates --dry-run` CLI
+      // command to see what a real run WOULD do without touching R2/MySQL.
+      const db = readDb();
+      for (const { url, name } of pageLinks.values()) {
+        const tracked = (db.series || []).find(s => s.seriesUrl === url || (s.sourceUrls || []).includes(url));
+        console.log(`[latest-updates]   ${tracked ? 'ALREADY TRACKED' : 'NEW'} - "${name}" - ${url}`);
+      }
+    } else {
+      const found = [];
+      for (const { url, name } of pageLinks.values()) {
+        try {
+          // Pass the title actually seen on the listing tile through as the
+          // fallback name (addSeriesCommand only uses it if this isn't
+          // already a tracked series, or as the name to create a new one
+          // with) - normalizeForComparison strips non-ASCII/punctuation, so
+          // a Thai subtitle baked into the tile text ("Lookism ลุกคิซึม")
+          // still matches an existing plain "Lookism" row.
+          //
+          // scrape: false here too - registers the series and discovers
+          // chapter links only. The actual downloading for everything
+          // found on THIS page happens right below, as its own round-robin
+          // pass scoped to just this page's batch.
+          const series = await addSeriesCommand(url, { name, scrape: false });
+          if (series) found.push(series);
+          totalOk++;
+        } catch (err) {
+          console.error(`[latest-updates] failed for ${url}:`, err.message);
+        }
+      }
+
+      // Fully completes this page's batch (round-robin, one chapter per
+      // series per round - same fairness reasoning as
+      // SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) before the loop above moves
+      // on to fetching the next page at all.
+      const db = readDb();
+      let active = found;
+      while (active.length > 0) {
+        const next = [];
+        for (const series of active) {
+          const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
+          if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+          const stillEligible = (series.chapters || []).some(
+            c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+          );
+          if (stillEligible && !blockedEarly) next.push(series);
+        }
+        active = next;
+      }
+      console.log(`[latest-updates] page ${page}: batch fully caught up (${found.length} series)`);
     }
 
     const nextPage = findNextListingPageUrl(html, pageUrl);
@@ -4247,69 +4311,12 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
     }
   }
 
-  console.log(`[latest-updates] found ${seriesLinks.size} series link(s) across ${visited.size} page(s) of ${siteUrl}`);
-
   if (dryRun) {
-    // Preview only - used by the `check-latest-updates --dry-run` CLI
-    // command to see what a real run WOULD do without touching R2/MySQL.
-    const db = readDb();
-    for (const { url, name } of seriesLinks.values()) {
-      const tracked = (db.series || []).find(s => s.seriesUrl === url || (s.sourceUrls || []).includes(url));
-      console.log(`[latest-updates]   ${tracked ? 'ALREADY TRACKED' : 'NEW'} - "${name}" - ${url}`);
-    }
-    console.log(`[latest-updates] dry-run: would process ${seriesLinks.size} series link(s), nothing written`);
+    console.log(`[latest-updates] dry-run: would process ${totalFound} series link(s) across ${visited.size} page(s), nothing written`);
     return;
   }
 
-  let okCount = 0;
-  const found = [];
-  for (const { url, name } of seriesLinks.values()) {
-    try {
-      // Pass the title actually seen on the listing tile through as the
-      // fallback name (addSeriesCommand only uses it if this isn't already
-      // a tracked series, or as the name to create a new one with) -
-      // normalizeForComparison strips non-ASCII/punctuation, so a Thai
-      // subtitle baked into the tile text ("Lookism ลุกคิซึม") still
-      // matches an existing plain "Lookism" row. Previously this was
-      // dropped entirely, leaving addSeriesCommand to fall back to a raw
-      // URL-slug name that never gets replaced if the one metadata-fetch
-      // attempt on creation fails (see backfillCoverImages above).
-      //
-      // scrape: false here too - registers the series and discovers
-      // chapter links only. The actual downloading for everything found on
-      // these front pages happens below, as its own round-robin pass
-      // (fair across just THIS batch, same reasoning as
-      // SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) so one huge backlog among
-      // them can't starve the others found on the same pages - but unlike
-      // syncAllSeries's pass, this one always finishes every series found
-      // here before checkLatestUpdatesForSite returns, so a reader
-      // following what's on the source site's front page actually gets a
-      // fully caught-up series, not just its first chapter, before the bot
-      // moves on to lower-priority work (older already-tracked series,
-      // whole-site discovery).
-      const series = await addSeriesCommand(url, { name, scrape: false });
-      if (series) found.push(series);
-      okCount++;
-    } catch (err) {
-      console.error(`[latest-updates] failed for ${url}:`, err.message);
-    }
-  }
-  console.log(`[latest-updates] done with ${siteUrl}: ${okCount}/${seriesLinks.size} series link(s) processed successfully`);
-
-  const db = readDb();
-  let active = found;
-  while (active.length > 0) {
-    const next = [];
-    for (const series of active) {
-      const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
-      if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
-      const stillEligible = (series.chapters || []).some(
-        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
-      );
-      if (stillEligible && !blockedEarly) next.push(series);
-    }
-    active = next;
-  }
+  console.log(`[latest-updates] done with ${siteUrl}: ${totalOk}/${totalFound} series link(s) processed successfully across ${visited.size} page(s)`);
 }
 
 // Runs checkLatestUpdatesForSite for each configured site, but only once
