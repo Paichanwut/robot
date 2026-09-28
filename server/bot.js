@@ -4200,6 +4200,8 @@ const LATEST_UPDATES_INTERVAL_MS = 12 * 60 * 60 * 1000;
 // so it no longer earns page 1's priority. This is what keeps the "page 1
 // must finish before page 2" rule from ever blocking the bot indefinitely.
 const LATEST_UPDATES_BUDGET_MS = 6 * 60 * 60 * 1000;
+// See the safety-net check in checkLatestUpdatesForSite's page loop.
+const MIN_EXPECTED_SERIES_LINKS_PER_PAGE = 3;
 // Which site homepages get the check at all - empty/unset = feature off
 // (opt-in, same posture as ACTIVE_DISCOVERY_ORIGINS above).
 const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
@@ -4263,7 +4265,23 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       if (isPathDisallowed(pageUrl, robotsRules.disallowPaths)) {
         return { disallowed: true, html: null };
       }
-      return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, false) };
+      // useStealth: true (2026-09-28) - the plain/cookie-replay fetch this
+      // used before returned a "Text Mode" stub page for
+      // go-manga.com/manga/?order=update (a real series never even got
+      // discovered, and a bogus "Text Mode" series got created from a UI
+      // element instead) despite working fine for the plain homepage URL,
+      // while a normal browser (or a from-scratch curl) sees the real
+      // listing - strongly suggests this specific URL needs the full
+      // Cloudflare-challenge/rendering path, not a stale replayed cookie.
+      // Slower (spins up the real browser instead of a bare fetch) but
+      // safer against being misidentified as a bot on this listing check
+      // specifically - worth the tradeoff over risking the site blocking
+      // us outright. forceFullRender=true too: a plain clearance-cookie
+      // replay (useStealth's own default shortcut) can still silently
+      // return a "successful" but wrong/incomplete page the same way the
+      // old plain fetch did - this skips that shortcut and always goes
+      // through the real browser render.
+      return { disallowed: false, html: await fetchTextOrNull(pageUrl, 15000, true, true) };
     });
 
     if (disallowed) {
@@ -4284,6 +4302,19 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       if (!pageLinks.has(link.url)) pageLinks.set(link.url, link);
     }
     console.log(`[latest-updates] page ${page}: found ${pageLinks.size} series link(s) on ${pageUrl}`);
+
+    // Safety net (2026-09-28): a real listing page always has many series
+    // on it - suspiciously few is a sign the fetch got back something
+    // other than the real page (a bot-detection stub, an error page, a
+    // reading-mode toggle, ...) rather than an actual quiet day. Seen
+    // live: go-manga.com/manga/?order=update once returned a page whose
+    // only "series link" was a UI element ("Text Mode"), which got
+    // created as a bogus series. Stop here rather than risk creating more
+    // junk from content that isn't really the listing.
+    if (pageLinks.size < MIN_EXPECTED_SERIES_LINKS_PER_PAGE) {
+      console.warn(`[latest-updates] page ${page}: only ${pageLinks.size} series link(s) found (expected several) - this doesn't look like the real listing page, stopping here rather than risk creating junk from it`);
+      break;
+    }
     totalFound += pageLinks.size;
 
     if (dryRun) {
