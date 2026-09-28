@@ -4183,6 +4183,23 @@ async function addSeriesCommand(url, { name, stealth, scrape = true } = {}) {
 const LATEST_UPDATES_MAX_PAGES = 2;
 // How often to re-run that check per site - see runDueLatestUpdatesChecks.
 const LATEST_UPDATES_INTERVAL_MS = 12 * 60 * 60 * 1000;
+// Hard ceiling on how long checkLatestUpdatesForSite spends completing
+// pages' batches before giving up for THIS cycle - added 2026-09-28 after
+// a single call ran for 47+ hours straight (several front-page series each
+// had 100-200+ chapters still pending), starving every cron-triggered
+// invocation after it (they'd just queue up on the lock, unable to do
+// anything, for as long as this one kept going).
+//
+// Deliberately well under LATEST_UPDATES_INTERVAL_MS: whatever's still
+// incomplete when the budget runs out is left exactly as-is (each
+// chapter's status is durably tracked, so nothing is lost) - syncAllSeries
+// picks it up afterward at ordinary priority, and next cycle's due-check
+// re-fetches page 1 from scratch. A series still on page 1 then picks up
+// its forced-priority treatment right where it left off; one that's since
+// fallen to page 2+ simply stops getting it - it's not on page 1 anymore,
+// so it no longer earns page 1's priority. This is what keeps the "page 1
+// must finish before page 2" rule from ever blocking the bot indefinitely.
+const LATEST_UPDATES_BUDGET_MS = 6 * 60 * 60 * 1000;
 // Which site homepages get the check at all - empty/unset = feature off
 // (opt-in, same posture as ACTIVE_DISCOVERY_ORIGINS above).
 const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
@@ -4209,6 +4226,16 @@ const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
 // never a combined pool across pages. A reader following the source
 // site's front page should see a fully caught-up series here, not just
 // its first chapter.
+//
+// Bounded by LATEST_UPDATES_BUDGET_MS (2026-09-28, after a real 47+ hour
+// run): "complete before moving on" does NOT mean "no matter how long it
+// takes" - once the budget runs out, whatever's still incomplete is simply
+// left as pending (nothing lost, every chapter's status is durable) and
+// picked up afterward by syncAllSeries at ordinary priority. The next
+// due-check re-fetches page 1 from scratch rather than resuming a stale
+// list - a series still there picks its forced-priority treatment back up
+// where it left off; one that's since dropped to page 2+ just stops
+// getting it, because it's not on page 1 anymore.
 async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false } = {}) {
   console.log(`[latest-updates] checking first ${maxPages} listing page(s) of ${siteUrl}...`);
 
@@ -4216,8 +4243,15 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
   const visited = new Set();
   let totalFound = 0;
   let totalOk = 0;
+  const deadline = Date.now() + LATEST_UPDATES_BUDGET_MS;
+  let budgetExceeded = false;
 
   for (let page = 1; page <= maxPages && pageUrl && !visited.has(pageUrl); page++) {
+    if (Date.now() > deadline) {
+      console.warn(`[latest-updates] budget of ${(LATEST_UPDATES_BUDGET_MS / 3600000).toFixed(1)}h exceeded before page ${page} - stopping here for this cycle, next due-check re-fetches from page 1`);
+      budgetExceeded = true;
+      break;
+    }
     visited.add(pageUrl);
     const pageOrigin = originOf(pageUrl);
     if (!pageOrigin) break;
@@ -4290,6 +4324,11 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
       const db = readDb();
       let active = found;
       while (active.length > 0) {
+        if (Date.now() > deadline) {
+          console.warn(`[latest-updates] page ${page}: budget exceeded mid-batch - ${active.length}/${found.length} series still have chapters pending, leaving them for syncAllSeries; next due-check re-fetches page 1 fresh`);
+          budgetExceeded = true;
+          break;
+        }
         const next = [];
         for (const series of active) {
           const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
@@ -4301,8 +4340,12 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
         }
         active = next;
       }
-      console.log(`[latest-updates] page ${page}: batch fully caught up (${found.length} series)`);
+      if (!budgetExceeded) console.log(`[latest-updates] page ${page}: batch fully caught up (${found.length} series)`);
     }
+
+    // Budget ran out mid-batch above - don't fetch page 2+ this cycle
+    // either, per the strict "page 1 finishes before page 2" ordering.
+    if (budgetExceeded) break;
 
     const nextPage = findNextListingPageUrl(html, pageUrl);
     pageUrl = (nextPage && !visited.has(nextPage)) ? nextPage : null;
@@ -4316,7 +4359,7 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
     return;
   }
 
-  console.log(`[latest-updates] done with ${siteUrl}: ${totalOk}/${totalFound} series link(s) processed successfully across ${visited.size} page(s)`);
+  console.log(`[latest-updates] done with ${siteUrl}: ${totalOk}/${totalFound} series link(s) processed successfully across ${visited.size} page(s)${budgetExceeded ? ' (stopped early - budget exceeded)' : ''}`);
 }
 
 // Runs checkLatestUpdatesForSite for each configured site, but only once
