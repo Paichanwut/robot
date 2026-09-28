@@ -2434,6 +2434,7 @@ async function backfillMissingChaptersFromSiblings(db, series) {
       if (siblingChapter.status !== 'done') continue; // only borrow chapters the sibling actually finished
       const num = extractLeadingNumber(siblingChapter.name);
       if (num === null || haveNumbers.has(num)) continue;
+      if (!isOnActiveOrigin(siblingChapter.url)) continue; // would have to be downloaded from a paused site
 
       if (!series.chapters) series.chapters = [];
       series.chapters.push({
@@ -2485,6 +2486,13 @@ const SITE_PROGRESS_LOG_EVERY = 20;
 const SERIES_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 async function scrapeChapterCore(db, series, chapter) {
+  // Last line of defense for the paused-origin rule (see isOnActiveOrigin) -
+  // every pending-chapter filter already skips these, so this only fires
+  // for an explicit one-off command. The chapter is left exactly as it was.
+  if (!isOnActiveOrigin(chapter.url)) {
+    console.log(`[scrape] skipping "${chapter.name}" - ${originOf(chapter.url)} is paused (ACTIVE_DISCOVERY_ORIGINS)`);
+    return { httpStatus: 0, error: null, skipped: true };
+  }
   // Serialize against every other scrape/crawl operation hitting this same
   // site (see runExclusiveByOrigin above) - this is the one function every
   // scraping entry point funnels through, so locking here is enough to stop
@@ -3293,6 +3301,7 @@ async function backfillCoverImages(db) {
   let skipped = 0;
 
   for (const series of db.series || []) {
+    if (series.seriesUrl && !isOnActiveOrigin(series.seriesUrl)) continue; // paused site - don't contact it
     // Retry metadata fetch whenever there's no cover URL yet, not just when
     // metadata itself is null - a series graduated from the whole-site
     // crawl or the 5-page daily check only ever gets ONE metadata-fetch
@@ -3429,7 +3438,7 @@ async function repairEntityTitlesCommand() {
 // stopping is checked between chapters, not mid-scrape.
 async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinity } = {}) {
   const findEligible = () => (series.chapters || []).filter(
-    c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
+    c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
   );
 
   let scrapedCount = 0;
@@ -3542,6 +3551,16 @@ const ACTIVE_DISCOVERY_ORIGINS = (process.env.ACTIVE_DISCOVERY_ORIGINS || '')
 
 function isDiscoveryActiveForOrigin(origin) {
   return ACTIVE_DISCOVERY_ORIGINS.length === 0 || ACTIVE_DISCOVERY_ORIGINS.includes(origin);
+}
+
+// Since 2026-09-28 the same list also gates DOWNLOADING, not just discovery:
+// a paused site isn't contacted at all - no chapter scrapes, cover fetches,
+// or sibling gap-fill borrowing its chapter URLs. Chapters already pending
+// there simply stay pending (untouched) until the origin is re-enabled.
+// MySQL-only work (repairMysqlSync) still covers every series, since it
+// never touches the source site.
+function isOnActiveOrigin(url) {
+  return isDiscoveryActiveForOrigin(originOf(url));
 }
 
 function originOf(url) {
@@ -3686,7 +3705,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
       let retrySeries = null;
       for (const s of (db.series || [])) {
         if (!crawlSeriesUrls.has(s.seriesUrl)) continue;
-        const found = (s.chapters || []).find(c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES);
+        const found = (s.chapters || []).find(c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES);
         if (found) {
           retryChapter = found;
           retrySeries = s;
@@ -3706,7 +3725,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
         for (const s of (db.series || [])) {
           if (!crawlSeriesUrls.has(s.seriesUrl)) continue;
           for (const c of (s.chapters || [])) {
-            if (c.status !== 'done') incompleteChapters.push(c);
+            if (isOnActiveOrigin(c.url) && c.status !== 'done') incompleteChapters.push(c);
           }
         }
 
@@ -3897,7 +3916,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     // at MAX_CHAPTER_RETRIES attempts within *this* pass, so a permanently
     // broken chapter just costs one extra sweep per revisit, not a spin.
     series.chapters.forEach(c => {
-      if (c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+      if (isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
         c.retryCount = 0;
       }
     });
@@ -3906,7 +3925,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     let firstChapterOfSeries = true;
     while (!seriesBlocked) {
       const pending = series.chapters.filter(
-        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+        c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
       );
       if (pending.length === 0) break;
 
@@ -4011,7 +4030,7 @@ async function syncAllSeries(db) {
     // permanently broken chapter costs one extra sweep per sync, not a spin.
     let unstuckCount = 0;
     series.chapters.forEach(c => {
-      if (c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+      if (isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
         c.retryCount = 0;
         unstuckCount++;
       }
@@ -4035,7 +4054,7 @@ async function syncAllSeries(db) {
       // A blocked series sits out the rest of this pass rather than being
       // fed straight back into the very next round against the same site.
       const stillEligible = (series.chapters || []).some(
-        c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+        c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
       );
       if (stillEligible && !blockedEarly) next.push(series);
     }
@@ -4438,7 +4457,7 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
           const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
           if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
           const stillEligible = (series.chapters || []).some(
-            c => c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+            c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
           );
           if (stillEligible && !blockedEarly) next.push(series);
         }
@@ -4476,6 +4495,7 @@ async function runDueLatestUpdatesChecks(db) {
   if (!db.latestUpdatesChecks) db.latestUpdatesChecks = {};
 
   for (const siteUrl of LATEST_UPDATES_SITE_URLS) {
+    if (!isOnActiveOrigin(siteUrl)) continue;
     const lastCheckedAt = db.latestUpdatesChecks[siteUrl];
     const msSinceLastCheck = lastCheckedAt ? Date.now() - new Date(lastCheckedAt).getTime() : Infinity;
     if (msSinceLastCheck < LATEST_UPDATES_INTERVAL_MS) {
