@@ -2512,6 +2512,9 @@ async function scrapeChapterCore(db, series, chapter) {
 
 async function scrapeChapterCoreAttempt(db, series, chapter) {
   const seriesId = series.id;
+  // Captured before 'scraping' overwrites it - decides below whether pages
+  // uploaded by an earlier incomplete attempt can be kept instead of refetched.
+  const resumingIncomplete = chapter.status !== 'done' && (chapter.images || []).length > 0;
   chapter.status = 'scraping';
   chapter.error = null;
   updateChapter(chapter);
@@ -2626,19 +2629,51 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     const chapterNumber = extractLeadingNumber(chapter.name);
     const chapterLabel = chapterNumber !== null ? String(chapterNumber) : String(chapter.orderIndex + 1);
 
-    // Wipe any previous upload for this chapter first, so a re-scrape after
-    // the filters above catch something new doesn't leave stale pages (e.g.
-    // yesterday's ad banner) orphaned in R2 under the old key prefix.
     const chapterKeyPrefix = `manga/${seriesTitleForFile}/ep${chapterLabel}/`;
-    await deleteR2Prefix(chapterKeyPrefix);
+
+    // Resuming a partial chapter: pages the earlier attempt already uploaded
+    // are kept as-is and only the missing ones are fetched, instead of
+    // re-downloading the whole chapter every retry. Matched on BOTH position
+    // and source URL, so a page list the site reordered/replaced since then
+    // simply misses here and gets fetched fresh.
+    const reusablePages = new Map();
+    if (resumingIncomplete) {
+      for (const img of chapter.images) {
+        if (img.originalUrl && img.contentHash && img.relativePath?.startsWith(chapterKeyPrefix)) {
+          reusablePages.set(`${img.order}|${img.originalUrl}`, img);
+        }
+      }
+    }
+
+    // Otherwise wipe any previous upload for this chapter first, so a
+    // re-scrape after the filters above catch something new doesn't leave
+    // stale pages (e.g. yesterday's ad banner) orphaned in R2 under the old
+    // key prefix.
+    if (reusablePages.size === 0) await deleteR2Prefix(chapterKeyPrefix);
 
     const downloaded = [];
     const chapterHashes = new Set(); // content hashes already kept in THIS scrape - catches in-chapter duplicate pages
     let blockedEarly = false;
     let retryAfterMs = null;
     let excludedAsSharedCount = 0; // hash-deduped ad/credit images - not a download failure
+    let duplicateInChapterCount = 0; // same page file repeated within this chapter - kept once, not a download failure
+    let reusedCount = 0;
 
     for (let i = 0; i < mangaImages.length; i++) {
+      const reused = reusablePages.get(`${i + 1}|${mangaImages[i].url}`);
+      if (reused) {
+        if (chapterHashes.has(reused.contentHash)) {
+          duplicateInChapterCount++;
+        } else if (sharedHashSet.has(reused.contentHash)) {
+          excludedAsSharedCount++; // became a known ad/credit graphic since the last attempt
+        } else {
+          chapterHashes.add(reused.contentHash);
+          downloaded.push(reused);
+          reusedCount++;
+        }
+        continue;
+      }
+
       if (i > 0) {
         await sleep(computeNextDelayMs(robotsRules.crawlDelaySeconds));
       }
@@ -2706,6 +2741,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
         // below only fire when a hash reappears under a *different* chapter, so
         // an in-chapter repeat would slip through and get saved twice - drop it.
         if (chapterHashes.has(contentHash)) {
+          duplicateInChapterCount++;
           continue;
         }
         chapterHashes.add(contentHash);
@@ -2781,8 +2817,9 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
       }
     }
 
+    downloaded.sort((a, b) => a.order - b.order);
     chapter.images = downloaded;
-    const expectedCount = mangaImages.length - excludedAsSharedCount;
+    const expectedCount = mangaImages.length - excludedAsSharedCount - duplicateInChapterCount;
     if (blockedEarly && downloaded.length === 0) {
       chapter.status = 'blocked';
     } else if (expectedCount === 0) {
@@ -2824,7 +2861,7 @@ async function scrapeChapterCoreAttempt(db, series, chapter) {
     }
 
     chapter.scrapedAt = new Date().toISOString();
-    console.log(`[scrape] "${chapter.name}" finished: status=${chapter.status}, downloaded=${downloaded.length}/${expectedCount}, excludedAsShared=${excludedAsSharedCount}`);
+    console.log(`[scrape] "${chapter.name}" finished: status=${chapter.status}, downloaded=${downloaded.length}/${expectedCount}, excludedAsShared=${excludedAsSharedCount}, duplicateInChapter=${duplicateInChapterCount}, reusedFromLastAttempt=${reusedCount}`);
 
     updateChapter(chapter);
     return { httpStatus: 200, error: null, blockedEarly, retryAfterMs };
