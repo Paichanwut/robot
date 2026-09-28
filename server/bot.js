@@ -2870,8 +2870,42 @@ function cleanChapterName(text) {
     .trim();
 }
 
+// The WordPress manga theme both go-manga and up-manga run wraps a series'
+// real chapter list in <div class="eplister"><ul>...</ul>. Every link in it
+// is this series' chapter by construction - including when the site's admin
+// gave the chapter URLs a different slug than the series page itself (seen
+// live: /dragonslayers-regression/ -> /dragonslayers-peerless-regression-ตอนที่-1/),
+// which the slug-prefix matching below can never catch. Empty on sites
+// without this markup, which then fall back to slug matching alone.
+//
+// The list itself isn't fully trustworthy though: admins occasionally paste
+// another series' chapter into it (seen live: up-manga's 99-wooden-stick list
+// carries two awakening-the-purple-ตอนที่-N links). So only links sharing the
+// list's dominant chapter-URL prefix (the part before "-ตอนที่-N") count.
+function chapterUrlPrefix(url) {
+  let p = url.pathname;
+  try { p = decodeURIComponent(p); } catch (e) { /* keep raw */ }
+  return p.replace(/[-_]?(?:ตอนที่|ตอน|chapter|episode|ep)[-_.\s]*\d[\s\S]*$/i, '');
+}
+
+function extractChapterListHrefs(html, pageUrl) {
+  const listMatch = /<div[^>]*class=["'][^"']*\beplister\b[^"']*["'][^>]*>([\s\S]*?)<\/ul>/i.exec(html);
+  if (!listMatch) return new Set();
+  const urls = [];
+  const hrefRegex = /<a\s[^>]*href=["']([^"']+)["']/gi;
+  let match;
+  while ((match = hrefRegex.exec(listMatch[1])) !== null) {
+    try { urls.push(new URL(match[1].trim(), pageUrl)); } catch (e) { /* malformed - skip */ }
+  }
+  const prefixCounts = new Map();
+  for (const u of urls) prefixCounts.set(chapterUrlPrefix(u), (prefixCounts.get(chapterUrlPrefix(u)) || 0) + 1);
+  const [dominantPrefix] = [...prefixCounts.entries()].sort((a, b) => b[1] - a[1])[0] || [];
+  return new Set(urls.filter(u => chapterUrlPrefix(u) === dominantPrefix).map(u => u.href));
+}
+
 function discoverChapterLinksFromHtml(html, pageUrl) {
   const cleanedHtml = stripNavChrome(html);
+  const chapterListHrefs = extractChapterListHrefs(cleanedHtml, pageUrl);
   const seriesPath = new URL(pageUrl).pathname.replace(/\/+$/, '');
   const CHAPTER_KEYWORD_REGEX = /(chapter|ตอน|ep[-_.]?\d|episode)/i;
   const NUMBER_REGEX = /(\d+(?:\.\d+)?)/;
@@ -2915,7 +2949,9 @@ function discoverChapterLinksFromHtml(html, pageUrl) {
     try { if (seriesSlug) decodedSeriesSlug = decodeURIComponent(seriesSlug); } catch (e) {}
 
     let isSameSeries = false;
-    if (seriesPath !== '' && seriesPath !== '/') {
+    if (chapterListHrefs.has(absoluteUrl.href)) {
+      isSameSeries = true;
+    } else if (seriesPath !== '' && seriesPath !== '/') {
       // 1. Nested: /series/ -> /series/chapter-1
       if (linkPath.startsWith(`${seriesPath}/`) || decodedLinkPath.startsWith(`${seriesPath}/`)) {
         isSameSeries = true;
