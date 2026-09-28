@@ -2903,7 +2903,10 @@ function chapterNumberFromPath(decodedPath) {
 // latest chapter" buttons, prev/next arrows) rather than a real chapter list
 // entry - we still keep the URL, but its text must not become the chapter's
 // name, and a real list entry for the same URL should win over it.
-const CHAPTER_NAV_LABEL_REGEX = /^(อ่าน(ตอน)?(แรก|ล่าสุด|ต่อ)|ตอน(แรก|ล่าสุด|ก่อน(หน้า)?|ถัดไป)|บท(ก่อน(หน้า)?|ถัดไป)|กลับ|first|last|prev(ious)?|next|latest|newest|oldest|read\s*(first|last|now))\b/i;
+// Ends in (?![a-z0-9]) rather than \b: JS's \b only knows ASCII word chars,
+// so after a Thai label like "อ่านตอนล่าสุด:" it never matched and the
+// button's text became the latest chapter's name on every go-manga series.
+const CHAPTER_NAV_LABEL_REGEX = /^(อ่าน(ตอน)?(แรก|ล่าสุด|ต่อ)|ตอน(แรก|ล่าสุด|ก่อน(หน้า)?|ถัดไป)|บท(ก่อน(หน้า)?|ถัดไป)|กลับ|first|last|prev(ious)?|next|latest|newest|oldest|read\s*(first|last|now))(?![a-z0-9])/i;
 
 // Strips a trailing "N สัปดาห์ / 3 วัน / 2 hours ago" freshness stamp that
 // these listings tack onto each chapter row, so it never lands in the name (or,
@@ -3253,8 +3256,19 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
   const existingUrls = new Set(series.chapters.map(c => c.url));
 
   let addedCount = 0;
+  const renamedDoneChapters = [];
   discovered.forEach((item, index) => {
-    if (existingUrls.has(item.url)) return; // already tracked by URL - skip
+    if (existingUrls.has(item.url)) {
+      // Heals chapters named after a "read latest" button before
+      // CHAPTER_NAV_LABEL_REGEX could match Thai labels (see there).
+      const existing = series.chapters.find(c => c.url === item.url);
+      if (existing && CHAPTER_NAV_LABEL_REGEX.test(existing.name) && !CHAPTER_NAV_LABEL_REGEX.test(item.name)) {
+        console.log(`[discover] "${series.name}": renaming chapter "${existing.name}" -> "${item.name}"`);
+        existing.name = item.name;
+        if (existing.status === 'done') renamedDoneChapters.push(existing);
+      }
+      return;
+    }
 
     const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
     if (existingSameChapter) {
@@ -3285,6 +3299,13 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
 
   series.sourceUrls = [...new Set([...(series.sourceUrls || []), series.seriesUrl, listingUrl].filter(Boolean))];
   if (!series.seriesUrl) series.seriesUrl = listingUrl;
+
+  if (renamedDoneChapters.length > 0) {
+    saveSeries(series); // updateChapter() doesn't write names - only a full series save does
+    // Already live on the website under the old title - push the fix there too
+    // (same number, so it upserts the existing row in place).
+    for (const chapter of renamedDoneChapters) await syncChapterToWebsiteDbSafe(series, chapter);
+  }
 
   return { discoveredCount: discovered.length, addedCount };
 }
