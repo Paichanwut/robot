@@ -2528,9 +2528,182 @@ async function scrapeChapterCore(db, series, chapter) {
   // partial/error/blocked chapters stay bot-internal until a later retry
   // round finishes them.
   if (chapter.status === 'done') {
-    await syncChapterToWebsiteDbSafe(series, chapter);
+    const problems = validateChapterForPublish(db, series, chapter);
+    if (problems.length > 0) {
+      chapter.status = 'quarantined';
+      chapter.error = problems.join(' | ');
+      updateChapter(chapter);
+      runReport.quarantined.push(`"${series.name}" ${chapter.name}: ${chapter.error}`);
+      console.warn(`[quarantine] "${series.name}" / "${chapter.name}" (${chapter.id}) held back from the website: ${chapter.error}`);
+    } else {
+      await syncChapterToWebsiteDbSafe(series, chapter);
+    }
   }
+  runReport.scraped[chapter.status] = (runReport.scraped[chapter.status] || 0) + 1;
   return result;
+}
+
+const findOtherSeriesWithHashStmt = sqliteDb.prepare(
+  'SELECT i.chapterId, c.seriesId FROM images i JOIN chapters c ON c.id = i.chapterId WHERE i.contentHash = ? AND c.seriesId != ?'
+);
+
+// Last check before a finished chapter goes to the website. Each rule is a
+// failure that actually reached readers before (2026-09): a nav-button label
+// as the chapter title, and another manga's pages published under this one
+// (Evolution from the Big Tree got Infinite Evolution From Zero's ep1 - every
+// page byte-identical to that series' chapter). Anything flagged is held as
+// 'quarantined' for a human (quarantine / approve-chapter / reject-chapter).
+function validateChapterForPublish(db, series, chapter) {
+  const problems = [];
+
+  if (CHAPTER_NAV_LABEL_REGEX.test(chapter.name)) {
+    problems.push('ชื่อตอนเป็นข้อความปุ่ม (nav label)');
+  }
+
+  // (No "chapter number vs URL number" rule: tried against 3,930 live
+  // chapters it only produced false alarms - source sites write 37.5 as
+  // ตอนที่-37-5 and even typo 32 as ตอนที่-3-2.)
+
+  // Pages shared with another series. Real cross-site copies of the SAME
+  // manga (isStrongSibling) legitimately share scans, so they don't count;
+  // a site-wide credit page or two can repeat anywhere, hence the threshold.
+  const images = chapter.images || [];
+  const matchesBySeries = new Map();
+  for (const img of images) {
+    if (!img.contentHash) continue;
+    const seen = new Set();
+    for (const row of findOtherSeriesWithHashStmt.all(img.contentHash, series.id)) {
+      if (seen.has(row.seriesId)) continue;
+      seen.add(row.seriesId);
+      matchesBySeries.set(row.seriesId, (matchesBySeries.get(row.seriesId) || 0) + 1);
+    }
+  }
+  const threshold = Math.max(3, Math.ceil(images.length * 0.5));
+  for (const [otherId, count] of matchesBySeries) {
+    if (count < threshold) continue;
+    const other = findSeries(db, otherId);
+    if (other && isStrongSibling(series, other)) continue;
+    problems.push(`รูป ${count}/${images.length} หน้าซ้ำกับเรื่อง "${other?.name || otherId}" - น่าจะเป็นตอนของเรื่องอื่น`);
+  }
+
+  return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Run report: what this invocation did and what needs a human, printed at
+// the end and (when DISCORD_WEBHOOK_URL is set) posted to Discord.
+// ---------------------------------------------------------------------------
+const runReport = { startedAt: Date.now(), scraped: {}, quarantined: [], zeroChapterSeries: [], fetchFailedSeries: [] };
+
+function collectHealthIssues(db) {
+  const all = (db.series || []).flatMap(s => (s.chapters || []).map(c => ({ s, c })));
+  const quarantined = all.filter(({ c }) => c.status === 'quarantined');
+  const stuck = all.filter(({ c }) => needsScrape(c) && ['partial', 'error', 'blocked'].includes(c.status) && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES);
+  const navNames = all.filter(({ c }) => c.status === 'done' && CHAPTER_NAV_LABEL_REGEX.test(c.name));
+  return { quarantined, stuck, navNames };
+}
+
+function formatRunReport(db, { title, error } = {}) {
+  const minutes = Math.round((Date.now() - runReport.startedAt) / 60000);
+  const scraped = Object.entries(runReport.scraped).map(([k, v]) => `${k} ${v}`).join(', ') || 'ไม่มี';
+  const health = collectHealthIssues(db);
+  const lines = [
+    `**${title || 'solo-manga bot'}** ${error ? '❌ หยุดเพราะ error' : '✅ จบรอบ'} (${minutes} นาที)`,
+    `โหลดตอน: ${scraped}`,
+  ];
+  if (error) lines.push(`Error: ${String(error.message || error).slice(0, 300)}`);
+  const section = (label, items) => {
+    if (items.length === 0) return;
+    lines.push(`${label} (${items.length}):`);
+    items.slice(0, 8).forEach(item => lines.push(`• ${String(item).slice(0, 180)}`));
+    if (items.length > 8) lines.push(`• ...อีก ${items.length - 8}`);
+  };
+  section('⚠️ กักใหม่รอบนี้ (ไม่ขึ้นเว็บ รอตรวจ)', runReport.quarantined);
+  section('⚠️ เรื่องที่หาตอนไม่เจอ (0 ตอน)', runReport.zeroChapterSeries);
+  section('⚠️ เปิดหน้าเรื่องไม่ได้', runReport.fetchFailedSeries);
+  section('รอตรวจทั้งหมด (quarantine)', health.quarantined.map(({ s, c }) => `${c.id} "${s.name}" ${c.name}`));
+  section('ตอนค้างโหลดไม่ผ่านหลายรอบ', health.stuck.map(({ s, c }) => `"${s.name}" ${c.name} [${c.status}]`));
+  section('ชื่อตอนผิด (nav label)', health.navNames.map(({ s, c }) => `"${s.name}" ${c.name}`));
+  return lines.join('\n').slice(0, 1990);
+}
+
+async function notifyDiscord(content) {
+  const url = process.env.DISCORD_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+    if (!res.ok) console.error(`[report] Discord webhook answered HTTP ${res.status}`);
+  } catch (err) {
+    console.error('[report] could not reach Discord webhook:', err.message); // never log the URL itself - it's a secret
+  }
+}
+
+async function reportRun(opts) {
+  const text = formatRunReport(readDb(), opts);
+  console.log(`[report]\n${text}`);
+  await notifyDiscord(text);
+}
+
+// Strips a leftover "อ่านตอนล่าสุด: " prefix from the bot's own copy of chapter
+// names (the website rows were already fixed by SQL on 2026-09-28) - covers
+// chapters discovery can no longer re-see, e.g. ones on a paused site.
+// Renaming is reversible and never touches the website, so it runs unattended.
+function healNavLabelNames(db) {
+  for (const series of db.series || []) {
+    let changed = false;
+    for (const chapter of series.chapters || []) {
+      const healed = chapter.name.replace(/^อ่านตอน(แรก|ล่าสุด|ต่อ):?\s*/, '');
+      if (healed !== chapter.name && healed) {
+        chapter.name = healed;
+        changed = true;
+      }
+    }
+    if (changed) saveSeries(series);
+  }
+}
+
+function findChapterById(db, chapterId) {
+  for (const series of db.series || []) {
+    const chapter = (series.chapters || []).find(c => c.id === chapterId);
+    if (chapter) return { series, chapter };
+  }
+  return null;
+}
+
+function quarantineListCommand() {
+  const { quarantined } = collectHealthIssues(readDb());
+  quarantined.forEach(({ s, c }) => console.log(`[quarantine] ${c.id} | "${s.name}" | ${c.name} | ${c.error} | ${c.url}`));
+  console.log(`[quarantine] ${quarantined.length} chapter(s) waiting. approve-chapter <id> publishes one, reject-chapter <id> drops it for good.`);
+}
+
+async function approveChapterCommand(chapterId) {
+  const found = findChapterById(readDb(), chapterId);
+  if (!found || found.chapter.status !== 'quarantined') throw new Error(`No quarantined chapter with id "${chapterId}"`);
+  const { series, chapter } = found;
+  chapter.status = 'done';
+  chapter.error = null;
+  updateChapter(chapter);
+  await syncChapterToWebsiteDbSafe(series, chapter);
+  console.log(`[quarantine] approved "${chapter.name}" of "${series.name}" - published to the website`);
+}
+
+// Keeps the record (status 'rejected', no images) instead of deleting it, so
+// discovery/gap-fill see the chapter as known and never queue it again.
+async function rejectChapterCommand(chapterId) {
+  const db = readDb();
+  const found = findChapterById(db, chapterId);
+  if (!found || found.chapter.status !== 'quarantined') throw new Error(`No quarantined chapter with id "${chapterId}"`);
+  const { series, chapter } = found;
+  const folders = new Set((chapter.images || []).map(img => img.relativePath || '').map(key => key.slice(0, key.lastIndexOf('/') + 1)).filter(Boolean));
+  const otherUsers = (db.series || []).flatMap(s => s.chapters || []).filter(c => c.id !== chapter.id)
+    .flatMap(c => c.images || []).map(img => img.relativePath || '');
+  for (const folder of folders) {
+    if (!otherUsers.some(key => key.startsWith(folder))) await deleteR2Prefix(folder);
+  }
+  chapter.status = 'rejected';
+  chapter.images = [];
+  updateChapter(chapter);
+  console.log(`[quarantine] rejected "${chapter.name}" of "${series.name}" - images removed, it won't be downloaded again`);
 }
 
 async function scrapeChapterCoreAttempt(db, series, chapter) {
@@ -3256,7 +3429,10 @@ async function fetchSeriesPageRespectingRobots(pageUrl, useStealth = false) {
 async function discoverAndAddNewChapters(db, series, listingUrl) {
   const { disallowed, html } = await fetchSeriesPageRespectingRobots(listingUrl, series.useStealth);
   if (disallowed) return { discoveredCount: 0, addedCount: 0, disallowed: true };
-  if (!html) return { discoveredCount: 0, addedCount: 0, fetchFailed: true };
+  if (!html) {
+    runReport.fetchFailedSeries.push(`"${series.name}" ${listingUrl}`);
+    return { discoveredCount: 0, addedCount: 0, fetchFailed: true };
+  }
 
   if (!series.metadata) {
     series.metadata = extractSeriesMetadataFromHtml(html, listingUrl);
@@ -3267,6 +3443,7 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
   }
 
   const discovered = discoverChapterLinksFromHtml(html, listingUrl);
+  if (discovered.length === 0) runReport.zeroChapterSeries.push(`"${series.name}" ${listingUrl}`);
   if (!series.chapters) series.chapters = [];
   const existingUrls = new Set(series.chapters.map(c => c.url));
 
@@ -3289,7 +3466,7 @@ async function discoverAndAddNewChapters(db, series, listingUrl) {
     if (existingSameChapter) {
       // Same chapter number under a slightly different URL: only re-arm it if it
       // never finished. A chapter already downloaded ('done') is left untouched.
-      if (existingSameChapter.status !== 'done') {
+      if (!FINISHED_STATUSES.has(existingSameChapter.status)) {
         existingSameChapter.url = item.url;
         existingSameChapter.status = 'pending';
         existingSameChapter.error = null;
@@ -3474,7 +3651,7 @@ async function repairEntityTitlesCommand() {
 // stopping is checked between chapters, not mid-scrape.
 async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinity } = {}) {
   const findEligible = () => (series.chapters || []).filter(
-    c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
+    c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
   );
 
   let scrapedCount = 0;
@@ -3599,6 +3776,15 @@ function isOnActiveOrigin(url) {
   return isDiscoveryActiveForOrigin(originOf(url));
 }
 
+// 'quarantined' (failed validateChapterForPublish, waiting for a human) and
+// 'rejected' (a human said no) are as final as 'done' for every scrape/retry
+// loop - otherwise each pass would re-download and re-quarantine them.
+const FINISHED_STATUSES = new Set(['done', 'quarantined', 'rejected']);
+
+function needsScrape(c) {
+  return isOnActiveOrigin(c.url) && !FINISHED_STATUSES.has(c.status);
+}
+
 function originOf(url) {
   try { return new URL(url).origin; } catch (e) { return null; }
 }
@@ -3720,7 +3906,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     const nextLink =
       unprocessedLinks.find(s => {
         const tracked = findTrackedSeries(s.url);
-        return tracked && (tracked.chapters || []).some(c => c.status !== 'done');
+        return tracked && (tracked.chapters || []).some(c => !FINISHED_STATUSES.has(c.status));
       }) ||
       unprocessedLinks.find(s => {
         const tracked = findTrackedSeries(s.url);
@@ -3741,7 +3927,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
       let retrySeries = null;
       for (const s of (db.series || [])) {
         if (!crawlSeriesUrls.has(s.seriesUrl)) continue;
-        const found = (s.chapters || []).find(c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES);
+        const found = (s.chapters || []).find(c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES);
         if (found) {
           retryChapter = found;
           retrySeries = s;
@@ -3761,7 +3947,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
         for (const s of (db.series || [])) {
           if (!crawlSeriesUrls.has(s.seriesUrl)) continue;
           for (const c of (s.chapters || [])) {
-            if (isOnActiveOrigin(c.url) && c.status !== 'done') incompleteChapters.push(c);
+            if (needsScrape(c)) incompleteChapters.push(c);
           }
         }
 
@@ -3906,7 +4092,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
             
             const existingSameChapter = series.chapters.find(c => isSameChapter(c.name, item.name));
             if (existingSameChapter) {
-              if (existingSameChapter.status !== 'done') {
+              if (!FINISHED_STATUSES.has(existingSameChapter.status)) {
                 existingSameChapter.url = item.url;
                 existingSameChapter.status = 'pending';
                 existingSameChapter.error = null;
@@ -3952,7 +4138,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     // at MAX_CHAPTER_RETRIES attempts within *this* pass, so a permanently
     // broken chapter just costs one extra sweep per revisit, not a spin.
     series.chapters.forEach(c => {
-      if (isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+      if (needsScrape(c) && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
         c.retryCount = 0;
       }
     });
@@ -3961,7 +4147,7 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
     let firstChapterOfSeries = true;
     while (!seriesBlocked) {
       const pending = series.chapters.filter(
-        c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+        c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
       );
       if (pending.length === 0) break;
 
@@ -4066,7 +4252,7 @@ async function syncAllSeries(db) {
     // permanently broken chapter costs one extra sweep per sync, not a spin.
     let unstuckCount = 0;
     series.chapters.forEach(c => {
-      if (isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
+      if (needsScrape(c) && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) {
         c.retryCount = 0;
         unstuckCount++;
       }
@@ -4090,7 +4276,7 @@ async function syncAllSeries(db) {
       // A blocked series sits out the rest of this pass rather than being
       // fed straight back into the very next round against the same site.
       const stillEligible = (series.chapters || []).some(
-        c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+        c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
       );
       if (stillEligible && !blockedEarly) next.push(series);
     }
@@ -4493,7 +4679,7 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
           const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
           if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
           const stillEligible = (series.chapters || []).some(
-            c => isOnActiveOrigin(c.url) && c.status !== 'done' && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
+            c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
           );
           if (stillEligible && !blockedEarly) next.push(series);
         }
@@ -4770,6 +4956,16 @@ async function main() {
   } else if (cmd === 'check-latest-updates') {
     if (!arg) throw new Error('Usage: node server/bot.js check-latest-updates <siteUrl> [--dry-run]');
     await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
+  } else if (cmd === 'quarantine') {
+    quarantineListCommand();
+  } else if (cmd === 'approve-chapter') {
+    if (!arg) throw new Error('Usage: node server/bot.js approve-chapter <chapterId>');
+    await approveChapterCommand(arg);
+  } else if (cmd === 'reject-chapter') {
+    if (!arg) throw new Error('Usage: node server/bot.js reject-chapter <chapterId>');
+    await rejectChapterCommand(arg);
+  } else if (cmd === 'health') {
+    await reportRun({ title: 'solo-manga bot - health check' });
   } else if (cmd === 'audit-gapfill') {
     await auditGapfillCommand({ apply: arg === '--apply' });
   } else if (cmd === 'repair-entities') {
@@ -4781,6 +4977,7 @@ async function main() {
     console.log(`[remove-series] stopped tracking "${arg}" - its chapters/images are gone from the bot's own DB (the live website row is untouched; delete that separately if needed)`);
   } else if (!cmd) {
     const db = readDb();
+    healNavLabelNames(db);
     // Runs before EVERYTHING else. A missing cover costs one page fetch +
     // one image download; nothing else this run might do should be able to
     // delay that.
@@ -4815,17 +5012,23 @@ async function main() {
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities | remove-series <seriesId> | audit-gapfill [--apply]]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities | remove-series <seriesId> | audit-gapfill [--apply] | quarantine | approve-chapter <id> | reject-chapter <id> | health]`);
   }
 }
 
+// Only the scheduled/regular run (no command) reports - one-off maintenance
+// commands print their own output and shouldn't ping Discord.
+const isRegularRun = !process.argv[2];
+
 acquireLock()
   .then(() => main())
+  .then(async () => { if (isRegularRun) await reportRun(); })
   .then(() => shutdownBrowser())
   .then(() => mysqlPool.end())
   .then(() => { releaseLock(); process.exit(0); })
   .catch(async (err) => {
     console.error(err);
+    if (isRegularRun) await reportRun({ error: err }).catch(() => {});
     await shutdownBrowser();
     await mysqlPool.end().catch(() => {});
     releaseLock();
