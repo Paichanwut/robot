@@ -2417,8 +2417,23 @@ function findPossibleDuplicateSeries(db, candidateSeries) {
 // filled in this way lands in the exact same manga/<title>/ep<N>/ folder
 // either series would have used on its own - the two sources converge into
 // one complete set instead of two separate, each-partial copies.
+// Gap-fill copies real chapter CONTENT across series, so it needs a much
+// stronger match than findPossibleDuplicateSeries' "might be a duplicate"
+// warning. Substring containment there paired "Evolution from the Big Tree"
+// (up-manga slug /evolution-from/) with "Infinite Evolution From Zero" and
+// published the latter's chapter 1 as the former's (seen live 2026-09-26).
+// A sibling must share an IDENTICAL normalized title/slug token and live on
+// a different site - two series on one site are never cross-site copies.
+function isStrongSibling(a, b) {
+  if (!a || !b || a.id === b.id) return false;
+  const originA = originOf(a.seriesUrl);
+  if (!originA || originA === originOf(b.seriesUrl)) return false;
+  const tokensA = new Set(seriesIdentityTokens(a));
+  return seriesIdentityTokens(b).some(t => tokensA.has(t));
+}
+
 async function backfillMissingChaptersFromSiblings(db, series) {
-  const siblingRefs = findPossibleDuplicateSeries(db, series);
+  const siblingRefs = (db.series || []).filter(s => isStrongSibling(series, s));
   if (siblingRefs.length === 0) return 0;
 
   const haveNumbers = new Set(
@@ -4534,6 +4549,69 @@ async function runDueLatestUpdatesChecks(db) {
 // relearns which images are genuinely shared site furniture from scratch -
 // use this after a false-positive blacklist entry (or a threshold/logic
 // change like this one) has already poisoned a series' saved state.
+// Finds chapters an earlier, looser gap-fill (see isStrongSibling) borrowed
+// from a series that isn't really the same manga, and with --apply removes
+// each one everywhere: the website's MySQL chapter (only if its pages are
+// exactly this chapter's images - never a genuine chapter that happens to
+// share the number), its R2 folder, and the bot's own record, so
+// repairMysqlSync can't push it back. Without --apply it only lists them.
+async function auditGapfillCommand({ apply }) {
+  const db = readDb();
+  const wrong = [];
+  const unverifiable = [];
+  for (const series of db.series || []) {
+    for (const chapter of series.chapters || []) {
+      if (!String(chapter.id).endsWith('_gapfill')) continue;
+      const owner = db.series.find(s => s.id !== series.id &&
+        (s.chapters || []).some(c => c.url === chapter.url && !String(c.id).endsWith('_gapfill')));
+      if (!owner) unverifiable.push({ series, chapter });
+      else if (!isStrongSibling(series, owner)) wrong.push({ series, chapter, owner });
+    }
+  }
+
+  for (const { series, chapter, owner } of wrong) {
+    console.log(`[audit-gapfill] WRONG "${series.name}" (${series.id}) got "${chapter.name}" [${chapter.status}] from "${owner.name}" (${owner.id}) - ${chapter.url}`);
+  }
+  for (const { series, chapter } of unverifiable) {
+    console.log(`[audit-gapfill] UNVERIFIABLE (source series no longer tracked, left alone) "${series.name}" (${series.id}) "${chapter.name}" [${chapter.status}] - ${chapter.url}`);
+  }
+  console.log(`[audit-gapfill] ${wrong.length} wrongly borrowed chapter(s), ${unverifiable.length} unverifiable`);
+  if (!apply) {
+    if (wrong.length > 0) console.log('[audit-gapfill] dry run - nothing changed. Re-run with --apply to remove the WRONG ones.');
+    return;
+  }
+
+  for (const { series, chapter } of wrong) {
+    const imageKeys = new Set((chapter.images || []).map(img => img.relativePath));
+    const number = extractLeadingNumber(chapter.name) ?? (chapter.orderIndex ?? 0) + 1;
+    const mysqlResult = await withMysqlRetry(async (conn) => {
+      let [[row]] = await conn.execute('SELECT id FROM series WHERE source_series_id = ?', [series.id]);
+      if (!row) [[row]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slugify(series.metadata?.title || series.name, series.id)]);
+      if (!row) return 'series not on website';
+      const [[chapterRow]] = await conn.execute('SELECT id FROM chapters WHERE series_id = ? AND number = ?', [row.id, number]);
+      if (!chapterRow) return 'chapter not on website';
+      const [pages] = await conn.execute('SELECT image_key FROM chapter_pages WHERE chapter_id = ?', [chapterRow.id]);
+      const samePages = pages.length === imageKeys.size && pages.every(p => imageKeys.has(p.image_key));
+      if (!samePages) return `KEPT website chapter ${chapterRow.id} - its pages aren't this chapter's images`;
+      await conn.execute('DELETE FROM chapters WHERE id = ?', [chapterRow.id]); // chapter_pages cascade
+      return `deleted website chapter ${chapterRow.id}`;
+    });
+    // Folders are title-based, so another chapter (or the website chapter we
+    // just KEPT) can point into the same one - only wipe a folder nothing
+    // else still uses.
+    const folders = new Set([...imageKeys].map(key => key.slice(0, key.lastIndexOf('/') + 1)).filter(Boolean));
+    const otherUsers = (db.series || []).flatMap(s => s.chapters || []).filter(c => c.id !== chapter.id)
+      .flatMap(c => c.images || []).map(img => img.relativePath || '');
+    for (const folder of [...folders]) {
+      if (mysqlResult.startsWith('KEPT') || otherUsers.some(key => key.startsWith(folder))) folders.delete(folder);
+      else await deleteR2Prefix(folder);
+    }
+    series.chapters = series.chapters.filter(c => c.id !== chapter.id);
+    saveSeries(series);
+    console.log(`[audit-gapfill] removed "${chapter.name}" from "${series.name}": ${mysqlResult}; R2 ${[...folders].join(', ') || '(no images)'}`);
+  }
+}
+
 async function resetDedupCommand(url) {
   const seriesUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
   const db = readDb();
@@ -4692,6 +4770,8 @@ async function main() {
   } else if (cmd === 'check-latest-updates') {
     if (!arg) throw new Error('Usage: node server/bot.js check-latest-updates <siteUrl> [--dry-run]');
     await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
+  } else if (cmd === 'audit-gapfill') {
+    await auditGapfillCommand({ apply: arg === '--apply' });
   } else if (cmd === 'repair-entities') {
     await repairEntityTitlesCommand();
   } else if (cmd === 'remove-series') {
@@ -4735,7 +4815,7 @@ async function main() {
     // during THIS run (or a previous one) without needing a separate command.
     await repairMysqlSync(readDb());
   } else {
-    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities | remove-series <seriesId>]`);
+    throw new Error(`Unknown command "${cmd}". Usage: node server/bot.js [add <url> | crawl <url> | repair-sync | reset-dedup <seriesUrl> | check-latest-updates <siteUrl> [--dry-run] | repair-entities | remove-series <seriesId> | audit-gapfill [--apply]]`);
   }
 }
 
