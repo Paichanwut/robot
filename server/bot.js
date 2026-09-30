@@ -2622,7 +2622,7 @@ function formatRunReport(db, { title, error } = {}) {
   section('⚠️ เรื่องที่หาตอนไม่เจอ (0 ตอน)', runReport.zeroChapterSeries);
   section('⚠️ เปิดหน้าเรื่องไม่ได้', runReport.fetchFailedSeries);
   section('รอตรวจทั้งหมด (quarantine)', health.quarantined.map(({ s, c }) => `${c.id} "${s.name}" ${c.name}`));
-  section('ตอนค้างโหลดไม่ผ่านหลายรอบ', health.stuck.map(({ s, c }) => `"${s.name}" ${c.name} [${c.status}]`));
+  section('ตอนค้างโหลดไม่ผ่านหลายรอบ', health.stuck.map(({ s, c }) => `"${s.name}" ${c.name} [${c.status}]${c.error ? ` ${String(c.error).slice(0, 70)}` : ''}`));
   section('ชื่อตอนผิด (nav label)', health.navNames.map(({ s, c }) => `"${s.name}" ${c.name}`));
   return lines.join('\n').slice(0, 1990);
 }
