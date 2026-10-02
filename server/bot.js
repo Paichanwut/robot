@@ -4295,7 +4295,15 @@ async function repairMysqlSync(db) {
         // nothing and misreport every one of this series' chapters as
         // "missing" even though they're all fine - seen live 2026-09-26,
         // re-"repairing" 242 already-correct chapters every single run.
-        const [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE source_series_id = ?', [series.id]);
+        let [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE source_series_id = ?', [series.id]);
+        // Fallback: the slug syncSeriesToWebsiteDb upserts by. Two bot
+        // series of the same manga converge on ONE row, whose
+        // source_series_id belongs to whichever synced last - without this
+        // the other one found no row, "repaired" its whole catalog (306
+        // chapters on 2026-10-02) and took the row back, every single run.
+        if (!seriesRow) {
+          [[seriesRow]] = await conn.execute('SELECT id FROM series WHERE slug = ?', [slugify(series.metadata?.title || series.name, series.id)]);
+        }
         const counts = new Map();
         if (seriesRow) {
           const [rows] = await conn.execute(
