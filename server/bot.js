@@ -3639,27 +3639,21 @@ async function repairEntityTitlesCommand() {
 // Downloads every not-yet-done chapter of a series, retrying incomplete ones
 // across up to MAX_CHAPTER_RETRIES rounds (a longer, gentler gap between
 // rounds). Shared by /scrape-all and /retry-problem-chapters. Assumes the
-// caller holds the scrapingSeries[id] lock. Returns { scrapedCount, blockedEarly }.
-// maxChaptersThisTurn lets a caller round-robin scraping work across many
-// series (see syncAllSeries) instead of draining one series' entire backlog
-// before ever touching the next - a single series with a huge backlog (a
-// long-completed title being onboarded, or one that slipped behind) would
-// otherwise starve every other tracked series' freshness for as long as it
-// takes to finish (could be days - this is exactly what happened 2026-09-26,
-// see the fix alongside this one for checkLatestUpdatesForSite). A chapter
-// already in flight when the cap is hit is finished before returning -
-// stopping is checked between chapters, not mid-scrape.
-async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinity } = {}) {
+// caller holds the scrapingSeries[id] lock. Returns { scrapedCount, blockedEarly, yielded }.
+// shouldYield is checked between chapters (never mid-scrape): when it
+// returns true the call stops and reports yielded - used to hand control
+// back to the 12-hourly front-page check (see runFrontPageFirst).
+async function runScrapeAllForSeries(db, series, { shouldYield = () => false } = {}) {
   const findEligible = () => (series.chapters || []).filter(
     c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES && !scrapingChapters[c.id]
   );
 
   let scrapedCount = 0;
   let blockedEarly = false;
+  let yielded = false;
   let lastRetryAfterMs = null;
 
   for (let round = 0; round < MAX_CHAPTER_RETRIES; round++) {
-    if (scrapedCount >= maxChaptersThisTurn) break;
     const chaptersToScrape = findEligible();
     if (chaptersToScrape.length === 0) break;
 
@@ -3676,7 +3670,10 @@ async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinit
 
     let blockedThisRound = false;
     for (let i = 0; i < chaptersToScrape.length; i++) {
-      if (scrapedCount >= maxChaptersThisTurn) break;
+      if (shouldYield()) {
+        yielded = true;
+        break;
+      }
       if (i > 0) {
         await sleep(computeNextDelayMs(null));
       }
@@ -3698,6 +3695,8 @@ async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinit
       }
     }
 
+    if (yielded) break;
+
     if (blockedThisRound && !lastRetryAfterMs) {
       // Blocked with no explicit signal for how long to wait - an
       // ambiguous 429/403 is treated as "stop touching this site right
@@ -3713,7 +3712,7 @@ async function runScrapeAllForSeries(db, series, { maxChaptersThisTurn = Infinit
   // Reflects the final state after every round (including one that ran out of
   // retries while still blocked), not just whether a round broke out early.
   blockedEarly = blockedEarly || (series.chapters || []).some(c => c.status === 'blocked');
-  return { scrapedCount, blockedEarly };
+  return { scrapedCount, blockedEarly, yielded };
 }
 
 // ---------------------------------------------------------------------------
@@ -4206,22 +4205,21 @@ async function runSiteCrawl(crawlId, { maxUnitsThisTurn = Infinity } = {}) {
 // cron) to pick up new chapters/series later.
 // ---------------------------------------------------------------------------
 
-// One round-robin unit for syncAllSeries's scrape phase below - deliberately
-// tiny (a single chapter) so a series with a huge backlog (a long-completed
-// title being onboarded, or one that slipped behind) only ever holds up
-// every other tracked series' freshness by about one chapter's worth of
-// time, not its entire backlog - see runScrapeAllForSeries's doc comment.
-const SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND = 1;
-
 // Discovers new chapters and downloads everything not yet 'done' for every
 // series already tracked in the DB. Cover backfill used to run here too,
 // but even this can run for a long time (a single series can have 70+ new
 // chapters) - it's now called once, earlier, at the very top of main()'s
 // no-arg path instead, so a missing cover never waits behind ANY backlog,
 // including one discovered by the "cheap" 2-page check itself (see there).
-async function syncAllSeries(db) {
-  const pending = [];
+// One series at a time, each finished completely before the next (user's
+// call, 2026-10-02 - replaced a one-chapter-per-series round-robin): a
+// reader gets whole series, not every series half-done. The 12-hourly
+// front-page check still gets its turn on time via shouldYield (checked
+// before each series and between chapters), so a long backlog here can
+// delay "latest" by at most one chapter.
+async function syncAllSeries(db, { shouldYield = () => false } = {}) {
   for (const series of db.series || []) {
+    if (shouldYield()) return { yielded: true };
     if (series.seriesUrl && isDiscoveryActiveForOrigin(originOf(series.seriesUrl))) {
       try {
         const { addedCount } = await discoverAndAddNewChapters(db, series, series.seriesUrl);
@@ -4259,29 +4257,11 @@ async function syncAllSeries(db) {
     });
     if (unstuckCount > 0) console.log(`[sync] "${series.name}": giving ${unstuckCount} exhausted chapter(s) a fresh retry budget`);
 
-    pending.push(series);
+    const { scrapedCount, blockedEarly, yielded } = await runScrapeAllForSeries(db, series, { shouldYield });
+    if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+    if (yielded) return { yielded: true };
   }
-
-  // Round-robins the actual scraping across every series (one chapter each
-  // per round, cycling back around) instead of draining one series' entire
-  // backlog before ever touching the next - same reasoning as
-  // resumeRunningCrawls' round-robin over site crawls, applied one level
-  // down at the per-chapter granularity.
-  let active = pending;
-  while (active.length > 0) {
-    const next = [];
-    for (const series of active) {
-      const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
-      if (scrapedCount > 0) console.log(`[sync] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
-      // A blocked series sits out the rest of this pass rather than being
-      // fed straight back into the very next round against the same site.
-      const stillEligible = (series.chapters || []).some(
-        c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
-      );
-      if (stillEligible && !blockedEarly) next.push(series);
-    }
-    active = next;
-  }
+  return { yielded: false };
 }
 
 // Catches up any chapter that finished downloading (status 'done', so R2
@@ -4385,7 +4365,7 @@ function logRoundRobinSummary(ids) {
   }
 }
 
-async function resumeRunningCrawls(db) {
+async function resumeRunningCrawls(db, { shouldYield = () => false } = {}) {
   const pausedIds = [];
   let activeIds = (db.siteCrawls || [])
     .filter(c => c.status === 'running')
@@ -4398,7 +4378,7 @@ async function resumeRunningCrawls(db) {
   if (pausedIds.length > 0) {
     console.log(`[sync] discovery paused for ${pausedIds.length} site crawl(s) (ACTIVE_DISCOVERY_ORIGINS): ${pausedIds.join(', ')}`);
   }
-  if (activeIds.length === 0) return;
+  if (activeIds.length === 0) return { yielded: false };
 
   console.log(`[sync] resuming ${activeIds.length} site crawl(s) round-robin: ${activeIds.map(id => findCrawl(db, id)?.siteUrl).join(', ')}`);
   activeIds.forEach(id => { crawlControl[id] = { stopRequested: false }; });
@@ -4406,6 +4386,7 @@ async function resumeRunningCrawls(db) {
   let round = 0;
   while (activeIds.length > 0) {
     for (const id of [...activeIds]) {
+      if (shouldYield()) return { yielded: true };
       await runSiteCrawl(id, { maxUnitsThisTurn: 1 });
       const latest = findCrawl(readDb(), id);
       if (!latest || latest.status !== 'running') {
@@ -4418,6 +4399,7 @@ async function resumeRunningCrawls(db) {
       logRoundRobinSummary(activeIds);
     }
   }
+  return { yielded: false };
 }
 
 // Registers (or finds by URL/name) a series and immediately discovers +
@@ -4497,23 +4479,6 @@ async function addSeriesCommand(url, { name, stealth, scrape = true } = {}) {
 const LATEST_UPDATES_MAX_PAGES = 2;
 // How often to re-run that check per site - see runDueLatestUpdatesChecks.
 const LATEST_UPDATES_INTERVAL_MS = 12 * 60 * 60 * 1000;
-// Hard ceiling on how long checkLatestUpdatesForSite spends completing
-// pages' batches before giving up for THIS cycle - added 2026-09-28 after
-// a single call ran for 47+ hours straight (several front-page series each
-// had 100-200+ chapters still pending), starving every cron-triggered
-// invocation after it (they'd just queue up on the lock, unable to do
-// anything, for as long as this one kept going).
-//
-// Deliberately well under LATEST_UPDATES_INTERVAL_MS: whatever's still
-// incomplete when the budget runs out is left exactly as-is (each
-// chapter's status is durably tracked, so nothing is lost) - syncAllSeries
-// picks it up afterward at ordinary priority, and next cycle's due-check
-// re-fetches page 1 from scratch. A series still on page 1 then picks up
-// its forced-priority treatment right where it left off; one that's since
-// fallen to page 2+ simply stops getting it - it's not on page 1 anymore,
-// so it no longer earns page 1's priority. This is what keeps the "page 1
-// must finish before page 2" rule from ever blocking the bot indefinitely.
-const LATEST_UPDATES_BUDGET_MS = 6 * 60 * 60 * 1000;
 // See the safety-net check in checkLatestUpdatesForSite's page loop.
 const MIN_EXPECTED_SERIES_LINKS_PER_PAGE = 3;
 // Which site homepages get the check at all - empty/unset = feature off
@@ -4530,44 +4495,29 @@ const LATEST_UPDATES_SITE_URLS = (process.env.LATEST_UPDATES_SITE_URLS || '')
 // is exactly "if we have it, update it; if not, add it" with no separate
 // logic needed here.
 //
-// This whole check is the bot's top scheduling priority (2026-09-26): every
-// series found on a front page is downloaded to FULL completion -
-// round-robined fairly against just the others found on that SAME page, so
-// one huge backlog among them doesn't starve the rest of that page's batch
-// - before moving on to the next page, and before main() moves on to
-// anything lower-priority (already-tracked series that didn't happen to be
-// on these pages this cycle, then whole-site discovery). Page order is
-// strict: page 1's batch finishes completely before page 2 is even
-// fetched, page 2's batch finishes completely before page 3, and so on -
-// never a combined pool across pages. A reader following the source
-// site's front page should see a fully caught-up series here, not just
-// its first chapter.
+// This whole check is the bot's top scheduling priority. Order (user's
+// call, 2026-10-02): page 1's series top to bottom, each one discovered and
+// downloaded to completion before the next starts (a series we already
+// have complete just picks up its new chapters, which is quick); only when
+// all of page 1 is done does page 2 get fetched, same way. A reader sees
+// the newest updates first AND whole series.
 //
-// Bounded by LATEST_UPDATES_BUDGET_MS (2026-09-28, after a real 47+ hour
-// run): "complete before moving on" does NOT mean "no matter how long it
-// takes" - once the budget runs out, whatever's still incomplete is simply
-// left as pending (nothing lost, every chapter's status is durable) and
-// picked up afterward by syncAllSeries at ordinary priority. The next
-// due-check re-fetches page 1 from scratch rather than resuming a stale
-// list - a series still there picks its forced-priority treatment back up
-// where it left off; one that's since dropped to page 2+ just stops
-// getting it, because it's not on page 1 anymore.
-async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false } = {}) {
+// No time budget any more: instead shouldYield (the 12-hourly due check,
+// see runFrontPageFirst) can interrupt between chapters, and the next pass
+// re-fetches page 1 fresh and starts again from its first series. Progress
+// is never lost - every chapter's status is durable - so a series that was
+// interrupted resumes where it stopped, and one that has dropped off page 1
+// is picked up later by syncAllSeries.
+async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_PAGES, { dryRun = false, shouldYield = () => false } = {}) {
   console.log(`[latest-updates] checking first ${maxPages} listing page(s) of ${siteUrl}...`);
 
   let pageUrl = siteUrl;
   const visited = new Set();
   let totalFound = 0;
   let totalOk = 0;
-  const deadline = Date.now() + LATEST_UPDATES_BUDGET_MS;
-  let budgetExceeded = false;
+  let yielded = false;
 
   for (let page = 1; page <= maxPages && pageUrl && !visited.has(pageUrl); page++) {
-    if (Date.now() > deadline) {
-      console.warn(`[latest-updates] budget of ${(LATEST_UPDATES_BUDGET_MS / 3600000).toFixed(1)}h exceeded before page ${page} - stopping here for this cycle, next due-check re-fetches from page 1`);
-      budgetExceeded = true;
-      break;
-    }
     visited.add(pageUrl);
     const pageOrigin = originOf(pageUrl);
     if (!pageOrigin) break;
@@ -4640,57 +4590,44 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
         console.log(`[latest-updates]   ${tracked ? 'ALREADY TRACKED' : 'NEW'} - "${name}" - ${url}`);
       }
     } else {
-      const found = [];
+      // Listing order = newest update first; each series is discovered and
+      // fully downloaded before the next one starts.
+      let position = 0;
       for (const { url, name } of pageLinks.values()) {
+        position++;
+        if (shouldYield()) {
+          yielded = true;
+          break;
+        }
+        let series;
         try {
           // Pass the title actually seen on the listing tile through as the
           // fallback name (addSeriesCommand only uses it if this isn't
           // already a tracked series, or as the name to create a new one
           // with) - normalizeForComparison strips non-ASCII/punctuation, so
           // a Thai subtitle baked into the tile text ("Lookism ลุกคิซึม")
-          // still matches an existing plain "Lookism" row.
-          //
-          // scrape: false here too - registers the series and discovers
-          // chapter links only. The actual downloading for everything
-          // found on THIS page happens right below, as its own round-robin
-          // pass scoped to just this page's batch.
-          const series = await addSeriesCommand(url, { name, scrape: false });
-          if (series) found.push(series);
+          // still matches an existing plain "Lookism" row. scrape: false -
+          // the download happens right below, for this series only.
+          series = await addSeriesCommand(url, { name, scrape: false });
           totalOk++;
         } catch (err) {
           console.error(`[latest-updates] failed for ${url}:`, err.message);
+          continue;
         }
-      }
-
-      // Fully completes this page's batch (round-robin, one chapter per
-      // series per round - same fairness reasoning as
-      // SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) before the loop above moves
-      // on to fetching the next page at all.
-      const db = readDb();
-      let active = found;
-      while (active.length > 0) {
-        if (Date.now() > deadline) {
-          console.warn(`[latest-updates] page ${page}: budget exceeded mid-batch - ${active.length}/${found.length} series still have chapters pending, leaving them for syncAllSeries; next due-check re-fetches page 1 fresh`);
-          budgetExceeded = true;
+        if (!series) continue;
+        const result = await runScrapeAllForSeries(readDb(), series, { shouldYield });
+        if (result.scrapedCount > 0) console.log(`[latest-updates] page ${page} #${position} "${series.name}": scraped ${result.scrapedCount} chapter(s)${result.blockedEarly ? ' (stopped early - site blocked)' : ''}`);
+        if (result.yielded) {
+          yielded = true;
           break;
         }
-        const next = [];
-        for (const series of active) {
-          const { scrapedCount, blockedEarly } = await runScrapeAllForSeries(db, series, { maxChaptersThisTurn: SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND });
-          if (scrapedCount > 0) console.log(`[latest-updates] "${series.name}": scraped ${scrapedCount} chapter(s)${blockedEarly ? ' (stopped early - site blocked)' : ''}`);
-          const stillEligible = (series.chapters || []).some(
-            c => needsScrape(c) && (c.retryCount || 0) < MAX_CHAPTER_RETRIES
-          );
-          if (stillEligible && !blockedEarly) next.push(series);
-        }
-        active = next;
       }
-      if (!budgetExceeded) console.log(`[latest-updates] page ${page}: batch fully caught up (${found.length} series)`);
+      if (!yielded) console.log(`[latest-updates] page ${page}: all ${pageLinks.size} series caught up`);
     }
 
-    // Budget ran out mid-batch above - don't fetch page 2+ this cycle
-    // either, per the strict "page 1 finishes before page 2" ordering.
-    if (budgetExceeded) break;
+    // Interrupted by the 12-hourly re-check - page 2+ waits for the next
+    // pass, per the strict "page 1 finishes before page 2" ordering.
+    if (yielded) break;
 
     const nextPage = findNextListingPageUrl(html, pageUrl);
     pageUrl = (nextPage && !visited.has(nextPage)) ? nextPage : null;
@@ -4704,7 +4641,8 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
     return;
   }
 
-  console.log(`[latest-updates] done with ${siteUrl}: ${totalOk}/${totalFound} series link(s) processed successfully across ${visited.size} page(s)${budgetExceeded ? ' (stopped early - budget exceeded)' : ''}`);
+  console.log(`[latest-updates] done with ${siteUrl}: ${totalOk}/${totalFound} series link(s) processed successfully across ${visited.size} page(s)${yielded ? ' (interrupted - 12h re-check is due, restarting from page 1)' : ''}`);
+  return { yielded };
 }
 
 // Runs checkLatestUpdatesForSite for each configured site, but only once
@@ -4712,8 +4650,18 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
 // in the store blob (db.latestUpdatesChecks) the same way db.siteCrawls is,
 // so the cadence holds regardless of how often (or briefly) this process
 // itself gets invoked by cron/docker.
+//
+// The timestamp is stamped when a check STARTS, so "due" means 12h since
+// page 1 was last fetched - and isLatestUpdatesDue turning true mid-pass is
+// exactly what interrupts long work to go back to page 1.
+function isLatestUpdatesDue(db) {
+  const checks = db.latestUpdatesChecks || {};
+  return LATEST_UPDATES_SITE_URLS.some(siteUrl => isOnActiveOrigin(siteUrl) &&
+    (!checks[siteUrl] || Date.now() - new Date(checks[siteUrl]).getTime() >= LATEST_UPDATES_INTERVAL_MS));
+}
+
 async function runDueLatestUpdatesChecks(db) {
-  if (LATEST_UPDATES_SITE_URLS.length === 0) return;
+  if (LATEST_UPDATES_SITE_URLS.length === 0) return { yielded: false };
   if (!db.latestUpdatesChecks) db.latestUpdatesChecks = {};
 
   for (const siteUrl of LATEST_UPDATES_SITE_URLS) {
@@ -4724,9 +4672,32 @@ async function runDueLatestUpdatesChecks(db) {
       console.log(`[latest-updates] ${siteUrl} last checked ${(msSinceLastCheck / 3600000).toFixed(1)}h ago - not due yet`);
       continue;
     }
-    await checkLatestUpdatesForSite(siteUrl);
     db.latestUpdatesChecks[siteUrl] = new Date().toISOString();
     writeDb(db);
+    const { yielded } = await checkLatestUpdatesForSite(siteUrl, LATEST_UPDATES_MAX_PAGES, { shouldYield: () => isLatestUpdatesDue(readDb()) });
+    if (yielded) return { yielded: true };
+  }
+  return { yielded: false };
+}
+
+// The regular run's scheduling loop: front page first (page 1 series in
+// order, each to completion, then page 2), then every other tracked series
+// one at a time, then whole-site discovery. Whenever the 12-hourly
+// front-page check comes due, whatever is running stops after its current
+// chapter and the loop starts over from page 1.
+async function runFrontPageFirst() {
+  const shouldYield = () => isLatestUpdatesDue(readDb());
+  for (;;) {
+    if ((await runDueLatestUpdatesChecks(readDb())).yielded) continue;
+    if ((await syncAllSeries(readDb(), { shouldYield })).yielded) {
+      console.log('[sync] 12h front-page check is due - going back to page 1');
+      continue;
+    }
+    if ((await resumeRunningCrawls(readDb(), { shouldYield })).yielded) {
+      console.log('[sync] 12h front-page check is due - pausing site crawl, going back to page 1');
+      continue;
+    }
+    return;
   }
 }
 
@@ -4990,23 +4961,10 @@ async function main() {
     // multi-hundred-chapter backlog to see content the bot already has.
     const repairedNowCount = await repairMysqlSync(readDb());
     if (repairedNowCount > 0) console.log(`[sync] re-synced ${repairedNowCount} already-downloaded chapter(s) that were missing from the live site`);
-    // Runs next, before everything below - this is the bot's top priority
-    // (see checkLatestUpdatesForSite's doc comment): every series found on
-    // the source site's front pages gets downloaded to full completion
-    // here, round-robined fairly against just each other, before anything
-    // lower-priority gets a turn.
-    await runDueLatestUpdatesChecks(db);
-    // Runs before resumeRunningCrawls (whole-site discovery of BRAND NEW
-    // series, lowest priority - see its own round-robin/while loop, which
-    // can genuinely take days to fully finish one pass). syncAllSeries keeps
-    // every ALREADY-tracked series current (round-robined one chapter at a
-    // time per series - see SYNC_MAX_CHAPTERS_PER_SERIES_PER_ROUND) and must
-    // never wait behind that: a reader following an ongoing series shouldn't
-    // go stale for days just because the bot is also mid-crawl discovering
-    // an entirely new site's catalog. Old, not-yet-discovered backlogs can
-    // wait - freshness of what's already live can't.
-    await syncAllSeries(readDb());
-    await resumeRunningCrawls(readDb());
+    // Front page first, then every tracked series, then whole-site
+    // discovery - each series to completion, re-checking page 1 every 12h
+    // (see runFrontPageFirst).
+    await runFrontPageFirst();
     // Cheap catch-up pass every regular run too, not just on-demand - covers
     // chapters that finished downloading while MySQL was briefly unreachable
     // during THIS run (or a previous one) without needing a separate command.
