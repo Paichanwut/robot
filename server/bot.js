@@ -1097,6 +1097,12 @@ async function fetchTextWithPuppeteer(url, timeoutMs = 15000) {
   let page = null;
   try {
     page = await newScrapePage();
+    // go-manga sends `cache-control: public, max-age=16070400` (186 days) even
+    // on its homepage, and Chrome's profile here is persistent - so goto()
+    // kept serving the bot the homepage from ~2026-09-26 out of disk cache:
+    // the "latest updates" check walked the same stale list for days and
+    // never saw anything newer. Always go to the network.
+    await page.setCacheEnabled(false).catch(err => console.warn(`[Puppeteer] could not disable cache: ${err.message}`));
     // A goto timeout is NOT fatal here: while Cloudflare's turnstile is being
     // solved the page reloads itself, which can keep `domcontentloaded` from
     // settling before the deadline. Rather than bail (which showed up as
