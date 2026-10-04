@@ -4940,7 +4940,29 @@ async function main() {
     await resetDedupCommand(arg);
   } else if (cmd === 'check-latest-updates') {
     if (!arg) throw new Error('Usage: node server/bot.js check-latest-updates <siteUrl> [--dry-run]');
-    await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
+    if (dryRun) {
+      await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { dryRun });
+    } else {
+      // Same 12h re-check as a regular run (see runFrontPageFirst): this
+      // command used to neither stamp the check time nor yield, so a manual
+      // run (seen 2026-10-02..04) kept grinding through page 2 for days
+      // while newer front-page updates waited. Stamp at start, and whenever
+      // it's due again restart from page 1's first series.
+      const db = readDb();
+      if (!db.latestUpdatesChecks) db.latestUpdatesChecks = {};
+      const stampKeys = LATEST_UPDATES_SITE_URLS.filter(u => originOf(u) === originOf(arg));
+      for (;;) {
+        for (const key of stampKeys.length > 0 ? stampKeys : [arg]) db.latestUpdatesChecks[key] = new Date().toISOString();
+        writeDb(db);
+        // Only this site's own stamp counts - an unconfigured URL never yields.
+        const dueAgain = () => {
+          const checks = readDb().latestUpdatesChecks || {};
+          return stampKeys.some(key => Date.now() - new Date(checks[key]).getTime() >= LATEST_UPDATES_INTERVAL_MS);
+        };
+        const { yielded } = await checkLatestUpdatesForSite(arg, LATEST_UPDATES_MAX_PAGES, { shouldYield: dueAgain });
+        if (!yielded) break;
+      }
+    }
   } else if (cmd === 'quarantine') {
     quarantineListCommand();
   } else if (cmd === 'approve-chapter') {
