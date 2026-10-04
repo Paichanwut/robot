@@ -2543,6 +2543,7 @@ async function scrapeChapterCore(db, series, chapter) {
       console.warn(`[quarantine] "${series.name}" / "${chapter.name}" (${chapter.id}) held back from the website: ${chapter.error}`);
     } else {
       await syncChapterToWebsiteDbSafe(series, chapter);
+      runReport.published.set(series.name, (runReport.published.get(series.name) || 0) + 1);
     }
   }
   runReport.scraped[chapter.status] = (runReport.scraped[chapter.status] || 0) + 1;
@@ -2599,7 +2600,23 @@ function validateChapterForPublish(db, series, chapter) {
 // Run report: what this invocation did and what needs a human, printed at
 // the end and (when DISCORD_WEBHOOK_URL is set) posted to Discord.
 // ---------------------------------------------------------------------------
-const runReport = { startedAt: Date.now(), scraped: {}, quarantined: [], zeroChapterSeries: [], fetchFailedSeries: [] };
+// published: series name -> chapters that went live on the website.
+const runReport = { startedAt: Date.now(), scraped: {}, published: new Map(), quarantined: [], zeroChapterSeries: [], fetchFailedSeries: [] };
+
+function resetRunReport() {
+  Object.assign(runReport, { startedAt: Date.now(), scraped: {}, published: new Map(), quarantined: [], zeroChapterSeries: [], fetchFailedSeries: [] });
+}
+
+// A run can last days (front page -> every series -> site crawl, restarting
+// from page 1 every 12h), so the end-of-run report alone could leave Discord
+// silent that long. This posts what happened since the previous 12h check
+// right before the next one starts, then starts a fresh period. Skipped when
+// the run itself only just began - that period has nothing to say yet.
+async function reportPeriodBeforeFrontPageCheck() {
+  if (Date.now() - runReport.startedAt < 10 * 60 * 1000) return;
+  await reportRun({ title: 'solo-manga bot - รายงานทุก 12 ชม.', periodic: true });
+  resetRunReport();
+}
 
 function collectHealthIssues(db) {
   const all = (db.series || []).flatMap(s => (s.chapters || []).map(c => ({ s, c })));
@@ -2609,21 +2626,24 @@ function collectHealthIssues(db) {
   return { quarantined, stuck, navNames };
 }
 
-function formatRunReport(db, { title, error } = {}) {
+function formatRunReport(db, { title, error, periodic } = {}) {
   const minutes = Math.round((Date.now() - runReport.startedAt) / 60000);
+  const duration = minutes < 120 ? `${minutes} นาที` : `${(minutes / 60).toFixed(1)} ชม.`;
   const scraped = Object.entries(runReport.scraped).map(([k, v]) => `${k} ${v}`).join(', ') || 'ไม่มี';
   const health = collectHealthIssues(db);
+  const status = error ? '❌ หยุดเพราะ error' : periodic ? '🕛 ยังทำงานอยู่ - กำลังกลับไปเช็กหน้า 1' : '✅ จบรอบ';
   const lines = [
-    `**${title || 'solo-manga bot'}** ${error ? '❌ หยุดเพราะ error' : '✅ จบรอบ'} (${minutes} นาที)`,
+    `**${title || 'solo-manga bot'}** ${status} (ช่วงนี้ ${duration})`,
     `โหลดตอน: ${scraped}`,
   ];
   if (error) lines.push(`Error: ${String(error.message || error).slice(0, 300)}`);
-  const section = (label, items) => {
+  const section = (label, items, max = 8) => {
     if (items.length === 0) return;
     lines.push(`${label} (${items.length}):`);
-    items.slice(0, 8).forEach(item => lines.push(`• ${String(item).slice(0, 180)}`));
-    if (items.length > 8) lines.push(`• ...อีก ${items.length - 8}`);
+    items.slice(0, max).forEach(item => lines.push(`• ${String(item).slice(0, 180)}`));
+    if (items.length > max) lines.push(`• ...อีก ${items.length - max}`);
   };
+  section('📚 ขึ้นเว็บแล้ว', [...runReport.published].sort((a, b) => b[1] - a[1]).map(([name, count]) => `${name} +${count} ตอน`), 15);
   section('⚠️ กักใหม่รอบนี้ (ไม่ขึ้นเว็บ รอตรวจ)', runReport.quarantined);
   section('⚠️ เรื่องที่หาตอนไม่เจอ (0 ตอน)', runReport.zeroChapterSeries);
   section('⚠️ เปิดหน้าเรื่องไม่ได้', runReport.fetchFailedSeries);
@@ -4686,6 +4706,7 @@ async function runDueLatestUpdatesChecks(db) {
       console.log(`[latest-updates] ${siteUrl} last checked ${(msSinceLastCheck / 3600000).toFixed(1)}h ago - not due yet`);
       continue;
     }
+    await reportPeriodBeforeFrontPageCheck();
     db.latestUpdatesChecks[siteUrl] = new Date().toISOString();
     writeDb(db);
     const { yielded } = await checkLatestUpdatesForSite(siteUrl, LATEST_UPDATES_MAX_PAGES, { shouldYield: () => isLatestUpdatesDue(readDb()) });
@@ -4952,6 +4973,7 @@ async function main() {
       if (!db.latestUpdatesChecks) db.latestUpdatesChecks = {};
       const stampKeys = LATEST_UPDATES_SITE_URLS.filter(u => originOf(u) === originOf(arg));
       for (;;) {
+        await reportPeriodBeforeFrontPageCheck();
         for (const key of stampKeys.length > 0 ? stampKeys : [arg]) db.latestUpdatesChecks[key] = new Date().toISOString();
         writeDb(db);
         // Only this site's own stamp counts - an unconfigured URL never yields.
