@@ -4649,6 +4649,14 @@ async function checkLatestUpdatesForSite(siteUrl, maxPages = LATEST_UPDATES_MAX_
           continue;
         }
         if (!series) continue;
+        // Fresh retry budget each 12h cycle, same as syncAllSeries gives
+        // every series. Without it a front-page series' chapters that failed
+        // 3x on a transient error (seen: DNS EAI_AGAIN on 6 Nano Machine
+        // chapters, 2026-10) were never retried - front-page series rarely
+        // wait for the sync phase to come around.
+        for (const c of series.chapters || []) {
+          if (needsScrape(c) && (c.retryCount || 0) >= MAX_CHAPTER_RETRIES) c.retryCount = 0;
+        }
         const result = await runScrapeAllForSeries(readDb(), series, { shouldYield });
         if (result.scrapedCount > 0) console.log(`[latest-updates] page ${page} #${position} "${series.name}": scraped ${result.scrapedCount} chapter(s)${result.blockedEarly ? ' (stopped early - site blocked)' : ''}`);
         if (result.yielded) {
